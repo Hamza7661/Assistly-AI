@@ -26,6 +26,17 @@ class LeadService:
             "accept": "application/json",
         }
 
+        # Mask sensitive fields in logs
+        masked = dict(payload)
+        if masked.get("leadName"):
+            masked["leadName"] = "***"
+        if masked.get("leadEmail"):
+            masked["leadEmail"] = "***@***"
+        if masked.get("leadPhoneNumber"):
+            masked["leadPhoneNumber"] = "********"
+        # Optional: print or integrate with a logger
+        # print("Creating public lead:", masked)
+
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 200 and resp.status_code < 300:

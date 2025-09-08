@@ -75,8 +75,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except json.JSONDecodeError:
                 user_text = data
 
-            # Ignore empty/no-op client messages to avoid double prompting on init
             if not user_text or not str(user_text).strip():
+                continue
+            if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
 
             reply, done = await manager.handle_user_message(user_text)

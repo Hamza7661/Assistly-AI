@@ -44,7 +44,73 @@ class GptService:
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0.3,
-            max_tokens=120,
         )
         return (resp.choices[0].message.content or "").strip() or "Okay."
+
+    async def agent_greet(self, context: Dict[str, Any], state: Dict[str, Any]) -> str:
+        if not self.client:
+            # Minimal fallback using provided context
+            lead_types = context.get("lead_types") or []
+            lines = ["How can i help u today"]
+            for lt in lead_types:
+                txt = lt.get("text") if isinstance(lt, dict) else str(lt)
+                lines.append(f"#Button# {txt} #Button#")
+            return "\n".join(lines)
+        return await self._agent_generate(history=[], user_message="__INIT__", context=context, state=state, is_init=True)
+
+    async def agent_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any]) -> str:
+        if not self.client:
+            return "Got it."
+        return await self._agent_generate(history=history, user_message=user_message, context=context, state=state, is_init=False)
+
+    async def _agent_generate(self, *, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_init: bool) -> str:
+        lead_types = context.get("lead_types") or []
+        service_types = context.get("service_types") or []
+        faqs = context.get("faqs") or []
+
+        lead_types_text = "\n".join(
+            f"- {lt.get('text')} | value={lt.get('value')}" if isinstance(lt, dict) else f"- {str(lt)}"
+            for lt in lead_types
+        )
+        service_types_text = "\n".join(f"- {str(s)}" for s in service_types)
+        faq_text = "\n".join(
+            f"- Q: {f.get('question')}: A: {f.get('answer')}" if isinstance(f, dict) else f"- {str(f)}"
+            for f in faqs[:10]
+        )
+
+        system = (
+            "You are an empathetic lead-generation agent for a {profession}.\n"
+            "GOAL: collect leadType -> serviceType -> leadName -> leadEmail -> leadPhoneNumber.\n"
+            "RULES:\n"
+            "1) On init, greet and ask: 'Hi! How can i help u today?' followed by selectable lead types.\n"
+            "2) Next, ask for service type by saying 'Which service are you looking to avail?' (use provided options if any in selectable same format as lead types).\n"
+            "3) Then ask for name, then email, then phone.\n"
+            "4) If user asks a question, answer shortly and warmly with emotions, then continue.\n"
+            "5) Wrap each selectable option line exactly as: #Button# <text> #Button# (no numbers, one per line).\n"
+            "6) When all required fields are collected, output ONLY a JSON object with keys:\n"
+            "   title, summary, description, leadName, leadPhoneNumber (string or null), leadEmail (string or null), leadType, serviceType.\n"
+            "   Do not add any commentary around the JSON.\n"
+        ).format(profession=self.profession)
+
+        trimmed = history[-self.max_history :] if self.max_history > 0 else history
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
+        # Provide context to the model
+        context_block = (
+            f"Context:\n"
+            f"Lead types (text|value):\n{lead_types_text or '- (none provided)'}\n\n"
+            f"Service types:\n{service_types_text or '- (none provided)'}\n\n"
+            f"FAQs:\n{faq_text or '- (none)'}\n\n"
+            f"Known state JSON: {state}"
+        )
+        messages.append({"role": "system", "content": context_block})
+        messages.extend(trimmed)
+        if is_init:
+            messages.append({"role": "user", "content": "__INIT__"})
+        else:
+            messages.append({"role": "user", "content": user_message})
+
+        resp = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+        )
+        return (resp.choices[0].message.content or "").strip()

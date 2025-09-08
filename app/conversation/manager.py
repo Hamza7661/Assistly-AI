@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,14 +16,15 @@ class ConversationManager:
 
         self.step: str = "lead_type"
         self.state: Dict[str, Any] = {
-            "lead_type": None,
-            "service_type": None,
-            "name": None,
-            "phone": None,
+            "leadType": None,
+            "serviceType": None,
+            "leadName": None,
+            "leadEmail": None,
+            "leadPhoneNumber": None,
             "history": [],
         }
 
-        # Build lead type options from backend-provided objects
+        # Build lead type options from backend-provided objects (for fallback greet only)
         self.lead_type_options: List[Dict[str, str]] = []
         for item in (context.get("lead_types") or []):
             if isinstance(item, dict):
@@ -38,63 +40,45 @@ class ConversationManager:
 
         # Track that the initial lead-type prompt has been sent
         self.has_shown_lead_prompt: bool = False
+        self._last_bot_message: Optional[str] = None
 
     async def start(self) -> str:
         self.has_shown_lead_prompt = True
-        return self._prompt_lead_type(greeting=True)
+        reply = await self.gpt.agent_greet(self.context, self.state)
+        self._remember_bot(reply)
+        self._last_bot_message = reply.strip()
+        return reply
 
     async def handle_user_message(self, message: str) -> Tuple[str, bool]:
         self._remember_user(message)
 
-        if self.step == "lead_type":
-            choice_value = self._parse_lead_choice(message, self.lead_type_options, synonyms={
-                "callback": ["call", "phone", "call back", "callback", "ring"],
-                "appointment arrangement": ["appointment", "arrange", "arrangement", "book", "visit", "schedule"],
-                "further information": ["info", "information", "more info", "details"],
-            })
-            if choice_value is None:
-                maybe_answer = await self._maybe_answer_question(message)
-                if maybe_answer:
-                    # Answer user question but avoid re-listing the same options again
-                    return maybe_answer, False
-                # Suppress duplicate prompt while waiting for selection
-                if self.has_shown_lead_prompt:
-                    return "", False
-                return self._prompt_lead_type(), False
-            self.state["lead_type"] = choice_value
-            self.step = "service_type"
-            return self._prompt_service_type(), False
+        reply = await self.gpt.agent_reply(self.state["history"], message, self.context, self.state)
 
-        if self.step == "service_type":
-            choice = self._parse_choice(message, self.service_types)
-            if choice is None:
-                maybe_answer = await self._maybe_answer_question(message)
-                if maybe_answer:
-                    return maybe_answer + "\n\n" + self._prompt_service_type(), False
-                return self._prompt_service_type(), False
-            self.state["service_type"] = choice
-            self.step = "name"
-            return "Great. May I have your full name?", False
+        # Drop identical repeated greetings
+        if self._last_bot_message and reply.strip() == self._last_bot_message:
+            return "", False
 
-        if self.step == "name":
-            name = self._extract_name(message)
-            if not name:
-                return "Please share your full name (e.g., John Smith).", False
-            self.state["name"] = name
-            self.step = "phone"
-            return "Thanks. What is the best phone number to reach you?", False
-
-        if self.step == "phone":
-            phone = self._extract_phone(message)
-            if not phone:
-                return "Please provide a valid phone number (digits, spaces or +).", False
-            self.state["phone"] = phone
-
-            created_text = await self._finalize_lead()
+        parsed = self._maybe_parse_json(reply)
+        if parsed is not None and isinstance(parsed, dict):
+            if self.user_id:
+                ok, _ = await self.lead_service.create_public_lead(self.user_id, parsed)
+            else:
+                ok = False
             self.step = "complete"
-            return created_text, True
+            if ok:
+                final_msg = "Thanks! I have your details and someone will get back to you soon. Bye!"
+            else:
+                final_msg = (
+                    "Thanks! I captured your details. There was a small issue creating the lead right now,"
+                    " but the team will still follow up shortly. Bye!"
+                )
+            self._remember_bot(final_msg)
+            self._last_bot_message = final_msg
+            return final_msg, True
 
-        return "Session complete.", True
+        self._remember_bot(reply)
+        self._last_bot_message = reply.strip()
+        return reply, False
 
     def _prompt_lead_type(self, greeting: bool = False) -> str:
         header = "How can i help u today" if greeting else "Please choose a lead type:"
@@ -150,47 +134,14 @@ class ConversationManager:
                         return key
         return None
 
-    def _parse_lead_choice(
-        self,
-        user_text: str,
-        options: List[Dict[str, str]],
-        synonyms: Optional[Dict[str, List[str]]] = None,
-    ) -> Optional[str]:
-        if not options:
+    def _maybe_parse_json(self, text: str) -> Optional[Dict[str, Any]]:
+        content = text.strip()
+        if not (content.startswith("{") and content.endswith("}")):
             return None
-        text = _normalize_text(user_text)
-        # number selection
-        nums = re.findall(r"\d+", text)
-        if nums:
-            try:
-                idx = int(nums[0]) - 1
-                if 0 <= idx < len(options):
-                    return options[idx].get("value")
-            except Exception:  # noqa: BLE001
-                pass
-        # direct match on text or value
-        for opt in options:
-            val = _normalize_text(opt.get("value") or "")
-            txt = _normalize_text(opt.get("text") or "")
-            if val and (val in text or text in val):
-                return opt.get("value")
-            if txt and (txt in text or text in txt):
-                return opt.get("value")
-        # synonyms
-        if synonyms:
-            for key, syns in synonyms.items():
-                if _normalize_text(key) in text:
-                    for opt in options:
-                        if _normalize_text(opt.get("value") or "") == _normalize_text(key):
-                            return opt.get("value")
-                    return key
-                for s in syns:
-                    if _normalize_text(s) in text:
-                        for opt in options:
-                            if _normalize_text(opt.get("value") or "") == _normalize_text(key):
-                                return opt.get("value")
-                        return key
-        return None
+        try:
+            return json.loads(content)
+        except Exception:  # noqa: BLE001
+            return None
 
     async def _maybe_answer_question(self, user_message: str) -> Optional[str]:
         text = user_message.strip()
@@ -227,13 +178,13 @@ class ConversationManager:
         self.state["history"] = self.state["history"][-10:]
 
     async def _finalize_lead(self) -> str:
-        lead_type = self.state["lead_type"]
-        service_type = self.state["service_type"]
-        name = self.state["name"]
-        phone = self.state["phone"]
+        lead_type = self.state.get("leadType")
+        service_type = self.state.get("serviceType")
+        name = self.state.get("leadName")
+        phone = self.state.get("leadPhoneNumber")
 
-        title = f"Lead - {service_type}"
-        summary = f"{lead_type} request from {name}"
+        title = f"Lead - {service_type}" if service_type else "Lead"
+        summary = f"{lead_type} request from {name}" if lead_type and name else "Lead request"
         description = (
             f"Lead generated via chatbot.\n"
             f"Name: {name}\n"
@@ -248,6 +199,9 @@ class ConversationManager:
             "description": description,
             "leadType": lead_type,
             "serviceType": service_type,
+            "leadName": name,
+            "leadPhoneNumber": phone,
+            "leadEmail": self.state.get("leadEmail"),
         }
 
         if self.user_id:

@@ -1,8 +1,12 @@
 from typing import Any, Dict, List, Optional
 
 import httpx
+import logging
+import json
 
 from ..utils.signing import build_signature, generate_nonce, generate_ts_millis
+
+logger = logging.getLogger("assistly.context")
 
 
 class ContextService:
@@ -30,7 +34,18 @@ class ContextService:
             resp.raise_for_status()
             data = resp.json()
 
-        return self._normalize_context(data)
+        try:
+            logger.info("Context API response for user_id=%s: %s", user_id, json.dumps(data))
+        except Exception:  # noqa: BLE001
+            logger.info("Context API response for user_id=%s (non-serializable)", user_id)
+
+        normalized = self._normalize_context(data)
+        try:
+            logger.info("Normalized context for user_id=%s: %s", user_id, json.dumps(normalized))
+        except Exception:  # noqa: BLE001
+            logger.info("Normalized context for user_id=%s (non-serializable)", user_id)
+
+        return normalized
 
     def _normalize_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # Many backends wrap payload inside a top-level 'data' key
