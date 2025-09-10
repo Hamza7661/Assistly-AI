@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional
+import time
 
 import httpx
 import logging
@@ -29,10 +30,17 @@ class ContextService:
             "accept": "application/json",
         }
 
+        start_time = time.time()
+        logger.info("Sending context API request at %s for user_id=%s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), user_id)
+
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info("Received context API response at %s (took %.3fs) for user_id=%s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration, user_id)
 
         try:
             logger.info("Context API response for user_id=%s: %s", user_id, json.dumps(data))
@@ -111,9 +119,18 @@ class ContextService:
                 or ""
             )
 
+        # Extract integration data (assistantName, greeting, etc.)
+        integration = first_present([
+            "integration",
+            "Integration",
+            "assistant",
+            "Assistant",
+        ], {})
+
         return {
             "lead_types": lead_types,
             "service_types": service_types,
             "faqs": faqs,
             "profession": profession,
+            "integration": integration,
         }

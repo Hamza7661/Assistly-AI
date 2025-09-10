@@ -1,6 +1,10 @@
 from typing import Any, Dict, List, Optional
+import time
 
 from openai import AsyncOpenAI
+import logging
+
+logger = logging.getLogger("assistly.gpt")
 
 
 class GptService:
@@ -41,17 +45,33 @@ class GptService:
             })
         messages.append({"role": "user", "content": user_message})
 
+        start_time = time.time()
+        logger.info("Sending GPT short_reply request at %s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)))
+
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
+            max_tokens=100,
+            temperature=0.2,
+            top_p=0.7,
+            presence_penalty=0,
+            frequency_penalty=0,
+            stream=False,
         )
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info("Received GPT short_reply response at %s (took %.3fs)", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration)
         return (resp.choices[0].message.content or "").strip() or "Okay."
 
     async def agent_greet(self, context: Dict[str, Any], state: Dict[str, Any]) -> str:
         if not self.client:
             # Minimal fallback using provided context
             lead_types = context.get("lead_types") or []
-            lines = ["How can i help u today"]
+            # Use custom greeting from context if available
+            integration = context.get("integration", {})
+            greeting = integration.get("greeting", "How can i help u today")
+            lines = [greeting]
             for lt in lead_types:
                 txt = lt.get("text") if isinstance(lt, dict) else str(lt)
                 lines.append(f"#Button# {txt} #Button#")
@@ -78,11 +98,15 @@ class GptService:
             for f in faqs[:10]
         )
 
+        # Use custom greeting from context if available
+        integration = context.get("integration", {})
+        custom_greeting = integration.get("greeting", "Hi! How can i help u today?")
+        
         system = (
             "You are an empathetic lead-generation agent for a {profession}.\n"
             "GOAL: collect leadType -> serviceType -> leadName -> leadEmail -> leadPhoneNumber.\n"
             "RULES:\n"
-            "1) On init, greet and ask: 'Hi! How can i help u today?' followed by selectable lead types.\n"
+            "1) On init, greet with: '{greeting}' followed by selectable lead types.\n"
             "2) Next, ask for service type by saying 'Which service are you looking to avail?' (use provided options if any in selectable same format as lead types).\n"
             "3) Then ask for name, then email, then phone.\n"
             "4) If user asks a question, answer shortly and warmly with emotions, then continue.\n"
@@ -90,7 +114,7 @@ class GptService:
             "6) When all required fields are collected, output ONLY a JSON object with keys:\n"
             "   title, summary, description, leadName, leadPhoneNumber (string or null), leadEmail (string or null), leadType, serviceType.\n"
             "   Do not add any commentary around the JSON.\n"
-        ).format(profession=self.profession)
+        ).format(profession=self.profession, greeting=custom_greeting)
 
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
         messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
@@ -109,8 +133,22 @@ class GptService:
         else:
             messages.append({"role": "user", "content": user_message})
 
+        start_time = time.time()
+        request_type = "agent_greet" if is_init else "agent_reply"
+        logger.info("Sending GPT %s request at %s", request_type, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)))
+
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
+            max_tokens=100,
+            temperature=0.2,
+            top_p=0.7,
+            presence_penalty=0,
+            frequency_penalty=0,
+            stream=False,
         )
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info("Received GPT %s response at %s (took %.3fs)", request_type, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration)
         return (resp.choices[0].message.content or "").strip()
