@@ -52,7 +52,7 @@ class GptService:
             model=self.model,
             messages=messages,
             max_tokens=100,
-            temperature=0.2,
+            temperature=0.3,
             top_p=0.7,
             presence_penalty=0,
             frequency_penalty=0,
