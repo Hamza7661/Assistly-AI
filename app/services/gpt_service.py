@@ -23,12 +23,7 @@ class GptService:
         if not self.client:
             return "Here's a brief answer based on available info."
 
-        faqs = context.get("faqs") or []
-        faq_text = "\n".join(
-            f"- Q: {f.get('q') or f.get('question')}: A: {f.get('a') or f.get('answer')}"
-            if isinstance(f, dict) else f"- {str(f)}"
-            for f in faqs[:6]
-        )
+        import json
 
         system = (
             "You are a concise, friendly lead-generation assistant for a {profession}. "
@@ -38,11 +33,13 @@ class GptService:
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
         messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(trimmed)
-        if faq_text:
-            messages.append({
-                "role": "system",
-                "content": f"FAQ context (may help):\n{faq_text}",
-            })
+        
+        # Pass raw JSON context to GPT
+        context_json = json.dumps(context, indent=2)
+        messages.append({
+            "role": "system",
+            "content": f"User context data:\n{context_json}",
+        })
         messages.append({"role": "user", "content": user_message})
 
         start_time = time.time()
@@ -74,7 +71,7 @@ class GptService:
             lines = [greeting]
             for lt in lead_types:
                 txt = lt.get("text") if isinstance(lt, dict) else str(lt)
-                lines.append(f"#Button# {txt} #Button#")
+                lines.append(f"<button> {txt} </button>")
             return "\n".join(lines)
         return await self._agent_generate(history=[], user_message="__INIT__", context=context, state=state, is_init=True)
 
@@ -84,49 +81,43 @@ class GptService:
         return await self._agent_generate(history=history, user_message=user_message, context=context, state=state, is_init=False)
 
     async def _agent_generate(self, *, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_init: bool) -> str:
-        lead_types = context.get("lead_types") or []
-        service_types = context.get("service_types") or []
-        faqs = context.get("faqs") or []
-
-        lead_types_text = "\n".join(
-            f"- {lt.get('text')} | value={lt.get('value')}" if isinstance(lt, dict) else f"- {str(lt)}"
-            for lt in lead_types
-        )
-        service_types_text = "\n".join(f"- {str(s)}" for s in service_types)
-        faq_text = "\n".join(
-            f"- Q: {f.get('question')}: A: {f.get('answer')}" if isinstance(f, dict) else f"- {str(f)}"
-            for f in faqs[:10]
-        )
-
+        import json
+        
         # Use custom greeting from context if available
         integration = context.get("integration", {})
         custom_greeting = integration.get("greeting", "Hi! How can i help u today?")
         
         system = (
-            "You are an empathetic lead-generation agent for a {profession}.\n"
-            "GOAL: collect leadType -> serviceType -> leadName -> leadEmail -> leadPhoneNumber.\n"
-            "RULES:\n"
-            "1) On init, greet with: '{greeting}' followed by selectable lead types.\n"
-            "2) Next, ask for service type by saying 'Which service are you looking to avail?' (use provided options if any in selectable same format as lead types).\n"
-            "3) Then ask for name, then email, then phone.\n"
-            "4) If user asks a question, answer shortly and warmly with emotions, then continue.\n"
-            "5) Wrap each selectable option line exactly as: #Button# <text> #Button# (no numbers, one per line).\n"
-            "6) When all required fields are collected, output ONLY a JSON object with keys:\n"
-            "   title, summary, description, leadName, leadPhoneNumber (string or null), leadEmail (string or null), leadType, serviceType.\n"
-            "   Do not add any commentary around the JSON.\n"
+            "You are a friendly and professional lead-generation assistant for a {profession}.\n"
+            "Your goal is to have a natural conversation and collect all required information before creating a lead.\n\n"
+            "CONVERSATION FLOW:\n"
+            "1) Start with: '{greeting}' and present lead type options as buttons\n"
+            "2) Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services)\n"
+            "3) Get their full name: 'Great! What's your full name?'\n"
+            "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
+            "5) Get their phone: 'Perfect! And what's your phone number?'\n"
+            "6) When you have ALL information, output ONLY the JSON lead (no other text)\n\n"
+            "IMPORTANT RULES:\n"
+            "- Be conversational and empathetic\n"
+            "- Present options as: <button> Option Text </button>\n"
+            "- Use the service_types AND treatment_plans from the context data to create service buttons\n"
+            "- For treatment_plans, use the 'question' field as the button text\n"
+            "- Present all services and treatment plans together as one unified list - do NOT ask about treatment plans separately\n"
+            "- If user asks a question, answer it briefly and warmly, then continue with the next required step\n"
+            "- Always guide the conversation back to collecting the required information\n"
+            "- When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON\n"
+            "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
+            "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
+            "- Do NOT add any text before or after the JSON - just the JSON object\n"
         ).format(profession=self.profession, greeting=custom_greeting)
 
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
         messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
-        # Provide context to the model
-        context_block = (
-            f"Context:\n"
-            f"Lead types (text|value):\n{lead_types_text or '- (none provided)'}\n\n"
-            f"Service types:\n{service_types_text or '- (none provided)'}\n\n"
-            f"FAQs:\n{faq_text or '- (none)'}\n\n"
-            f"Known state JSON: {state}"
-        )
-        messages.append({"role": "system", "content": context_block})
+        
+        # Pass raw JSON context to GPT
+        context_json = json.dumps(context, indent=2)
+        messages.append({"role": "system", "content": f"User context data:\n{context_json}"})
+        
         messages.extend(trimmed)
         if is_init:
             messages.append({"role": "user", "content": "__INIT__"})
@@ -140,8 +131,8 @@ class GptService:
         resp = await self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            max_tokens=100,
-            temperature=0.2,
+            max_tokens=200,
+            temperature=0.3,
             top_p=0.7,
             presence_penalty=0,
             frequency_penalty=0,

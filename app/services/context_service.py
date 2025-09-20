@@ -107,6 +107,20 @@ class ContextService:
             "questions",
         ], [])
 
+        # Treatment plans
+        treatment_plans = first_present([
+            "treatmentPlans",
+            "treatment_plans",
+            "treatment_plans_options",
+            "treatments",
+        ], [])
+        
+        # Capitalize first letter of treatment plan questions
+        if isinstance(treatment_plans, list):
+            for plan in treatment_plans:
+                if isinstance(plan, dict) and "question" in plan:
+                    plan["question"] = plan["question"].capitalize()
+
         # Profession description may be under src['user']['professionDescription']
         profession = ""
         if isinstance(src, dict):
@@ -131,6 +145,7 @@ class ContextService:
             "lead_types": lead_types,
             "service_types": service_types,
             "faqs": faqs,
+            "treatment_plans": treatment_plans,
             "profession": profession,
             "integration": integration,
         }
