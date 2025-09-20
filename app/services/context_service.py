@@ -141,6 +141,14 @@ class ContextService:
             "Assistant",
         ], {})
 
+        # Extract country code
+        country = first_present([
+            "country",
+            "Country",
+            "countryCode",
+            "country_code",
+        ], "US")
+
         return {
             "lead_types": lead_types,
             "service_types": service_types,
@@ -148,4 +156,5 @@ class ContextService:
             "treatment_plans": treatment_plans,
             "profession": profession,
             "integration": integration,
+            "country": country,
         }

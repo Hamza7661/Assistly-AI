@@ -10,6 +10,7 @@ from .services.context_service import ContextService
 from .services.lead_service import LeadService
 from .services.gpt_service import GptService
 from .services.email_validation_service import EmailValidationService
+from .services.phone_validation_service import PhoneValidationService
 
 
 logger = logging.getLogger("assistly")
@@ -49,6 +50,10 @@ def _validate_email_verification(email_validation_state: Dict) -> bool:
     """Validate that email has been verified."""
     return email_validation_state.get("otp_verified", False)
 
+def _validate_phone_verification(phone_validation_state: Dict) -> bool:
+    """Validate that phone has been verified."""
+    return phone_validation_state.get("otp_verified", False)
+
 def _is_valid_email(email: str) -> bool:
     """Validate email format more strictly."""
     import re
@@ -77,6 +82,26 @@ def _extract_otp_from_text(text: str) -> str:
     otp_match = re.search(r'\b\d{6}\b', text)
     return otp_match.group(0) if otp_match else None
 
+def _extract_phone_from_text(text: str) -> str:
+    """Extract phone number from user text."""
+    import re
+    # Look for phone number patterns (digits with possible separators)
+    phone_patterns = [
+        r'\b\d{10,15}\b',  # 10-15 digits
+        r'\+\d{10,15}\b',  # + followed by 10-15 digits
+        r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b',  # US format
+        r'\b\d{4}[-.\s]?\d{3}[-.\s]?\d{3}\b',  # Some international formats
+    ]
+    
+    for pattern in phone_patterns:
+        match = re.search(pattern, text)
+        if match:
+            # Clean the phone number (remove separators)
+            phone = re.sub(r'[-.\s]', '', match.group(0))
+            return phone
+    
+    return None
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -92,6 +117,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     lead_service = LeadService(settings)
     gpt_service = GptService(settings)
     email_validation_service = EmailValidationService(settings)
+    phone_validation_service = PhoneValidationService(settings)
 
     try:
         context = await context_service.fetch_user_context(user_id)
@@ -114,6 +140,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         "otp_sent": False,
         "otp_verified": False,
         "customer_name": None
+    }
+    
+    # Phone validation state
+    phone_validation_state = {
+        "phone": None,
+        "otp_sent": False,
+        "otp_verified": False
     }
     
     # Send initial greeting
@@ -201,13 +234,64 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     # Let GPT handle missing email naturally
                     pass
             
+            # Check if we need to handle phone validation
+            validate_phone = context.get("integration", {}).get("validatePhoneNumber", True)
+            if validate_phone and not phone_validation_state["otp_sent"] and last_bot_message and "phone" in last_bot_message["content"].lower():
+                # Extract phone number from user text
+                phone = _extract_phone_from_text(user_text)
+                if phone:
+                    phone_validation_state["phone"] = phone
+                    
+                    # Get country code from context
+                    country_code = context.get("country", "US")
+                    logger.info(f"Using country code from context: '{country_code}' for phone: '{phone}'")
+                    
+                    # Send SMS OTP
+                    ok, _ = await phone_validation_service.send_sms_otp(user_id, phone, country_code)
+                    
+                    reply = (f"Great! I've sent a 6-digit verification code to {phone}. Please enter the code to verify your phone number." 
+                            if ok else "Sorry, I couldn't send the verification SMS. Please check your phone number and try again.")
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    if ok:
+                        phone_validation_state["otp_sent"] = True
+                    continue
+                else:
+                    # Let GPT handle invalid phone naturally
+                    pass
+            
+            # Check if we're in phone OTP verification mode
+            if phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
+                # User is entering phone OTP code - try to extract 6-digit code from text
+                otp_code = _extract_otp_from_text(user_text)
+                if otp_code:
+                    # Verify phone OTP
+                    country_code = context.get("country", "US")
+                    logger.info(f"Verifying phone OTP for phone: '{phone_validation_state['phone']}' with country: '{country_code}'")
+                    ok, message = await phone_validation_service.verify_sms_otp(
+                        user_id, 
+                        phone_validation_state["phone"], 
+                        otp_code,
+                        country_code
+                    )
+                    if ok:
+                        phone_validation_state["otp_verified"] = True
+                        # Let GPT handle the success message naturally
+                        pass
+                    else:
+                        # Let GPT handle invalid OTP naturally
+                        pass
+                else:
+                    # Let GPT handle non-OTP responses naturally
+                    pass
+            
             # Get GPT response
             reply = await gpt_service.agent_reply(conversation_history, user_text, context, {})
             
             # Check if it's JSON (lead completion)
             parsed_json = _maybe_parse_json(reply)
             if parsed_json and isinstance(parsed_json, dict):
-                if _validate_required_fields(parsed_json) and _validate_email_verification(email_validation_state):
+                if _validate_required_fields(parsed_json) and _validate_email_verification(email_validation_state) and _validate_phone_verification(phone_validation_state):
                     # Create lead
                     try:
                         ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
