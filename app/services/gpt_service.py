@@ -105,10 +105,17 @@ class GptService:
             "- Present all services and treatment plans together as one unified list - do NOT ask about treatment plans separately\n"
             "- If user asks a question, answer it briefly and warmly, then continue with the next required step\n"
             "- Always guide the conversation back to collecting the required information\n"
+            "- For email: If user provides invalid email, politely explain and ask again in the same message\n"
+            "- Be natural and conversational - don't give cold error messages\n"
+            "- If email validation is disabled in context, just collect email without OTP verification\n"
+            "- For OTP: If user asks questions or provides non-OTP responses, answer naturally and guide them back to entering the code\n"
+            "- For OTP: If user provides wrong OTP, be empathetic and ask them to try again in a friendly way\n"
             "- When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON\n"
             "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
             "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
             "- Do NOT add any text before or after the JSON - just the JSON object\n"
+            "- IMPORTANT: After collecting phone number, immediately generate the JSON - do NOT ask for anything else\n"
+            "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
         ).format(profession=self.profession, greeting=custom_greeting)
 
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
