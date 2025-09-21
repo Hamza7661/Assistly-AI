@@ -117,7 +117,7 @@ class GptService:
             "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
              "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
             "- Do NOT add any text before or after the JSON - just the JSON object\n"
-            "- IMPORTANT: After collecting phone number,simply immediately generate the JSON - do NOT ask for anything else\n"
+            "- IMPORTANT: After collecting phone number and if otp is required then after otp is verified, immediately generate the JSON - do NOT ask for anything else\n"
             "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
         ).format(profession=self.profession, greeting=custom_greeting)
 
