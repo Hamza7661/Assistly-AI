@@ -182,13 +182,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         email_validation_state["email"], 
                         otp_code
                     )
+                    logger.info(f"Email OTP verification result: {ok} - {message}")
                     if ok:
                         email_validation_state["otp_verified"] = True
-                        # Let GPT handle the success message naturally
-                        pass
+                        # Send success message directly
+                        success_msg = "Great! Your email has been verified. Now, could you please tell me your phone number?"
+                        conversation_history.append({"role": "assistant", "content": success_msg})
+                        await websocket.send_json({"type": "bot", "content": success_msg})
+                        continue
                     else:
-                        # Let GPT handle invalid OTP naturally
-                        pass
+                        # Send error message directly
+                        error_msg = "That code doesn't look right. Please check and try entering the 6-digit code again."
+                        conversation_history.append({"role": "assistant", "content": error_msg})
+                        await websocket.send_json({"type": "bot", "content": error_msg})
+                        continue
                 else:
                     # Let GPT handle non-OTP responses naturally
                     pass
@@ -274,13 +281,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         otp_code,
                         country_code
                     )
+                    logger.info(f"Phone OTP verification result: {ok} - {message}")
                     if ok:
                         phone_validation_state["otp_verified"] = True
-                        # Let GPT handle the success message naturally
-                        pass
+                        # Send success message directly
+                        success_msg = "Perfect! Your phone number has been verified. Let me collect your information and create your lead."
+                        conversation_history.append({"role": "assistant", "content": success_msg})
+                        await websocket.send_json({"type": "bot", "content": success_msg})
+                        continue
                     else:
-                        # Let GPT handle invalid OTP naturally
-                        pass
+                        # Send error message directly
+                        error_msg = "That code doesn't look right. Please check and try entering the 6-digit code again."
+                        conversation_history.append({"role": "assistant", "content": error_msg})
+                        await websocket.send_json({"type": "bot", "content": error_msg})
+                        continue
                 else:
                     # Let GPT handle non-OTP responses naturally
                     pass
