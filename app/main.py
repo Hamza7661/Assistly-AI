@@ -41,10 +41,6 @@ def _maybe_parse_json(text: str) -> Optional[Dict]:
     except Exception:
         return None
 
-def _validate_required_fields(parsed: Dict) -> bool:
-    """Validate that all required fields are present in the parsed JSON."""
-    required_fields = ["leadType", "serviceType", "leadName", "leadEmail", "leadPhoneNumber"]
-    return all(parsed.get(field) for field in required_fields)
 
 def _validate_email_verification(email_validation_state: Dict) -> bool:
     """Validate that email has been verified."""
@@ -305,7 +301,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Check if it's JSON (lead completion)
             parsed_json = _maybe_parse_json(reply)
             if parsed_json and isinstance(parsed_json, dict):
-                if _validate_required_fields(parsed_json) and _validate_email_verification(email_validation_state) and _validate_phone_verification(phone_validation_state):
+                # Check email verification only if enabled
+                email_valid = True
+                if context.get("integration", {}).get("validateEmail", True):
+                    email_valid = _validate_email_verification(email_validation_state)
+                
+                # Check phone verification only if enabled
+                phone_valid = True
+                if context.get("integration", {}).get("validatePhoneNumber", True):
+                    phone_valid = _validate_phone_verification(phone_validation_state)
+                
+                if email_valid and phone_valid:
                     # Create lead
                     try:
                         ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
@@ -319,12 +325,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "bot", "content": final_msg})
                     await websocket.close(code=1000)
                     break
-                else:
-                    # Missing fields, ask for them
-                    missing_fields = [field for field in ["leadType", "serviceType", "leadName", "leadEmail", "leadPhoneNumber"] if not parsed_json.get(field)]
-                    missing_msg = f"I need a bit more information. Please provide: {', '.join(missing_fields)}"
-                    conversation_history.append({"role": "assistant", "content": missing_msg})
-                    await websocket.send_json({"type": "bot", "content": missing_msg})
             else:
                 # Regular conversation response
                 conversation_history.append({"role": "assistant", "content": reply})

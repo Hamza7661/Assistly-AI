@@ -96,7 +96,8 @@ class GptService:
             "3) Get their full name: 'Great! What's your full name?'\n"
             "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
             "5) Get their phone: 'Perfect! And what's your phone number?'\n"
-            "6) When you have ALL information, output ONLY the JSON lead (no other text)\n\n"
+            "6) IMMEDIATELY after collecting phone number, output ONLY the JSON lead (no other text)\n"
+            "7) DO NOT ask for anything else after phone number - just generate JSON\n\n"
             "IMPORTANT RULES:\n"
             "- Be conversational and empathetic\n"
             "- Present options as: <button> Option Text </button>\n"
@@ -112,13 +113,15 @@ class GptService:
             "- For OTP: If user provides wrong OTP, be empathetic and ask them to try again in a friendly way\n"
             "- For phone: If user provides invalid phone number, politely explain and ask again in the same message\n"
             "- For phone OTP: Handle phone verification naturally like email verification\n"
-            "- When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON\n"
+            "- CRITICAL: When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON immediately\n"
             "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
             "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
-             "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
+            "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
             "- Do NOT add any text before or after the JSON - just the JSON object\n"
-            "- IMPORTANT: After collecting phone number, immediately generate the JSON - do NOT ask for anything else\n"
+            "- CRITICAL: After collecting phone number, immediately generate the JSON - do NOT ask for anything else\n"
             "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
+            "- REMEMBER: Once you have leadType, serviceType, leadName, leadEmail, and leadPhoneNumber - output JSON immediately\n"
+            "- FINAL STEP: After phone number collection, generate JSON immediately - do NOT ask for more information\n"
         ).format(profession=self.profession, greeting=custom_greeting)
 
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
