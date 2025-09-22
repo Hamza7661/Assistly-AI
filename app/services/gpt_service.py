@@ -134,6 +134,7 @@ class GptService:
             "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
             "- REMEMBER: Once you have leadType, serviceType, leadName, leadEmail, and leadPhoneNumber - output JSON immediately\n"
             "- FINAL STEP: After phone number collection, generate JSON immediately - do NOT ask for more information\n"
+            "- SPECIAL CASE: If the last message mentions 'phone number has been verified' and you have all 5 fields, generate JSON immediately\n"
         ).format(profession=self.profession, greeting=custom_greeting)
 
         trimmed = history[-self.max_history :] if self.max_history > 0 else history

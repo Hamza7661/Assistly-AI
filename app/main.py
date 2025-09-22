@@ -280,10 +280,41 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     logger.info(f"Phone OTP verification result: {ok} - {message}")
                     if ok:
                         phone_validation_state["otp_verified"] = True
-                        # Send success message directly
-                        success_msg = "Perfect! Your phone number has been verified. Let me collect your information and create your lead."
-                        conversation_history.append({"role": "assistant", "content": success_msg})
-                        await websocket.send_json({"type": "bot", "content": success_msg})
+                        
+                        # Trigger GPT to generate JSON immediately after phone verification
+                        json_trigger_msg = "Generate JSON now with all collected information."
+                        conversation_history.append({"role": "user", "content": json_trigger_msg})
+                        
+                        # Get GPT response for JSON generation
+                        reply = await gpt_service.agent_reply(conversation_history, json_trigger_msg, context, {})
+                        
+                        # Check if it's JSON (lead completion)
+                        parsed_json = _maybe_parse_json(reply)
+                        if parsed_json and isinstance(parsed_json, dict):
+                            # Check email verification only if enabled
+                            email_valid = True
+                            if context.get("integration", {}).get("validateEmail", True):
+                                email_valid = _validate_email_verification(email_validation_state)
+                            
+                            # Check phone verification only if enabled
+                            phone_valid = True
+                            if context.get("integration", {}).get("validatePhoneNumber", True):
+                                phone_valid = _validate_phone_verification(phone_validation_state)
+                            
+                            if email_valid and phone_valid:
+                                # Create lead
+                                try:
+                                    ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                                    if ok:
+                                        final_msg = "Thanks! I have your details and someone will get back to you soon. Bye!"
+                                    else:
+                                        final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
+                                except Exception:
+                                    final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
+                                
+                                await websocket.send_json({"type": "bot", "content": final_msg})
+                                await websocket.close(code=1000)
+                                break
                         continue
                     else:
                         # Send error message directly
@@ -323,8 +354,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                     
                     await websocket.send_json({"type": "bot", "content": final_msg})
-                    await websocket.close(code=1000)
-                    break
+                await websocket.close(code=1000)
+                break
             else:
                 # Regular conversation response
                 conversation_history.append({"role": "assistant", "content": reply})
