@@ -1,11 +1,12 @@
 from typing import Any, Dict, List, Optional
 import time
+from urllib.parse import quote
 
 import httpx
 import logging
 import json
 
-from ..utils.signing import build_signature, generate_nonce, generate_ts_millis
+from ..utils.signing import build_signature, build_signature_with_param, generate_nonce, generate_ts_millis
 
 logger = logging.getLogger("assistly.context")
 
@@ -52,6 +53,74 @@ class ContextService:
             logger.info("Normalized context for user_id=%s: %s", user_id, json.dumps(normalized))
         except Exception:  # noqa: BLE001
             logger.info("Normalized context for user_id=%s (non-serializable)", user_id)
+
+        return normalized
+    
+    async def fetch_user_context_by_twilio(self, twilio_phone: str) -> Dict[str, Any]:
+        """Fetch user context using Twilio phone number"""
+        # Remove 'whatsapp:' prefix if present
+        clean_phone = twilio_phone.replace("whatsapp:", "")
+        
+        # URL encode the phone number for the actual request URL
+        encoded_phone = quote(clean_phone, safe='')
+        
+        # Path for signature (use encoded version)
+        path = f"/api/v1/users/by-twilio/{encoded_phone}/context"
+        url = f"{self.base_url}{path}"
+
+        ts = str(generate_ts_millis())
+        nonce = generate_nonce()
+        # Use the parameterized signature builder with twilioPhoneNumber
+        sign = build_signature_with_param(
+            self.secret, 
+            ts, 
+            nonce, 
+            method="GET", 
+            path=path, 
+            param_name="twilioPhoneNumber",
+            param_value=clean_phone  # Use non-encoded phone in the signature
+        )
+
+        headers = {
+            "x-tp-ts": ts,
+            "x-tp-nonce": nonce,
+            "x-tp-sign": sign,
+            "accept": "application/json",
+        }
+
+        start_time = time.time()
+        logger.info("Sending context API request at %s for Twilio phone=%s", 
+                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), clean_phone)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            resp = await client.get(url, headers=headers)
+            
+            # Log response details
+            logger.info("Context API response status: %s for Twilio phone=%s", resp.status_code, clean_phone)
+            try:
+                response_text = resp.text
+                logger.info("Context API response body: %s", response_text)
+            except Exception:
+                logger.info("Could not read response body")
+            
+            resp.raise_for_status()
+            data = resp.json()
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info("Received context API response at %s (took %.3fs) for Twilio phone=%s", 
+                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration, clean_phone)
+
+        try:
+            logger.info("Context API response for Twilio phone=%s: %s", clean_phone, json.dumps(data))
+        except Exception:  # noqa: BLE001
+            logger.info("Context API response for Twilio phone=%s (non-serializable)", clean_phone)
+
+        normalized = self._normalize_context(data)
+        try:
+            logger.info("Normalized context for Twilio phone=%s: %s", clean_phone, json.dumps(normalized))
+        except Exception:  # noqa: BLE001
+            logger.info("Normalized context for Twilio phone=%s (non-serializable)", clean_phone)
 
         return normalized
 
@@ -149,6 +218,14 @@ class ContextService:
             "country_code",
         ], "US")
 
+        # Extract user data
+        user_data = first_present([
+            "user",
+            "User",
+            "userData",
+            "user_data",
+        ], {})
+
         return {
             "lead_types": lead_types,
             "service_types": service_types,
@@ -157,4 +234,5 @@ class ContextService:
             "profession": profession,
             "integration": integration,
             "country": country,
+            "user": user_data,  # Preserve user data
         }

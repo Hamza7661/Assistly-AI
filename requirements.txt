@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 openai==1.40.3
 orjson==3.10.7
 phonenumbers==8.13.31
+twilio

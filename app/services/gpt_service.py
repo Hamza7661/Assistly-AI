@@ -1,5 +1,6 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import time
+import re
 
 from openai import AsyncOpenAI
 import logging
@@ -61,7 +62,7 @@ class GptService:
         logger.info("Received GPT short_reply response at %s (took %.3fs)", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration)
         return (resp.choices[0].message.content or "").strip() or "Okay."
 
-    async def agent_greet(self, context: Dict[str, Any], state: Dict[str, Any]) -> str:
+    async def agent_greet(self, context: Dict[str, Any], state: Dict[str, Any], is_whatsapp: bool = False) -> str:
         if not self.client:
             # Minimal fallback using provided context
             lead_types = context.get("lead_types") or []
@@ -73,37 +74,59 @@ class GptService:
                 txt = lt.get("text") if isinstance(lt, dict) else str(lt)
                 lines.append(f"<button> {txt} </button>")
             return "\n".join(lines)
-        return await self._agent_generate(history=[], user_message="__INIT__", context=context, state=state, is_init=True)
+        return await self._agent_generate(history=[], user_message="__INIT__", context=context, state=state, is_init=True, is_whatsapp=is_whatsapp)
 
-    async def agent_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any]) -> str:
+    async def agent_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_whatsapp: bool = False) -> str:
         if not self.client:
             return "Got it."
-        return await self._agent_generate(history=history, user_message=user_message, context=context, state=state, is_init=False)
+        return await self._agent_generate(history=history, user_message=user_message, context=context, state=state, is_init=False, is_whatsapp=is_whatsapp)
 
-    async def _agent_generate(self, *, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_init: bool) -> str:
+    async def _agent_generate(self, *, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_init: bool, is_whatsapp: bool = False) -> str:
         import json
         
         # Use custom greeting from context if available
         integration = context.get("integration", {})
         custom_greeting = integration.get("greeting", "Hi! How can i help u today?")
         
+        # WhatsApp-specific flow (skip phone number collection)
+        if is_whatsapp:
+            flow_steps = (
+                "CONVERSATION FLOW:\n"
+                "1) Start with: '{greeting}' and along with that simply present lead type options as buttons\n"
+                "2) Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services)\n"
+                "3) Get their name: 'Great! What's your name?'\n"
+                "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
+                "5) IMMEDIATELY after collecting email, output ONLY the JSON lead (no other text)\n"
+                "6) DO NOT ask for phone number - we already have it from WhatsApp\n"
+                "7) DO NOT ask for anything else after email - just generate JSON\n\n"
+            )
+            json_fields = "4 fields (leadType, serviceType, leadName, leadEmail)"
+            final_instruction = "CRITICAL: When you have ALL 4 fields (leadType, serviceType, leadName, leadEmail), output ONLY the JSON immediately"
+        else:
+            # Regular web chat flow (includes phone number)
+            flow_steps = (
+                "CONVERSATION FLOW:\n"
+                "1) Start with: '{greeting}' and along with that simply present lead type options as buttons\n"
+                "2) Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services)\n"
+                "3) Get their name: 'Great! What's your name?'\n"
+                "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
+                "5) Get their phone: 'Perfect! And what's your phone number?'\n"
+                "6) IMMEDIATELY after collecting phone number, output ONLY the JSON lead (no other text)\n"
+                "7) DO NOT ask for anything else after phone number - just generate JSON\n\n"
+            )
+            json_fields = "5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber)"
+            final_instruction = "CRITICAL: When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON immediately"
+        
         system = (
             "You are a friendly and professional lead-generation assistant for a {profession}.\n"
             "Your goal is to have a natural conversation and collect all required information before creating a lead.\n\n"
-            "CONVERSATION FLOW:\n"
-            "1) Start with: '{greeting}' and along with that simply present lead type options as buttons\n"
-            "2) Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services)\n"
-            "3) Get their name: 'Great! What's your name?'\n"
-            "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
-            "5) Get their phone: 'Perfect! And what's your phone number?'\n"
-            "6) IMMEDIATELY after collecting phone number, output ONLY the JSON lead (no other text)\n"
-            "7) DO NOT ask for anything else after phone number - just generate JSON\n\n"
+            + flow_steps +
             "VALIDATION RULES:\n"
             "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
             "- Service Type: Must be exactly one of the provided service or treatment plan options\n"
             "- Name: Must be a real name (2+ characters, contains letters, not just numbers)\n"
             "- Email: Must be valid email format (contains @ and domain)\n"
-            "- Phone: Must be a valid phone number (digits, reasonable length)\n"
+            + ("" if is_whatsapp else "- Phone: Must be a valid phone number (digits, reasonable length)\n") +
             "- If any input is invalid, politely ask for correction and show options again\n\n"
             "IMPORTANT RULES:\n"
             "- Be conversational and empathetic\n"
@@ -123,19 +146,24 @@ class GptService:
             "- If email validation is disabled in context, just collect email without OTP verification\n"
             "- For OTP: If user asks questions or provides non-OTP responses, answer naturally and guide them back to entering the code\n"
             "- For OTP: If user provides wrong OTP, be empathetic and ask them to try again in a friendly way\n"
-            "- For phone: If user provides invalid phone number, politely explain the issue in their response in a way a simple user can understand like you didnt provide bla bla i asked for bla bla and ask again in the same message\n"
-            "- For phone OTP: Handle phone verification naturally like email verification\n"
-            "- CRITICAL: The flow should be ask lead type first, then service type, then name, then email and then phone number"
-            "- CRITICAL: When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON immediately\n"
+            + ("" if is_whatsapp else "- For phone: If user provides invalid phone number, politely explain the issue in their response in a way a simple user can understand like you didnt provide bla bla i asked for bla bla and ask again in the same message\n") +
+            ("" if is_whatsapp else "- For phone OTP: Handle phone verification naturally like email verification\n") +
+            ("- CRITICAL: The flow should be ask lead type first, then service type, then name, then email (we have phone from WhatsApp)\n" if is_whatsapp else "- CRITICAL: The flow should be ask lead type first, then service type, then name, then email and then phone number\n") +
+            f"- {final_instruction}\n"
             "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
             "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
             "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
             "- Do NOT add any text before or after the JSON - just the JSON object\n"
             "- CRITICAL: After collecting phone number, immediately generate the JSON - do NOT ask for anything else\n"
             "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
-            "- REMEMBER: Once you have leadType, serviceType, leadName, leadEmail, and leadPhoneNumber - output JSON immediately\n"
-            "- FINAL STEP: After phone number collection, generate JSON immediately - do NOT ask for more information\n"
-            "- SPECIAL CASE: If the last message mentions 'phone number has been verified' and you have all 5 fields, generate JSON immediately\n"
+            + (
+                "- REMEMBER: Once you have leadType, serviceType, leadName, and leadEmail - output JSON immediately (phone from WhatsApp)\n"
+                "- FINAL STEP: After email verification, generate JSON immediately - do NOT ask for more information\n"
+                if is_whatsapp else
+                "- REMEMBER: Once you have leadType, serviceType, leadName, leadEmail, and leadPhoneNumber - output JSON immediately\n"
+                "- FINAL STEP: After phone number collection, generate JSON immediately - do NOT ask for more information\n"
+                "- SPECIAL CASE: If the last message mentions 'phone number has been verified' and you have all 5 fields, generate JSON immediately\n"
+            )
         ).format(profession=self.profession, greeting=custom_greeting)
 
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
@@ -170,3 +198,39 @@ class GptService:
         duration = end_time - start_time
         logger.info("Received GPT %s response at %s (took %.3fs)", request_type, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration)
         return (resp.choices[0].message.content or "").strip()
+    
+    def extract_buttons_from_response(self, response: str) -> Tuple[str, List[Dict[str, str]]]:
+        """Extract buttons from GPT response and return cleaned text + button data"""
+        # Find all button patterns: <button> Text </button>
+        button_pattern = r'<button>\s*(.*?)\s*</button>'
+        buttons = []
+        
+        # Extract button texts
+        button_matches = re.findall(button_pattern, response, re.IGNORECASE)
+        for i, button_text in enumerate(button_matches, 1):
+            buttons.append({
+                "id": f"button_{i}",
+                "title": button_text.strip()
+            })
+        
+        # Remove button tags from response text
+        cleaned_response = re.sub(button_pattern, '', response, flags=re.IGNORECASE).strip()
+        
+        return cleaned_response, buttons
+    
+    def create_whatsapp_buttons_message(self, text: str, buttons: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Create WhatsApp interactive button message format"""
+        return {
+            "type": "interactive_buttons",
+            "text": text,
+            "buttons": buttons
+        }
+    
+    def create_whatsapp_list_message(self, text: str, button_text: str, sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create WhatsApp interactive list message format"""
+        return {
+            "type": "interactive_list",
+            "text": text,
+            "button_text": button_text,
+            "sections": sections
+        }

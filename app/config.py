@@ -15,6 +15,12 @@ class Settings(BaseModel):
     tp_sign_secret: Optional[str] = Field(default=None, alias="TP_SIGN_SECRET")
 
     max_history_messages: int = Field(default=10, alias="MAX_HISTORY_MESSAGES")
+    
+    # Twilio WhatsApp configuration
+    twilio_account_sid: Optional[str] = Field(default=None, alias="TWILIO_ACCOUNT_SID")
+    twilio_auth_token: Optional[str] = Field(default=None, alias="TWILIO_AUTH_TOKEN")
+    twilio_whatsapp_from: Optional[str] = Field(default=None, alias="TWILIO_WHATSAPP_FROM")
+    whatsapp_webhook_token: Optional[str] = Field(default=None, alias="WHATSAPP_WEBHOOK_TOKEN")
 
 
 @lru_cache(maxsize=1)

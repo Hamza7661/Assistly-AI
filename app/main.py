@@ -1,9 +1,14 @@
 import json
 import logging
-from typing import Dict, List, Optional
+import time
+import secrets
+import asyncio
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from contextlib import asynccontextmanager
 
 from .config import settings
 from .services.context_service import ContextService
@@ -11,12 +16,102 @@ from .services.lead_service import LeadService
 from .services.gpt_service import GptService
 from .services.email_validation_service import EmailValidationService
 from .services.phone_validation_service import PhoneValidationService
+from .services.whatsapp_service import WhatsAppService
 
 
 logger = logging.getLogger("assistly")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Assistly AI Chatbot WS")
+# In-memory storage for WhatsApp conversations (session-based)
+# Key: session_id, Value: {phone, history, email_state, phone_state, context, user_id, created_at, last_activity}
+whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
+
+# Mapping: phone number -> current active session_id
+phone_to_session: Dict[str, str] = {}
+
+# Session timeout in seconds (30 minutes)
+SESSION_TIMEOUT = 30 * 60
+
+def get_or_create_session(user_phone: str) -> tuple[str, bool]:
+    """Get existing session or create new one. Returns (session_id, is_new)"""
+    current_time = time.time()
+    
+    # Check if user has an active session
+    if user_phone in phone_to_session:
+        session_id = phone_to_session[user_phone]
+        
+        # Check if session is still valid (not expired)
+        if session_id in whatsapp_sessions:
+            session = whatsapp_sessions[session_id]
+            last_activity = session.get("last_activity", 0)
+            
+            # If session expired, create new one
+            if current_time - last_activity > SESSION_TIMEOUT:
+                logger.info(f"Session {session_id} expired for {user_phone}, creating new session")
+                # Clean up old session
+                del whatsapp_sessions[session_id]
+                del phone_to_session[user_phone]
+            else:
+                # Session is valid, update last activity
+                session["last_activity"] = current_time
+                return session_id, False
+    
+    # Create new session
+    session_id = secrets.token_urlsafe(16)
+    phone_to_session[user_phone] = session_id
+    logger.info(f"Created new session {session_id} for {user_phone}")
+    
+    return session_id, True
+
+def cleanup_expired_sessions():
+    """Remove expired sessions to prevent memory leaks"""
+    current_time = time.time()
+    expired_sessions = []
+    
+    for session_id, session in whatsapp_sessions.items():
+        last_activity = session.get("last_activity", 0)
+        if current_time - last_activity > SESSION_TIMEOUT:
+            expired_sessions.append(session_id)
+    
+    for session_id in expired_sessions:
+        session = whatsapp_sessions[session_id]
+        phone = session.get("phone")
+        if phone and phone_to_session.get(phone) == session_id:
+            del phone_to_session[phone]
+        del whatsapp_sessions[session_id]
+        logger.info(f"Cleaned up expired session {session_id}")
+    
+    return len(expired_sessions)
+
+async def background_session_cleanup():
+    """Background task to periodically clean up expired sessions"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            expired_count = cleanup_expired_sessions()
+            if expired_count > 0:
+                logger.info(f"Background cleanup: removed {expired_count} expired session(s)")
+                logger.info(f"Active sessions: {len(whatsapp_sessions)}")
+        except Exception as e:
+            logger.error(f"Error in background session cleanup: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup: Start background cleanup task
+    cleanup_task = asyncio.create_task(background_session_cleanup())
+    logger.info("Started background session cleanup task")
+    
+    yield
+    
+    # Shutdown: Cancel background task
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        logger.info("Background session cleanup task cancelled")
+
+app = FastAPI(title="Assistly AI Chatbot WS", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -97,6 +192,62 @@ def _extract_phone_from_text(text: str) -> str:
             return phone
     
     return None
+
+def _convert_lead_types_to_whatsapp_buttons(lead_types: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Convert lead types to WhatsApp button format"""
+    buttons = []
+    for i, lead_type in enumerate(lead_types, 1):
+        text = lead_type.get("text", str(lead_type))
+        value = lead_type.get("value", text)
+        buttons.append({
+            "id": f"lead_type_{value}",
+            "title": text
+        })
+    return buttons
+
+def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: List[Any] = None) -> List[Dict[str, Any]]:
+    """Convert services and treatment plans to WhatsApp list format"""
+    sections = []
+    items = []
+    
+    # Add regular services
+    for i, service in enumerate(services, 1):
+        if isinstance(service, dict):
+            title = service.get("name", service.get("title", str(service)))
+            description = service.get("description", "")
+        else:
+            title = str(service)
+            description = ""
+        
+        items.append({
+            "id": f"service_{i}",
+            "title": title,
+            "description": description
+        })
+    
+    # Add treatment plans
+    if treatment_plans:
+        for i, plan in enumerate(treatment_plans, len(services) + 1):
+            if isinstance(plan, dict):
+                title = plan.get("question", plan.get("title", str(plan)))
+                description = plan.get("description", "")
+            else:
+                title = str(plan)
+                description = ""
+            
+            items.append({
+                "id": f"treatment_{i}",
+                "title": title,
+                "description": description
+            })
+    
+    if items:
+        sections.append({
+            "title": "Services & Treatments",
+            "rows": items
+        })
+    
+    return sections
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -366,3 +517,238 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for user_id=%s", user_id)
+
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    """Handle incoming WhatsApp messages via Twilio webhook"""
+    try:
+        # Parse form data from Twilio webhook
+        form_data = await request.form()
+        
+        whatsapp_service = WhatsAppService(settings)
+        message_data = whatsapp_service.parse_webhook_data(dict(form_data))
+        
+        if not message_data.get("from"):
+            logger.error("No 'from' field in WhatsApp webhook data")
+            return Response(content=whatsapp_service.create_twiml_response("Error: Missing sender information"), media_type="text/xml")
+        
+        # Extract user_id and Twilio phone number
+        user_phone = message_data["from"]
+        twilio_phone = message_data["to"]  # The Twilio WhatsApp number that received the message
+        
+        # Initialize services
+        context_service = ContextService(settings)
+        lead_service = LeadService(settings)
+        gpt_service = GptService(settings)
+        email_validation_service = EmailValidationService(settings)
+        phone_validation_service = PhoneValidationService(settings)
+        
+        # Use the Twilio number from the webhook as the reply-from number
+        whatsapp_service.whatsapp_from = twilio_phone
+        
+        # Get or create session for this user (cleanup runs in background)
+        session_id, is_new_session = get_or_create_session(user_phone)
+        
+        if is_new_session:
+            # First message from this user - fetch context and initialize
+            try:
+                context = await context_service.fetch_user_context_by_twilio(twilio_phone)
+            except Exception as exc:
+                logger.exception("Failed to fetch user context for Twilio number %s: %s", twilio_phone, exc)
+                return Response(content=whatsapp_service.create_twiml_response("Sorry, I'm having trouble accessing your information. Please try again later."), media_type="text/xml")
+            
+            # Extract user_id from context for lead creation
+            user_data = context.get("user", {})
+            user_id = user_data.get("id")
+            
+            if not user_id:
+                logger.error(f"WhatsApp: No user_id found in context for Twilio number {twilio_phone}")
+                logger.error(f"WhatsApp: Context keys available: {list(context.keys())}")
+                logger.error(f"WhatsApp: User data: {user_data}")
+                return Response(content=whatsapp_service.create_twiml_response("Sorry, I couldn't identify your account. Please contact support."), media_type="text/xml")
+            
+            logger.info(f"WhatsApp: Using user_id '{user_id}' for Twilio number {twilio_phone}")
+            
+            # Initialize new session state
+            current_time = time.time()
+            whatsapp_sessions[session_id] = {
+                "phone": user_phone,
+                "history": [],
+                "email_state": {
+                    "email": None,
+                    "otp_sent": False,
+                    "otp_verified": False,
+                    "customer_name": None
+                },
+                "phone_state": {
+                    "phone": user_phone,  # Pre-fill with WhatsApp phone number
+                    "otp_sent": False,
+                    "otp_verified": True  # Already verified by WhatsApp
+                },
+                "context": context,
+                "user_id": user_id,
+                "created_at": current_time,
+                "last_activity": current_time,
+                "is_whatsapp": True  # Flag to identify WhatsApp conversations
+            }
+            
+            # Set profession and send initial greeting
+            gpt_service.set_profession(str(context.get("profession") or "Clinic"))
+            initial_reply = await gpt_service.agent_greet(context, {}, is_whatsapp=True)
+            whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
+            
+            # Extract buttons and send
+            cleaned_reply, buttons = gpt_service.extract_buttons_from_response(initial_reply)
+            if buttons:
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                await whatsapp_service.send_message(user_phone, full_message)
+            else:
+                await whatsapp_service.send_message(user_phone, initial_reply)
+            
+            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+        
+        # Load existing session state
+        session = whatsapp_sessions[session_id]
+        conversation_history = session["history"]
+        email_validation_state = session["email_state"]
+        phone_validation_state = session["phone_state"]
+        context = session["context"]
+        user_id = session["user_id"]
+        
+        # Set profession
+        gpt_service.set_profession(str(context.get("profession") or "Clinic"))
+        
+        # Handle button/list responses
+        user_text = message_data.get("body", "")
+        button_id = message_data.get("button_id", "")
+        list_id = message_data.get("list_id", "")
+        
+        if button_id:
+            # Handle button response
+            user_text = button_id
+        elif list_id:
+            # Handle list response
+            user_text = list_id
+        
+        # Convert numbered responses to actual values for better context
+        enhanced_user_text = user_text
+        if user_text.strip().isdigit():
+            number = int(user_text.strip())
+            
+            # Check conversation history to determine what type of selection this is
+            # Look at the conversation flow to determine context
+            
+            # Check if we have a lead type selected (look for leadType in recent messages)
+            has_lead_type = any("leadType:" in msg.get("content", "") for msg in conversation_history[-3:] if msg.get("role") == "user")
+            
+            # Check if we have a service selected (look for service mentions in recent messages) 
+            has_service = any(any(keyword in msg.get("content", "").lower() for keyword in ["cosmetic", "general", "dentistry", "treatment"]) 
+                            for msg in conversation_history[-3:] if msg.get("role") == "user")
+            
+            logger.info(f"WhatsApp: Selection context - has_lead_type: {has_lead_type}, has_service: {has_service}")
+            
+            if not has_lead_type:
+                # First selection - must be lead type
+                lead_types = context.get("lead_types", [])
+                if 1 <= number <= len(lead_types):
+                    selected = lead_types[number - 1]
+                    lead_type_value = selected.get('value', '')
+                    lead_type_text = selected.get('text', '')
+                    enhanced_user_text = f"{number} - {lead_type_text} (leadType: {lead_type_value})"
+                    logger.info(f"WhatsApp: User selected lead type #{number} -> value: '{lead_type_value}', text: '{lead_type_text}'")
+                else:
+                    logger.warning(f"WhatsApp: User selected invalid lead type number {number}, available: {len(lead_types)}")
+                    
+            elif has_lead_type and not has_service:
+                # Second selection - must be service
+                services = context.get("service_types", [])
+                treatments = context.get("treatment_plans", [])
+                all_options = services + [t.get("question", str(t)) for t in treatments if isinstance(t, dict)]
+                
+                logger.info(f"WhatsApp: Detected service selection. Available options: {all_options}")
+                
+                if 1 <= number <= len(all_options):
+                    selected = all_options[number - 1]
+                    service_name = selected.get("question", selected) if isinstance(selected, dict) else selected
+                    enhanced_user_text = f"{number} - {service_name}"
+                    logger.info(f"WhatsApp: User selected service #{number} -> '{service_name}'")
+                else:
+                    logger.warning(f"WhatsApp: User selected invalid service number {number}, available: {len(all_options)}")
+            else:
+                logger.info(f"WhatsApp: Number {number} - context unclear, treating as raw input")
+        
+        # Process the message similar to WebSocket flow
+        gpt_service.set_profession(str(context.get("profession") or "Clinic"))
+        
+        # Add user message to history (use enhanced text for better GPT understanding)
+        conversation_history.append({"role": "user", "content": enhanced_user_text})
+        
+        # Get GPT response (with WhatsApp flag)
+        reply = await gpt_service.agent_reply(conversation_history, user_text, context, {}, is_whatsapp=True)
+        
+        # Check if it's JSON (lead completion)
+        parsed_json = _maybe_parse_json(reply)
+        if parsed_json and isinstance(parsed_json, dict):
+            # Add WhatsApp phone number to the lead JSON
+            parsed_json["leadPhoneNumber"] = user_phone
+            
+            # Check email verification only if enabled
+            email_valid = True
+            if context.get("integration", {}).get("validateEmail", True):
+                email_valid = _validate_email_verification(email_validation_state)
+            
+            # Phone is already verified by WhatsApp (skip phone OTP)
+            if email_valid:
+                # Create lead
+                try:
+                    ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                    if ok:
+                        final_msg = "Thanks! I have your details and someone will get back to you soon. Bye!"
+                    else:
+                        final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
+                except Exception:
+                    final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
+                
+                await whatsapp_service.send_message(user_phone, final_msg)
+                
+                # Clean up session after lead creation
+                del whatsapp_sessions[session_id]
+                if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
+                    del phone_to_session[user_phone]
+                
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+        
+        # Check if response contains buttons
+        cleaned_reply, buttons = gpt_service.extract_buttons_from_response(reply)
+        
+        # Send appropriate WhatsApp message
+        if buttons:
+            # For WhatsApp, convert buttons to numbered list instead of interactive buttons
+            # (interactive buttons don't work well in Twilio sandbox)
+            button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+            full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+            success, message = await whatsapp_service.send_message(user_phone, full_message)
+            if not success:
+                logger.error("Failed to send WhatsApp message: %s", message)
+        else:
+            # Send simple text message
+            success, message = await whatsapp_service.send_message(user_phone, reply)
+            if not success:
+                logger.error("Failed to send WhatsApp message: %s", message)
+        
+        # Return empty TwiML response (no automatic reply needed)
+        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+        
+    except Exception as e:
+        logger.exception("Error processing WhatsApp webhook: %s", str(e))
+        whatsapp_service = WhatsAppService(settings)
+        return Response(content=whatsapp_service.create_twiml_response("Sorry, I encountered an error. Please try again."), media_type="text/xml")
+
+
+@app.get("/webhook/whatsapp")
+async def whatsapp_webhook_verification(request: Request):
+    """Handle WhatsApp webhook verification (GET request)"""
+    # Twilio may send GET requests for webhook verification
+    return {"status": "ok", "message": "WhatsApp webhook endpoint is active"}

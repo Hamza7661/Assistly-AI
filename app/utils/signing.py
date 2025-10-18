@@ -29,3 +29,22 @@ def build_signature(
         return hashlib.sha256(to_sign.encode("utf-8")).hexdigest()
     key = secret.encode("utf-8")
     return hmac.new(key, to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def build_signature_with_param(
+    secret: Optional[str],
+    ts_millis: str,
+    nonce: str,
+    *,
+    method: str,
+    path: str,
+    param_name: str,
+    param_value: str,
+) -> str:
+    # Format for parameterized routes:
+    # METHOD\nPATH\nPARAM_NAME=PARAM_VALUE\nTS_MILLIS\nNONCE
+    to_sign = f"{method.upper()}\n{path}\n{param_name}={param_value}\n{ts_millis}\n{nonce}"
+    if not secret:
+        return hashlib.sha256(to_sign.encode("utf-8")).hexdigest()
+    key = secret.encode("utf-8")
+    return hmac.new(key, to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
