@@ -30,8 +30,8 @@ whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
 # Mapping: phone number -> current active session_id
 phone_to_session: Dict[str, str] = {}
 
-# Session timeout in seconds (30 minutes)
-SESSION_TIMEOUT = 30 * 60
+# Session timeout from environment variable (default: 5 minutes)
+SESSION_TIMEOUT = settings.session_timeout_seconds
 
 def get_or_create_session(user_phone: str) -> tuple[str, bool]:
     """Get existing session or create new one. Returns (session_id, is_new)"""

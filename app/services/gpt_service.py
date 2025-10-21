@@ -202,33 +202,30 @@ class GptService:
     
     def extract_buttons_from_response(self, response: str) -> Tuple[str, List[Dict[str, str]]]:
         """Extract buttons from GPT response and return cleaned text + button data"""
-        # Find all button patterns: <button> Text </button> (more flexible matching)
-        button_patterns = [
-            r'<button>\s*(.*?)\s*</button>',  # Standard format
-            r'<button>\s*(.*?)\s*</button',   # Missing closing >
-            r'<button\s*(.*?)\s*</button>',   # Missing closing >
-            r'<button>\s*(.*?)\s*</button>',  # Case insensitive
-        ]
-        
         buttons = []
-        cleaned_response = response
         
-        # Try each pattern and extract buttons
-        for pattern in button_patterns:
-            button_matches = re.findall(pattern, cleaned_response, re.IGNORECASE | re.DOTALL)
-            for button_text in button_matches:
-                if button_text.strip():  # Only add non-empty buttons
-                    buttons.append({
-                        "id": f"button_{len(buttons) + 1}",
-                        "title": button_text.strip()
-                    })
+        # Comprehensive pattern to match various button formats
+        # This pattern handles: <button>text</button>, <button>text</button, <button text</button>, etc.
+        button_pattern = r'<button[^>]*>\s*(.*?)\s*</button[^>]*>'
         
-        # Remove all button tag variations from response text
-        for pattern in button_patterns:
-            cleaned_response = re.sub(pattern, '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+        # Extract all buttons with the comprehensive pattern
+        button_matches = re.findall(button_pattern, response, re.IGNORECASE | re.DOTALL)
         
-        # Also remove any remaining malformed button tags
-        cleaned_response = re.sub(r'<button[^>]*>.*?</button[^>]*>', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+        # Add unique buttons only
+        seen_buttons = set()
+        for button_text in button_matches:
+            clean_text = button_text.strip()
+            if clean_text and clean_text not in seen_buttons:
+                seen_buttons.add(clean_text)
+                buttons.append({
+                    "id": f"button_{len(buttons) + 1}",
+                    "title": clean_text
+                })
+        
+        # Remove all button tags from response text using the same comprehensive pattern
+        cleaned_response = re.sub(button_pattern, '', response, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Also remove any remaining malformed button tags that might not match the pattern
         cleaned_response = re.sub(r'<button[^>]*>.*?$', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
         
         cleaned_response = cleaned_response.strip()

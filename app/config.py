@@ -16,6 +16,9 @@ class Settings(BaseModel):
 
     max_history_messages: int = Field(default=10, alias="MAX_HISTORY_MESSAGES")
     
+    # Session configuration
+    session_timeout_seconds: int = Field(default=300, alias="SESSION_TIMEOUT_SECONDS")  # 5 minutes default
+    
     # Twilio WhatsApp configuration
     twilio_account_sid: Optional[str] = Field(default=None, alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: Optional[str] = Field(default=None, alias="TWILIO_AUTH_TOKEN")
