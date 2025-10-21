@@ -123,7 +123,7 @@ class GptService:
             + flow_steps +
             "VALIDATION RULES:\n"
             "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
-            "- Service Type: Must be exactly one of the provided service or treatment plan options\n"
+            "- Service Type: Must be intelligently matched to one of the provided service or treatment plan options. Use semantic matching to understand user intent (e.g., 'implants' matches 'Dental Implants')\n"
             "- Name: Must not be John Doe or Jane Doe\n"
             "- Email: Must be valid email format (contains @ and domain)\n"
             + ("" if is_whatsapp else "- Phone: Must be a valid phone number (digits, reasonable length)\n") +
@@ -134,11 +134,26 @@ class GptService:
             "- Use the service_types AND treatment_plans both combined from the context data to create service buttons. Must have treatment_plans included in it if any. Must ask after getting lead type\n"
             "- For treatment_plans, use the 'question' field as the button text\n"
             "- Present all services and treatment plans together as one unified list - do NOT ask about treatment plans separately\n"
+            "- INTELLIGENT SERVICE MATCHING: When user mentions a service in natural language, immediately match and proceed. Examples:\n"
+            "  * 'I wanna avail implants' or 'I want implants' → immediately proceed with 'Implants'\n"
+            "  * 'I need cleaning' or 'dental cleaning' → immediately proceed with 'General dentistry'\n"
+            "  * 'I want braces' or 'teeth straightening' → immediately proceed with 'Teeth straightening'\n"
+            "  * 'I want cosmetic work' → immediately proceed with 'Cosmetic dentistry'\n"
+            "  * 'I want facial treatment' → immediately proceed with 'Facial Aesthetics'\n"
+            "- CRITICAL: Do NOT ask for confirmation or show options again if the match is clear\n"
+            "- Only show options if the user's request is completely unclear or doesn't match any available services\n"
             "- If user asks a question, answer it briefly and warmly, then continue with the next required step\n"
             "- Always guide the conversation back to collecting the required information\n"
             "- For email: If user provides invalid email format, politely explain and ask again in the same message.\n"
             "- For lead type: If user doesn't select from provided options, politely say 'Please choose from the options above' and show the buttons again\n"
-            "- For service type: If user doesn't select from provided options, politely say 'Please choose from the services above' and show the buttons again. Whenever you show service types for selection make sure to add treatment plans in them as well.\n"
+            "- For service type: If user mentions a service in natural language, immediately match and proceed. Also dont forget to add treatment plans into those as well Examples:\n"
+            "  * 'I wanna avail implants' or 'I want implants' → immediately proceed with 'Implants'\n"
+            "  * 'I need cleaning' or 'dental cleaning' → immediately proceed with 'General dentistry'\n"
+            "  * 'I want braces' or 'teeth straightening' → immediately proceed with 'Teeth straightening'\n"
+            "  * 'I want cosmetic work' → immediately proceed with 'Cosmetic dentistry'\n"
+            "  * 'I want facial treatment' → immediately proceed with 'Facial Aesthetics'\n"
+            "  * 'I want [some treatment plan]' → immediately proceed with '[treatment plan]'\n"
+            "- Only ask for clarification if the user's request is completely unclear or doesn't match any available services\n"
             "- For name: If user provides fake name like John Doe, politely say 'Please provide your correct name' and ask again\n"
             "- For email: If user provides invalid email format, politely say 'Please provide a valid email address' and ask again\n"
             "- For phone: If user provides invalid phone number, politely say 'Please provide a valid phone number' and ask again\n"
@@ -149,6 +164,7 @@ class GptService:
             + ("" if is_whatsapp else "- For phone: If user provides invalid phone number, politely explain the issue in their response in a way a simple user can understand like you didnt provide bla bla i asked for bla bla and ask again in the same message\n") +
             ("" if is_whatsapp else "- For phone OTP: Handle phone verification naturally like email verification\n") +
             ("- CRITICAL: The flow should be ask lead type first, then service type, then name, then email (we have phone from WhatsApp)\n" if is_whatsapp else "- CRITICAL: The flow should be ask lead type first, then service type, then name, then email and then phone number\n") +
+            "- CRITICAL: When user selects a service (either by number or natural language), immediately proceed to the next step (asking for name). Do NOT ask for confirmation or show options again. Always include treatment plans into service types as well\n" +
             f"- {final_instruction}\n"
             "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
             "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
