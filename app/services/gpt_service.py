@@ -201,20 +201,36 @@ class GptService:
     
     def extract_buttons_from_response(self, response: str) -> Tuple[str, List[Dict[str, str]]]:
         """Extract buttons from GPT response and return cleaned text + button data"""
-        # Find all button patterns: <button> Text </button>
-        button_pattern = r'<button>\s*(.*?)\s*</button>'
+        # Find all button patterns: <button> Text </button> (more flexible matching)
+        button_patterns = [
+            r'<button>\s*(.*?)\s*</button>',  # Standard format
+            r'<button>\s*(.*?)\s*</button',   # Missing closing >
+            r'<button\s*(.*?)\s*</button>',   # Missing closing >
+            r'<button>\s*(.*?)\s*</button>',  # Case insensitive
+        ]
+        
         buttons = []
+        cleaned_response = response
         
-        # Extract button texts
-        button_matches = re.findall(button_pattern, response, re.IGNORECASE)
-        for i, button_text in enumerate(button_matches, 1):
-            buttons.append({
-                "id": f"button_{i}",
-                "title": button_text.strip()
-            })
+        # Try each pattern and extract buttons
+        for pattern in button_patterns:
+            button_matches = re.findall(pattern, cleaned_response, re.IGNORECASE | re.DOTALL)
+            for button_text in button_matches:
+                if button_text.strip():  # Only add non-empty buttons
+                    buttons.append({
+                        "id": f"button_{len(buttons) + 1}",
+                        "title": button_text.strip()
+                    })
         
-        # Remove button tags from response text
-        cleaned_response = re.sub(button_pattern, '', response, flags=re.IGNORECASE).strip()
+        # Remove all button tag variations from response text
+        for pattern in button_patterns:
+            cleaned_response = re.sub(pattern, '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Also remove any remaining malformed button tags
+        cleaned_response = re.sub(r'<button[^>]*>.*?</button[^>]*>', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+        cleaned_response = re.sub(r'<button[^>]*>.*?$', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+        
+        cleaned_response = cleaned_response.strip()
         
         return cleaned_response, buttons
     

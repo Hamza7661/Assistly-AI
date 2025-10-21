@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import secrets
 import asyncio
@@ -726,6 +727,13 @@ async def whatsapp_webhook(request: Request):
         # Check if response contains buttons
         cleaned_reply, buttons = gpt_service.extract_buttons_from_response(reply)
         
+        # Safety check: ensure no raw button tags are sent
+        if '<button' in cleaned_reply.lower():
+            logger.warning("Found remaining button tags in cleaned reply, removing them")
+            cleaned_reply = re.sub(r'<button[^>]*>.*?</button[^>]*>', '', cleaned_reply, flags=re.IGNORECASE | re.DOTALL)
+            cleaned_reply = re.sub(r'<button[^>]*>.*?$', '', cleaned_reply, flags=re.IGNORECASE | re.DOTALL)
+            cleaned_reply = cleaned_reply.strip()
+        
         # Send appropriate WhatsApp message
         if buttons:
             # For WhatsApp, convert buttons to numbered list instead of interactive buttons
@@ -736,8 +744,8 @@ async def whatsapp_webhook(request: Request):
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
         else:
-            # Send simple text message
-            success, message = await whatsapp_service.send_message(user_phone, reply)
+            # Send simple text message (ensure no button tags)
+            success, message = await whatsapp_service.send_message(user_phone, cleaned_reply)
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
         
