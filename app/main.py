@@ -689,6 +689,103 @@ async def whatsapp_webhook(request: Request):
         # Add user message to history (use enhanced text for better GPT understanding)
         conversation_history.append({"role": "user", "content": enhanced_user_text})
         
+        # Update session history
+        whatsapp_sessions[session_id]["history"] = conversation_history
+        
+        # Check if we need to handle email validation (similar to WebSocket flow)
+        validate_email = context.get("integration", {}).get("validateEmail", True)
+        logger.info(f"WhatsApp: Email validation check - validate_email: {validate_email}, otp_sent: {email_validation_state['otp_sent']}, history_length: {len(conversation_history)}")
+        
+        if validate_email and not email_validation_state["otp_sent"] and len(conversation_history) > 1:
+            # Check if last bot message asked for email
+            last_bot_message = next((msg for msg in reversed(conversation_history) if msg["role"] == "assistant"), None)
+            logger.info(f"WhatsApp: Last bot message: {last_bot_message['content'] if last_bot_message else 'None'}")
+            
+            if last_bot_message and "email" in last_bot_message["content"].lower():
+                logger.info(f"WhatsApp: Detected email collection phase, processing user input: {user_text}")
+                
+                # Extract name and email in one GPT call
+                extraction_prompt = (
+                    f"Extract from conversation: 1) Customer name (respond with just name or 'Customer'), "
+                    f"2) Email from '{user_text}' (respond with just email or 'NO_EMAIL'). "
+                    f"Format: NAME|EMAIL. Conversation: {[msg['content'] for msg in conversation_history if msg['role'] == 'user']}"
+                )
+                
+                extraction_response = await gpt_service.short_reply(conversation_history, extraction_prompt, context)
+                logger.info(f"WhatsApp: Email extraction response: {extraction_response}")
+                
+                if "|" in extraction_response:
+                    customer_name, email = extraction_response.split("|", 1)
+                    customer_name = customer_name.strip()
+                    email = email.strip()
+                    
+                    logger.info(f"WhatsApp: Extracted - name: '{customer_name}', email: '{email}'")
+                    
+                    if email != "NO_EMAIL" and "@" in email and _is_valid_email(email):
+                        logger.info(f"WhatsApp: Valid email detected, sending OTP to {email}")
+                        email_validation_state["email"] = email
+                        email_validation_state["customer_name"] = customer_name
+                        
+                        # Send OTP email
+                        ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
+                        
+                        reply = (f"Great! I've sent a 6-digit verification code to {email}. Please enter the code to verify your email." 
+                                if ok else "Sorry, I couldn't send the verification email. Please check your email address and try again.")
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await whatsapp_service.send_message(user_phone, reply)
+                        if ok:
+                            email_validation_state["otp_sent"] = True
+                        logger.info(f"WhatsApp: Email OTP sent, returning early to prevent JSON generation")
+                        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                    else:
+                        logger.info(f"WhatsApp: Invalid email format, letting GPT handle naturally")
+                        # Let GPT handle invalid email naturally
+                        pass
+                else:
+                    logger.info(f"WhatsApp: No email extracted, letting GPT handle naturally")
+                    # Let GPT handle missing email naturally
+                    pass
+        
+        # Check if we're in email OTP verification mode
+        if email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
+            logger.info(f"WhatsApp: In OTP verification mode, processing user input: {user_text}")
+            # User is entering OTP code - try to extract 6-digit code from text
+            otp_code = _extract_otp_from_text(user_text)
+            if otp_code:
+                logger.info(f"WhatsApp: Extracted OTP code: {otp_code}")
+                # Verify OTP
+                ok, message = await email_validation_service.verify_otp(
+                    user_id, 
+                    email_validation_state["email"], 
+                    otp_code
+                )
+                logger.info(f"WhatsApp Email OTP verification result: {ok} - {message}")
+                if ok:
+                    email_validation_state["otp_verified"] = True
+                    # Send success message directly
+                    success_msg = "Great! Your email has been verified. Now I have all your details and someone will get back to you soon. Bye!"
+                    conversation_history.append({"role": "assistant", "content": success_msg})
+                    await whatsapp_service.send_message(user_phone, success_msg)
+                    
+                    # Clean up session after email verification
+                    del whatsapp_sessions[session_id]
+                    if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
+                        del phone_to_session[user_phone]
+                    
+                    logger.info(f"WhatsApp: Email verification completed, session cleaned up")
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                else:
+                    # Send error message directly
+                    error_msg = "That code doesn't look right. Please check and try entering the 6-digit code again."
+                    conversation_history.append({"role": "assistant", "content": error_msg})
+                    await whatsapp_service.send_message(user_phone, error_msg)
+                    logger.info(f"WhatsApp: OTP verification failed, asking user to try again")
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            else:
+                logger.info(f"WhatsApp: No OTP code found in user input, letting GPT handle naturally")
+                # Let GPT handle non-OTP responses naturally
+                pass
+        
         # Get GPT response (with WhatsApp flag)
         reply = await gpt_service.agent_reply(conversation_history, user_text, context, {}, is_whatsapp=True)
         
@@ -698,13 +795,15 @@ async def whatsapp_webhook(request: Request):
             # Add WhatsApp phone number to the lead JSON
             parsed_json["leadPhoneNumber"] = user_phone
             
-            # Check email verification only if enabled
+            # Check email verification only if enabled (same as WebSocket flow)
             email_valid = True
             if context.get("integration", {}).get("validateEmail", True):
                 email_valid = _validate_email_verification(email_validation_state)
             
             # Phone is already verified by WhatsApp (skip phone OTP)
-            if email_valid:
+            phone_valid = True  # WhatsApp phone is always verified
+            
+            if email_valid and phone_valid:
                 # Create lead
                 try:
                     ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
@@ -748,6 +847,10 @@ async def whatsapp_webhook(request: Request):
             success, message = await whatsapp_service.send_message(user_phone, cleaned_reply)
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
+        
+        # Update conversation history with bot response
+        conversation_history.append({"role": "assistant", "content": cleaned_reply})
+        whatsapp_sessions[session_id]["history"] = conversation_history
         
         # Return empty TwiML response (no automatic reply needed)
         return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
