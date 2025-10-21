@@ -20,6 +20,29 @@ class GptService:
     def set_profession(self, profession: str) -> None:
         self.profession = profession or self.profession
 
+    def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge treatment plans into service_types array for unified service selection"""
+        service_types = context.get("service_types", [])
+        treatment_plans = context.get("treatment_plans", [])
+        
+        # Convert treatment plans to service format and merge with service types
+        merged_services = list(service_types)  # Start with existing services
+        for plan in treatment_plans:
+            if isinstance(plan, dict) and "question" in plan:
+                # Convert treatment plan to service format
+                service_item = {
+                    "name": plan["question"],
+                    "title": plan["question"],
+                    "description": plan.get("description", ""),
+                    "is_treatment_plan": True
+                }
+                merged_services.append(service_item)
+        
+        # Update context with merged services
+        context = context.copy()
+        context["service_types"] = merged_services
+        return context
+
     async def short_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any]) -> str:
         if not self.client:
             return "Here's a brief answer based on available info."
@@ -74,11 +97,19 @@ class GptService:
                 txt = lt.get("text") if isinstance(lt, dict) else str(lt)
                 lines.append(f"<button> {txt} </button>")
             return "\n".join(lines)
+        
+        # Merge treatment plans into service types for unified service selection
+        context = self._merge_treatment_plans_into_services(context)
+        
         return await self._agent_generate(history=[], user_message="__INIT__", context=context, state=state, is_init=True, is_whatsapp=is_whatsapp)
 
     async def agent_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_whatsapp: bool = False) -> str:
         if not self.client:
             return "Got it."
+        
+        # Merge treatment plans into service types for unified service selection
+        context = self._merge_treatment_plans_into_services(context)
+        
         return await self._agent_generate(history=history, user_message=user_message, context=context, state=state, is_init=False, is_whatsapp=is_whatsapp)
 
     async def _agent_generate(self, *, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_init: bool, is_whatsapp: bool = False) -> str:
@@ -123,7 +154,7 @@ class GptService:
             + flow_steps +
             "VALIDATION RULES:\n"
             "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
-            "- Service Type: Must be intelligently matched to one of the provided service or treatment plan options. Use semantic matching to understand user intent (e.g., 'implants' matches 'Dental Implants')\n"
+            "- Service Type: Must be intelligently matched to one of the provided service or treatment plan options using semantic understanding and natural language processing\n"
             "- Name: Must not be John Doe or Jane Doe\n"
             "- Email: Must be valid email format (contains @ and domain)\n"
             + ("" if is_whatsapp else "- Phone: Must be a valid phone number (digits, reasonable length)\n") +
@@ -131,28 +162,19 @@ class GptService:
             "IMPORTANT RULES:\n"
             "- Be conversational and empathetic\n"
             "- Present options as: <button> Option Text </button>\n"
-            "- Use the service_types AND treatment_plans both combined from the context data to create service buttons. Must have treatment_plans included in it if any. Must ask after getting lead type\n"
-            "- For treatment_plans, use the 'question' field as the button text\n"
+            "- Use the service_types array from context data to create service buttons (treatment plans are already merged into service_types)\n"
             "- Present all services and treatment plans together as one unified list - do NOT ask about treatment plans separately\n"
-            "- INTELLIGENT SERVICE MATCHING: When user mentions a service in natural language, immediately match and proceed. Examples:\n"
-            "  * 'I wanna avail implants' or 'I want implants' → immediately proceed with 'Implants'\n"
-            "  * 'I need cleaning' or 'dental cleaning' → immediately proceed with 'General dentistry'\n"
-            "  * 'I want braces' or 'teeth straightening' → immediately proceed with 'Teeth straightening'\n"
-            "  * 'I want cosmetic work' → immediately proceed with 'Cosmetic dentistry'\n"
-            "  * 'I want facial treatment' → immediately proceed with 'Facial Aesthetics'\n"
+            "- INTELLIGENT SERVICE MATCHING: Use semantic understanding to match user's natural language to available services. Analyze the user's intent and match it to the closest service from the provided options.\n"
+            "- When user mentions any service-related terms, intelligently determine which service they're referring to and proceed immediately\n"
+            "- If user asks questions about a service (pricing, discounts, details), answer them briefly and warmly, then continue with the next step (asking for name)\n"
             "- CRITICAL: Do NOT ask for confirmation or show options again if the match is clear\n"
             "- Only show options if the user's request is completely unclear or doesn't match any available services\n"
             "- If user asks a question, answer it briefly and warmly, then continue with the next required step\n"
             "- Always guide the conversation back to collecting the required information\n"
             "- For email: If user provides invalid email format, politely explain and ask again in the same message.\n"
             "- For lead type: If user doesn't select from provided options, politely say 'Please choose from the options above' and show the buttons again\n"
-            "- For service type: If user mentions a service in natural language, immediately match and proceed. Also dont forget to add treatment plans into those as well Examples:\n"
-            "  * 'I wanna avail implants' or 'I want implants' → immediately proceed with 'Implants'\n"
-            "  * 'I need cleaning' or 'dental cleaning' → immediately proceed with 'General dentistry'\n"
-            "  * 'I want braces' or 'teeth straightening' → immediately proceed with 'Teeth straightening'\n"
-            "  * 'I want cosmetic work' → immediately proceed with 'Cosmetic dentistry'\n"
-            "  * 'I want facial treatment' → immediately proceed with 'Facial Aesthetics'\n"
-            "  * 'I want [some treatment plan]' → immediately proceed with '[treatment plan]'\n"
+            "- For service type: Use semantic understanding to intelligently match user's natural language to available services. Analyze their intent and match to the closest service from the provided options.\n"
+            "- If user asks questions about the service (pricing, discounts, details), answer them briefly and warmly, then continue to next step\n"
             "- Only ask for clarification if the user's request is completely unclear or doesn't match any available services\n"
             "- For name: If user provides fake name like John Doe, politely say 'Please provide your correct name' and ask again\n"
             "- For email: If user provides invalid email format, politely say 'Please provide a valid email address' and ask again\n"
@@ -164,7 +186,7 @@ class GptService:
             + ("" if is_whatsapp else "- For phone: If user provides invalid phone number, politely explain the issue in their response in a way a simple user can understand like you didnt provide bla bla i asked for bla bla and ask again in the same message\n") +
             ("" if is_whatsapp else "- For phone OTP: Handle phone verification naturally like email verification\n") +
             ("- CRITICAL: The flow should be ask lead type first, then service type, then name, then email (we have phone from WhatsApp)\n" if is_whatsapp else "- CRITICAL: The flow should be ask lead type first, then service type, then name, then email and then phone number\n") +
-            "- CRITICAL: When user selects a service (either by number or natural language), immediately proceed to the next step (asking for name). Do NOT ask for confirmation or show options again. Always include treatment plans into service types as well\n" +
+            "- CRITICAL: When user selects a service (either by number or natural language), immediately proceed to the next step (asking for name). Do NOT ask for confirmation or show options again.\n" +
             f"- {final_instruction}\n"
             "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
             "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
