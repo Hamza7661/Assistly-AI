@@ -307,8 +307,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             try:
                 parsed = json.loads(data)
                 user_text = parsed.get("content") or parsed.get("text") or data
+                user_country = parsed.get("country")  # Extract country from user message
             except json.JSONDecodeError:
                 user_text = data
+                user_country = None
 
             if not user_text or not str(user_text).strip():
                 continue
@@ -396,12 +398,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if phone:
                     phone_validation_state["phone"] = phone
                     
-                    # Get country code from context
-                    country_code = context.get("country", "US")
-                    logger.info(f"Using country code from context: '{country_code}' for phone: '{phone}'")
+                    # Get country code from context (fallback for non-prefixed numbers)
+                    api_country_code = context.get("country", "US")
+                    logger.info(f"Using API country code as fallback: '{api_country_code}', user country: '{user_country}' for phone: '{phone}'")
                     
-                    # Send SMS OTP
-                    ok, _ = await phone_validation_service.send_sms_otp(user_id, phone, country_code)
+                    # Send SMS OTP (country detection happens inside the service with priority: user_country > phone_prefix > api_country)
+                    ok, _ = await phone_validation_service.send_sms_otp(user_id, phone, api_country_code, user_country)
                     
                     reply = (f"Great! I've sent a 6-digit verification code to {phone}. Please enter the code to verify your phone number." 
                             if ok else "Sorry, I couldn't send the verification SMS. Please check your phone number and try again.")
@@ -419,14 +421,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # User is entering phone OTP code - try to extract 6-digit code from text
                 otp_code = _extract_otp_from_text(user_text)
                 if otp_code:
-                    # Verify phone OTP
-                    country_code = context.get("country", "US")
-                    logger.info(f"Verifying phone OTP for phone: '{phone_validation_state['phone']}' with country: '{country_code}'")
+                    # Verify phone OTP (country detection happens inside the service with priority: user_country > phone_prefix > api_country)
+                    api_country_code = context.get("country", "US")
+                    logger.info(f"Verifying phone OTP for phone: '{phone_validation_state['phone']}' with API fallback country: '{api_country_code}', user country: '{user_country}'")
                     ok, message = await phone_validation_service.verify_sms_otp(
                         user_id, 
                         phone_validation_state["phone"], 
                         otp_code,
-                        country_code
+                        api_country_code,
+                        user_country
                     )
                     logger.info(f"Phone OTP verification result: {ok} - {message}")
                     if ok:
