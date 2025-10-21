@@ -153,7 +153,7 @@ class GptService:
             "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
             "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
             "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
-            "- Help the user, if the user asks you to show something again do that. Help in booking",
+            "- Help the user, if the user asks you to show something again do that. Help in booking\n"
             "- Do NOT add any text before or after the JSON - just the JSON object\n"
             "- CRITICAL: After collecting phone number, immediately generate the JSON - do NOT ask for anything else\n"
             "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
