@@ -138,7 +138,7 @@ class GptService:
             "- Always guide the conversation back to collecting the required information\n"
             "- For email: If user provides invalid email format, politely explain and ask again in the same message.\n"
             "- For lead type: If user doesn't select from provided options, politely say 'Please choose from the options above' and show the buttons again\n"
-            "- For service type: If user doesn't select from provided options, politely say 'Please choose from the services above' and show the buttons again\n"
+            "- For service type: If user doesn't select from provided options, politely say 'Please choose from the services above' and show the buttons again. Whenever you show service types for selection make sure to add treatment plans in them as well.\n"
             "- For name: If user provides fake name like John Doe, politely say 'Please provide your correct name' and ask again\n"
             "- For email: If user provides invalid email format, politely say 'Please provide a valid email address' and ask again\n"
             "- For phone: If user provides invalid phone number, politely say 'Please provide a valid phone number' and ask again\n"
