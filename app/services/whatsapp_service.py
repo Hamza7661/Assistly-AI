@@ -19,37 +19,25 @@ class WhatsAppService:
         if self.account_sid and self.auth_token:
             self.client = Client(self.account_sid, self.auth_token)
     
-    def _format_phone_number(self, phone: str) -> str:
-        """Format phone number for WhatsApp (remove + if present, ensure it starts with country code)"""
-        # Remove any non-digit characters except +
-        cleaned = ''.join(c for c in phone if c.isdigit() or c == '+')
-        
-        # If it doesn't start with +, assume it's a US number and add +1
-        if not cleaned.startswith('+'):
-            if len(cleaned) == 10:
-                cleaned = '+1' + cleaned
-            elif len(cleaned) == 11 and cleaned.startswith('1'):
-                cleaned = '+' + cleaned
-            else:
-                cleaned = '+' + cleaned
-        
-        return cleaned
-    
     async def send_message(self, to_phone: str, message: str) -> Tuple[bool, str]:
-        """Send a simple text message via WhatsApp"""
+        """Send a simple text message via WhatsApp
+        
+        Args:
+            to_phone: Phone number in international format (e.g., +1234567890)
+            message: Text message to send
+        """
         if not self.client:
             logger.warning("Twilio client not initialized - WhatsApp message not sent")
             return False, "WhatsApp service not configured"
         
         try:
-            formatted_phone = self._format_phone_number(to_phone)
-            whatsapp_to = f"whatsapp:{formatted_phone}"
+            whatsapp_to = f"whatsapp:{to_phone}"
             # Ensure whatsapp_from has whatsapp: prefix
             whatsapp_from = self.whatsapp_from if self.whatsapp_from.startswith('whatsapp:') else f"whatsapp:{self.whatsapp_from}"
             
             start_time = time.time()
             logger.info("Sending WhatsApp message at %s to %s", 
-                       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), formatted_phone)
+                       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), to_phone)
             
             message_obj = self.client.messages.create(
                 body=message,
@@ -75,8 +63,7 @@ class WhatsAppService:
             return False, "WhatsApp service not configured"
         
         try:
-            formatted_phone = self._format_phone_number(to_phone)
-            whatsapp_to = f"whatsapp:{formatted_phone}"
+            whatsapp_to = f"whatsapp:{to_phone}"
             whatsapp_from = f"whatsapp:{self.whatsapp_from}"
             
             # Limit to 3 buttons as per WhatsApp API
@@ -133,8 +120,7 @@ class WhatsAppService:
             return False, "WhatsApp service not configured"
         
         try:
-            formatted_phone = self._format_phone_number(to_phone)
-            whatsapp_to = f"whatsapp:{formatted_phone}"
+            whatsapp_to = f"whatsapp:{to_phone}"
             whatsapp_from = f"whatsapp:{self.whatsapp_from}"
             
             # Create interactive list payload

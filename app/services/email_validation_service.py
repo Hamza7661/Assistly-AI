@@ -137,6 +137,10 @@ class EmailValidationService:
                 logger.info("OTP verification failed at %s (took %.3fs) for user_id=%s, status=%s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration, user_id, resp.status_code)
                 try:
                     error_data = resp.json()
-                    return False, error_data.get("message", "Invalid OTP code")
+                    error_message = error_data.get("message", "Invalid OTP code")
+                    # Handle maximum attempts exceeded more gracefully
+                    if "maximum attempts" in error_message.lower():
+                        return False, "Please try again with a new verification code"
+                    return False, error_message
                 except Exception:
                     return False, f"OTP verification failed (status: {resp.status_code})"

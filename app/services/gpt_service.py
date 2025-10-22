@@ -151,10 +151,18 @@ class GptService:
         system = (
             "You are a friendly and professional lead-generation assistant for a {profession}.\n"
             "Your goal is to have a natural conversation and collect all required information before creating a lead.\n\n"
+            "CRITICAL SYSTEM INSTRUCTIONS:\n"
+            "- When user indicates they want to resend OTP (lost, didn't receive, send again), respond with ONLY: 'RETRY_OTP_REQUESTED'\n"
+            "- When user indicates they want to change their phone number (provides different phone number, says wrong number, new number), respond with ONLY: 'CHANGE_PHONE_REQUESTED'\n"
+            "- When user indicates they want to change their email address (provides different email, says wrong email, new email), respond with ONLY: 'CHANGE_EMAIL_REQUESTED'\n"
+            "- If user provides a different phone number than what was previously collected, this is a phone change request\n"
+            "- If user provides a different email than what was previously collected, this is an email change request\n"
+            "- These special phrases are REQUIRED - do NOT add any other text or explanations\n"
+            "- Use semantic understanding to detect user intent, not exact word matching\n\n"
             + flow_steps +
             "VALIDATION RULES:\n"
             "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
-            "- Service Type: Must be intelligently matched to one of the provided service or treatment plan options using semantic understanding and natural language processing\n"
+            "- Service Type: Must be intelligently matched to one of the provided service or treatment plan options using semantic understanding and natural language processing.\n"
             "- Name: Must not be John Doe or Jane Doe\n"
             "- Email: Must be valid email format (contains @ and domain)\n"
             + ("" if is_whatsapp else "- Phone: Must be a valid phone number (digits, reasonable length)\n") +
@@ -173,16 +181,23 @@ class GptService:
             "- Always guide the conversation back to collecting the required information\n"
             "- For email: If user provides invalid email format, politely explain and ask again in the same message.\n"
             "- For lead type: If user doesn't select from provided options, politely say 'Please choose from the options above' and show the buttons again\n"
-            "- For service type: Use semantic understanding to intelligently match user's natural language to available services. Analyze their intent and match to the closest service from the provided options.\n"
+            "- For service type:Always show service type after lead type. Use semantic understanding to intelligently match user's natural language to available services. Analyze their intent and match to the closest service from the provided options.\n"
             "- If user asks questions about the service (pricing, discounts, details), answer them briefly and warmly, then continue to next step\n"
             "- Only ask for clarification if the user's request is completely unclear or doesn't match any available services\n"
             "- For name: If user provides fake name like John Doe, politely say 'Please provide your correct name' and ask again\n"
             "- For email: If user provides invalid email format, politely say 'Please provide a valid email address' and ask again\n"
             "- For phone: If user provides invalid phone number, politely say 'Please provide a valid phone number' and ask again\n"
+            "- CRITICAL RETRY HANDLING: When user says they lost, didn't receive, or want to resend OTP, you MUST respond with ONLY: 'RETRY_OTP_REQUESTED'\n"
+            "- CRITICAL RETRY HANDLING: When user says they want to change phone number, you MUST respond with ONLY: 'CHANGE_PHONE_REQUESTED'\n"
+            "- CRITICAL RETRY HANDLING: When user says they want to change email, you MUST respond with ONLY: 'CHANGE_EMAIL_REQUESTED'\n"
+            "- CRITICAL: These special phrases are REQUIRED for the system to work. Do NOT add any other text, explanations, or responses.\n"
+            "- CRITICAL: If user asks for OTP resend, respond with ONLY 'RETRY_OTP_REQUESTED' - nothing else\n"
             "- Be natural and conversational - don't give cold error messages\n"
             "- If email validation is disabled in context, just collect email without OTP verification\n"
             "- For OTP: If user asks questions or provides non-OTP responses, answer naturally and guide them back to entering the code\n"
             "- For OTP: If user provides wrong OTP, be empathetic and ask them to try again in a friendly way\n"
+            "- For OTP: If user indicates they didn't receive the code or it's not working, respond with: 'RETRY_OTP_REQUESTED' - DO NOT provide any other text\n"
+            "- For OTP: If user indicates they provided wrong contact information, respond with: 'CHANGE_PHONE_REQUESTED' or 'CHANGE_EMAIL_REQUESTED' - DO NOT provide any other text\n"
             + ("" if is_whatsapp else "- For phone: If user provides invalid phone number, politely explain the issue in their response in a way a simple user can understand like you didnt provide bla bla i asked for bla bla and ask again in the same message\n") +
             ("" if is_whatsapp else "- For phone OTP: Handle phone verification naturally like email verification\n") +
             ("- CRITICAL: The flow should be ask lead type first, then service type, then name, then email (we have phone from WhatsApp)\n" if is_whatsapp else "- CRITICAL: The flow should be ask lead type first, then service type, then name, then email and then phone number\n") +
@@ -221,6 +236,9 @@ class GptService:
         start_time = time.time()
         request_type = "agent_greet" if is_init else "agent_reply"
         logger.info("Sending GPT %s request at %s", request_type, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)))
+        
+        if not is_init:
+            logger.info("User message to GPT: '%s'", user_message)
 
         resp = await self.client.chat.completions.create(
             model=self.model,
@@ -236,7 +254,11 @@ class GptService:
         end_time = time.time()
         duration = end_time - start_time
         logger.info("Received GPT %s response at %s (took %.3fs)", request_type, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration)
-        return (resp.choices[0].message.content or "").strip()
+        
+        response_content = (resp.choices[0].message.content or "").strip()
+        logger.info("GPT response content: '%s'", response_content)
+        
+        return response_content
     
     def extract_buttons_from_response(self, response: str) -> Tuple[str, List[Dict[str, str]]]:
         """Extract buttons from GPT response and return cleaned text + button data"""
