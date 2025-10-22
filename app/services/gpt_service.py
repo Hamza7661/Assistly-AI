@@ -159,6 +159,7 @@ class GptService:
             "- CRITICAL: Use semantic understanding to detect user intent: if user wants to resend to the same contact information, this indicates a retry request\n"
             "- These special phrases are REQUIRED - do NOT add any other text or explanations\n"
             "- Use semantic understanding to detect user intent, not exact word matching\n\n"
+            "- If user wants to switch the phone number for otp then facilitate according to rules below\n"
             + flow_steps +
             "VALIDATION RULES:\n"
             "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
