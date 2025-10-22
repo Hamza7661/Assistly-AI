@@ -124,7 +124,7 @@ class GptService:
             flow_steps = (
                 "CONVERSATION FLOW:\n"
                 "1) Start with: '{greeting}' and along with that simply present lead type options as buttons\n"
-                "2) Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services)\n"
+                "2) MANDATORY: Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services) - THIS STEP IS REQUIRED FOR ALL LEAD TYPES INCLUDING CALLBACK\n"
                 "3) Get their name: 'Great! What's your name?'\n"
                 "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
                 "5) IMMEDIATELY after collecting email, output ONLY the JSON lead (no other text)\n"
@@ -138,7 +138,7 @@ class GptService:
             flow_steps = (
                 "CONVERSATION FLOW:\n"
                 "1) Start with: '{greeting}' and along with that simply present lead type options as buttons\n"
-                "2) Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services)\n"
+                "2) MANDATORY: Ask about service type: 'Which service are you looking to avail?' and present ALL available service types and treatment plans as buttons (treat them as regular services) - THIS STEP IS REQUIRED FOR ALL LEAD TYPES INCLUDING CALLBACK\n"
                 "3) Get their name: 'Great! What's your name?'\n"
                 "4) Get their email: 'Thank you, [Name]! Could you please provide your email address?'\n"
                 "5) Get their phone: 'Perfect! And what's your phone number?'\n"
@@ -162,7 +162,7 @@ class GptService:
             + flow_steps +
             "VALIDATION RULES:\n"
             "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
-            "- Service Type: Must be intelligently matched to one of the provided service or treatment plan options using semantic understanding and natural language processing.\n"
+            "- Service Type: MANDATORY - Must be intelligently matched to one of the provided service or treatment plan options using semantic understanding and natural language processing. THIS FIELD IS REQUIRED FOR ALL LEAD TYPES INCLUDING CALLBACK\n"
             "- Name: Must not be John Doe or Jane Doe\n"
             "- Email: Must be valid email format (contains @ and domain)\n"
             + ("" if is_whatsapp else "- Phone: Must be a valid phone number (digits, reasonable length)\n") +
