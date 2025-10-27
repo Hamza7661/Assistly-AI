@@ -4,7 +4,7 @@ import re
 import time
 import secrets
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -243,6 +243,69 @@ def _convert_lead_types_to_whatsapp_buttons(lead_types: List[Dict[str, Any]]) ->
         })
     return buttons
 
+def _get_root_workflow(workflows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Get the first active root workflow"""
+    if not workflows:
+        return None
+    for workflow in workflows:
+        if workflow.get("isRoot") and workflow.get("isActive"):
+            return workflow
+    return None
+
+def _find_workflow_by_id(workflows: List[Dict[str, Any]], workflow_id: str) -> Optional[Dict[str, Any]]:
+    """Find a workflow by its ID"""
+    if not workflows or not workflow_id:
+        return None
+    for workflow in workflows:
+        if workflow.get("_id") == workflow_id:
+            return workflow
+    return None
+
+def _match_option_to_response(user_text: str, options: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Match user response to workflow option (simple text matching for now)"""
+    if not options:
+        return None
+    
+    user_text_lower = user_text.strip().lower()
+    
+    # First try exact match
+    for opt in options:
+        if opt.get("text", "").lower() == user_text_lower:
+            return opt
+    
+    # Try partial match
+    for opt in options:
+        opt_text = opt.get("text", "").lower()
+        if opt_text in user_text_lower or user_text_lower in opt_text:
+            return opt
+    
+    return None
+
+def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    Process user response within a workflow
+    Returns: (option_text, next_question, is_terminal)
+    """
+    options = current_workflow.get("options", [])
+    matched_option = _match_option_to_response(user_text, options)
+    
+    if not matched_option:
+        return (None, None, False)
+    
+    option_text = matched_option.get("text", "")
+    is_terminal = matched_option.get("isTerminal", False)
+    next_question_id = matched_option.get("nextQuestionId")
+    
+    if is_terminal:
+        return (option_text, None, True)
+    
+    if next_question_id:
+        next_workflow = _find_workflow_by_id(workflows, next_question_id)
+        if next_workflow:
+            return (option_text, next_workflow.get("question"), False)
+    
+    return (option_text, None, True)
+
 def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: List[Any] = None) -> List[Dict[str, Any]]:
     """Convert services and treatment plans to WhatsApp list format"""
     sections = []
@@ -319,6 +382,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     gpt_service.set_profession(str(context.get("profession") or "Clinic"))
     conversation_history: List[Dict[str, str]] = []
     
+    # Workflow state
+    workflow_state = {
+        "current_workflow_id": None,
+        "workflows": context.get("workflows", []),
+        "visited_workflows": []
+    }
+    
     # Email validation state
     email_validation_state = {
         "email": None,
@@ -334,8 +404,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         "otp_verified": False
     }
     
+    # Check if there's a root workflow to start with
+    root_workflow = _get_root_workflow(workflow_state["workflows"])
+    
     # Send initial greeting
-    initial_reply = await gpt_service.agent_greet(context, {})
+    if root_workflow and workflow_state["workflows"]:
+        # Start with workflow instead of GPT
+        initial_reply = root_workflow.get("question", "")
+        workflow_state["current_workflow_id"] = root_workflow.get("_id")
+        workflow_state["visited_workflows"].append(root_workflow.get("_id"))
+    else:
+        # Use GPT greeting as fallback
+        initial_reply = await gpt_service.agent_greet(context, {})
+    
     conversation_history.append({"role": "assistant", "content": initial_reply})
     await websocket.send_json({"type": "bot", "content": initial_reply})
 
@@ -529,9 +610,49 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     # Let GPT handle invalid phone naturally
                     pass
             
-            # Get GPT response
-            reply = await gpt_service.agent_reply(conversation_history, user_text, context, {})
-            logger.info(f"GPT response: '{reply}'")
+            # Check if we're in a workflow
+            reply = None
+            if workflow_state["current_workflow_id"]:
+                current_workflow = _find_workflow_by_id(workflow_state["workflows"], workflow_state["current_workflow_id"])
+                if current_workflow:
+                    option_text, next_question, is_terminal = _process_workflow_response(user_text, current_workflow, workflow_state["workflows"])
+                    
+                    if option_text is not None:
+                        # User matched an option
+                        logger.info(f"Workflow: User selected '{option_text}' in workflow '{current_workflow.get('title')}'")
+                        
+                        if is_terminal:
+                            # Terminal reached - fallback to normal conversation
+                            reply = "Thank you for your response!"
+                            workflow_state["current_workflow_id"] = None
+                        elif next_question:
+                            # Move to next question
+                            reply = next_question
+                            # Find and set the next workflow
+                            next_workflow = _find_workflow_by_id(workflow_state["workflows"], current_workflow.get("options", [])[next((i for i, opt in enumerate(current_workflow.get("options", [])) if opt.get("text") == option_text), -1)].get("nextQuestionId"))
+                            if next_workflow:
+                                workflow_state["current_workflow_id"] = next_workflow.get("_id")
+                                workflow_state["visited_workflows"].append(next_workflow.get("_id"))
+                            else:
+                                workflow_state["current_workflow_id"] = None
+                        else:
+                            # No next question but not terminal - fallback
+                            reply = "Thank you for your response!"
+                            workflow_state["current_workflow_id"] = None
+                    else:
+                        # No match - could be a question or off-path response
+                        logger.info(f"Workflow: User response didn't match options, letting GPT handle")
+                        reply = await gpt_service.agent_reply(conversation_history, user_text, context, {})
+                else:
+                    # Current workflow not found - fallback to GPT
+                    logger.info(f"Workflow: Current workflow not found, falling back to GPT")
+                    reply = await gpt_service.agent_reply(conversation_history, user_text, context, {})
+            else:
+                # Not in a workflow - use GPT
+                logger.info(f"Not in workflow, using GPT")
+                reply = await gpt_service.agent_reply(conversation_history, user_text, context, {})
+            
+            logger.info(f"Response: '{reply}'")
             logger.info(f"Conversation history sent to GPT: {conversation_history[-5:]}")  # Show last 5 messages
             
             # Check for retry requests from GPT response

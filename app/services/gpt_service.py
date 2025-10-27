@@ -42,6 +42,58 @@ class GptService:
         context = context.copy()
         context["service_types"] = merged_services
         return context
+    
+    def _get_workflow_prompt(self, context: Dict[str, Any]) -> str:
+        """Generate workflow instructions for GPT based on custom workflows"""
+        workflows = context.get("workflows", [])
+        if not workflows:
+            return ""
+        
+        # Find root workflows
+        root_workflows = [w for w in workflows if w.get("isRoot", False) and w.get("isActive", True)]
+        
+        if not root_workflows:
+            return ""
+        
+        workflow_instructions = [
+            "CUSTOM WORKFLOW CONVERSATION:",
+            "You have custom workflow questions defined. Use them to guide the conversation:",
+            ""
+        ]
+        
+        # Build workflow tree information
+        for workflow in root_workflows:
+            workflow_instructions.append(f"ROOT QUESTION: {workflow.get('title', 'Untitled')}")
+            workflow_instructions.append(f"Question: {workflow.get('question', '')}")
+            
+            # Get options
+            options = workflow.get("options", [])
+            if options:
+                workflow_instructions.append("Options:")
+                for opt in options:
+                    opt_text = opt.get("text", "")
+                    is_terminal = opt.get("isTerminal", False)
+                    next_q_id = opt.get("nextQuestionId")
+                    
+                    if is_terminal:
+                        workflow_instructions.append(f"  - {opt_text} (terminates conversation)")
+                    elif next_q_id:
+                        # Find the linked workflow
+                        linked_wf = next((w for w in workflows if w.get("_id") == next_q_id), None)
+                        if linked_wf:
+                            workflow_instructions.append(f"  - {opt_text} → leads to: {linked_wf.get('question', '')}")
+                        else:
+                            workflow_instructions.append(f"  - {opt_text}")
+                    else:
+                        workflow_instructions.append(f"  - {opt_text}")
+            
+            workflow_instructions.append("")
+        
+        workflow_instructions.append("IMPORTANT: Follow the custom workflow structure. Present the options as buttons when appropriate.")
+        workflow_instructions.append("When user selects an option, progress to the next question in the workflow.")
+        workflow_instructions.append("")
+        
+        return "\n".join(workflow_instructions)
 
     async def short_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any]) -> str:
         if not self.client:
@@ -101,6 +153,12 @@ class GptService:
         # Merge treatment plans into service types for unified service selection
         context = self._merge_treatment_plans_into_services(context)
         
+        # Get workflow instructions if custom workflows exist
+        workflow_prompt = self._get_workflow_prompt(context)
+        if workflow_prompt:
+            # Add workflow to state so it can be used in generation
+            state["workflow_instructions"] = workflow_prompt
+        
         return await self._agent_generate(history=[], user_message="__INIT__", context=context, state=state, is_init=True, is_whatsapp=is_whatsapp)
 
     async def agent_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_whatsapp: bool = False) -> str:
@@ -109,6 +167,12 @@ class GptService:
         
         # Merge treatment plans into service types for unified service selection
         context = self._merge_treatment_plans_into_services(context)
+        
+        # Get workflow instructions if custom workflows exist
+        workflow_prompt = self._get_workflow_prompt(context)
+        if workflow_prompt:
+            # Add workflow to state so it can be used in generation
+            state["workflow_instructions"] = workflow_prompt
         
         return await self._agent_generate(history=history, user_message=user_message, context=context, state=state, is_init=False, is_whatsapp=is_whatsapp)
 
@@ -148,9 +212,19 @@ class GptService:
             json_fields = "5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber)"
             final_instruction = "CRITICAL: When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON immediately"
         
+        # Get workflow instructions if they exist
+        workflow_instructions = state.get("workflow_instructions", "")
+        
         system = (
             "You are a friendly and professional lead-generation assistant for a {profession}.\n"
             "Your goal is to have a natural conversation and collect all required information before creating a lead.\n\n"
+        )
+        
+        # Add workflow instructions if they exist
+        if workflow_instructions:
+            system += workflow_instructions
+        
+        system += (
             "CRITICAL SYSTEM INSTRUCTIONS:\n"
             "- When user indicates they want to resend OTP (lost, didn't receive, send again), respond with ONLY: 'RETRY_OTP_REQUESTED'\n"
             "- When user indicates they want to change their phone number, respond with ONLY: 'CHANGE_PHONE_REQUESTED'\n"
