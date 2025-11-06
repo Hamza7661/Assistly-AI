@@ -7,3 +7,9 @@ openai==1.40.3
 orjson==3.10.7
 phonenumbers==8.13.31
 twilio
+langchain==0.2.16
+langchain-core==0.2.38
+langchain-openai==0.1.23
+langchain-community==0.2.16
+chromadb==0.4.22
+tiktoken==0.7.0

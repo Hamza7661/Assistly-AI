@@ -24,6 +24,10 @@ class Settings(BaseModel):
     twilio_auth_token: Optional[str] = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_whatsapp_from: Optional[str] = Field(default=None, alias="TWILIO_WHATSAPP_FROM")
     whatsapp_webhook_token: Optional[str] = Field(default=None, alias="WHATSAPP_WEBHOOK_TOKEN")
+    
+    # RAG (Retrieval-Augmented Generation) configuration
+    rag_k: int = Field(default=3, alias="RAG_K")  # Number of documents to retrieve
+    rag_persist_directory: Optional[str] = Field(default=None, alias="RAG_PERSIST_DIRECTORY")  # Optional persistent storage
 
 
 @lru_cache(maxsize=1)
