@@ -427,7 +427,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     lead_service = LeadService(settings)
     rag_service = RAGService(settings)
     email_validation_service = EmailValidationService(settings)
-    phone_validation_service = PhoneValidationService(settings)
+    
+    # Initialize OpenAI client for phone formatting
+    from openai import AsyncOpenAI
+    openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+    phone_validation_service = PhoneValidationService(
+        settings, 
+        openai_client=openai_client,
+        gpt_model=settings.gpt_model
+    )
 
     try:
         context = await context_service.fetch_user_context(user_id)
@@ -514,22 +522,73 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             
             # Handle OTP verification states using state machine
             if current_state == ConversationState.EMAIL_OTP_VERIFICATION:
-                otp_code = extractor.extract_otp_code(user_text)
-                if otp_code:
+                # First, check if user is requesting to change email or resend OTP
+                # Let ResponseGenerator handle it first to detect change/resend requests
+                temp_reply = await response_generator.generate_response(
+                    flow_controller, user_text, conversation_history, context
+                )
+                
+                # Check if it's a change/resend request
+                retry_type, extracted_value = _detect_retry_request(temp_reply)
+                if retry_type == 'resend_otp' and flow_controller.otp_state["email_sent"] and not flow_controller.otp_state["email_verified"]:
+                    # Resend OTP to existing email
                     email = flow_controller.collected_data.get("leadEmail")
+                    customer_name = flow_controller.collected_data.get("leadName", "Customer")
                     if email:
-                        ok, _ = await email_validation_service.verify_otp(user_id, email, otp_code)
-                        if ok:
-                            flow_controller.otp_state["email_verified"] = True
-                            flow_controller.transition_to(flow_controller.get_next_state())
-                            # Get AI response to continue
-                            reply = await response_generator.generate_response(
-                                flow_controller, "Email verified", conversation_history, context
-                            )
-                        else:
-                            reply = "That code doesn't look right. Please check and try entering the 6-digit code again."
+                        ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
+                        reply = (f"I've sent a new verification code to {email}. Please enter the code." 
+                                if ok else "Sorry, I couldn't resend the verification email. Please try again.")
                     else:
-                        reply = "Please enter the 6-digit verification code."
+                        reply = "I don't have your email address. Please provide your email address."
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                elif retry_type == 'change_email':
+                    # Reset email validation state to allow new email
+                    flow_controller.otp_state["email_sent"] = False
+                    flow_controller.otp_state["email_verified"] = False
+                    
+                    if extracted_value:
+                        # Response generator provided the new email
+                        email = extracted_value
+                        flow_controller.collected_data["leadEmail"] = email
+                        customer_name = flow_controller.collected_data.get("leadName", "Customer")
+                        
+                        logger.info(f"WebSocket: Sending OTP to NEW email: {email}")
+                        ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
+                        if ok:
+                            flow_controller.otp_state["email_sent"] = True
+                            flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                        reply = (f"Perfect! I've sent a verification code to {email}. Please enter the code to verify your email." 
+                                if ok else "I found your email, but couldn't send the verification code. Please try again.")
+                    else:
+                        reply = "No problem! Please provide your correct email address."
+                        flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                    
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                else:
+                    # Check if it's an OTP code
+                    otp_code = extractor.extract_otp_code(user_text)
+                    if otp_code:
+                        email = flow_controller.collected_data.get("leadEmail")
+                        if email:
+                            ok, _ = await email_validation_service.verify_otp(user_id, email, otp_code)
+                            if ok:
+                                flow_controller.otp_state["email_verified"] = True
+                                flow_controller.transition_to(flow_controller.get_next_state())
+                                # Get AI response to continue
+                                reply = await response_generator.generate_response(
+                                    flow_controller, "Email verified", conversation_history, context
+                                )
+                            else:
+                                reply = "That code doesn't look right. Please check and try entering the 6-digit code again."
+                        else:
+                            reply = "Please enter the 6-digit verification code."
+                    else:
+                        # Not an OTP and not a change/resend request - use ResponseGenerator's response
+                        reply = temp_reply
                     
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
@@ -612,7 +671,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 parts = reply.split("|||SEND_PHONE:", 1)
                 answer = parts[0].strip()
                 phone = parts[1].strip()
-                phone = format_phone_number(phone)
+                # Format phone with GPT
+                from app.utils.phone_utils import format_phone_number_with_gpt
+                phone = await format_phone_number_with_gpt(phone, openai_client, settings.gpt_model)
                 
                 # Send the answer first
                 conversation_history.append({"role": "assistant", "content": answer})
@@ -658,7 +719,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             
             elif reply.startswith("SEND_PHONE:"):
                 phone = reply.split(":", 1)[1].strip()
-                phone = format_phone_number(phone)
+                # Format phone with GPT
+                from app.utils.phone_utils import format_phone_number_with_gpt
+                phone = await format_phone_number_with_gpt(phone, openai_client, settings.gpt_model)
                 flow_controller.collected_data["leadPhoneNumber"] = phone
                 flow_controller.otp_state["phone_sent"] = True
                 flow_controller.transition_to(ConversationState.PHONE_OTP_SENT)
@@ -674,6 +737,90 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
                 continue
+            
+            # Check for retry requests from response generator
+            retry_type, extracted_value = _detect_retry_request(reply)
+            if retry_type:
+                if retry_type == 'resend_otp' and flow_controller.otp_state["phone_sent"] and not flow_controller.otp_state["phone_verified"]:
+                    # Resend OTP to existing phone number
+                    phone = flow_controller.collected_data.get("leadPhoneNumber")
+                    if phone:
+                        ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
+                        reply = (f"I've sent a new verification code to {phone}. Please enter the code." 
+                                if ok else "Sorry, I couldn't resend the verification SMS. Please try again.")
+                    else:
+                        reply = "I don't have your phone number. Please provide your phone number."
+                    
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                    
+                elif retry_type == 'resend_otp' and flow_controller.otp_state["email_sent"] and not flow_controller.otp_state["email_verified"]:
+                    # Resend OTP to existing email
+                    email = flow_controller.collected_data.get("leadEmail")
+                    customer_name = flow_controller.collected_data.get("leadName", "Customer")
+                    if email:
+                        ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
+                        reply = (f"I've sent a new verification code to {email}. Please enter the code." 
+                                if ok else "Sorry, I couldn't resend the verification email. Please try again.")
+                    else:
+                        reply = "I don't have your email address. Please provide your email address."
+                    
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                    
+                elif retry_type == 'change_phone':
+                    # Reset phone validation state to allow new phone number
+                    flow_controller.otp_state["phone_sent"] = False
+                    flow_controller.otp_state["phone_verified"] = False
+                    
+                    if extracted_value:
+                        # Response generator provided the new phone - format with GPT
+                        from app.utils.phone_utils import format_phone_number_with_gpt
+                        phone = await format_phone_number_with_gpt(extracted_value, openai_client, settings.gpt_model)
+                        flow_controller.collected_data["leadPhoneNumber"] = phone
+                        
+                        logger.info(f"WebSocket: Sending OTP to NEW phone: {phone}")
+                        ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
+                        if ok:
+                            flow_controller.otp_state["phone_sent"] = True
+                            flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
+                        reply = (f"Perfect! I've sent a verification code to {phone}. Please enter the code to verify your phone number." 
+                                if ok else "I found your phone number, but couldn't send the verification code. Please try again.")
+                    else:
+                        reply = "No problem! Please provide your correct phone number."
+                        flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+                    
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                    
+                elif retry_type == 'change_email':
+                    # Reset email validation state to allow new email
+                    flow_controller.otp_state["email_sent"] = False
+                    flow_controller.otp_state["email_verified"] = False
+                    
+                    if extracted_value:
+                        # Response generator provided the new email
+                        email = extracted_value
+                        flow_controller.collected_data["leadEmail"] = email
+                        customer_name = flow_controller.collected_data.get("leadName", "Customer")
+                        
+                        logger.info(f"WebSocket: Sending OTP to NEW email: {email}")
+                        ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
+                        if ok:
+                            flow_controller.otp_state["email_sent"] = True
+                            flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                        reply = (f"Perfect! I've sent a verification code to {email}. Please enter the code to verify your email." 
+                                if ok else "I found your email, but couldn't send the verification code. Please try again.")
+                    else:
+                        reply = "No problem! Please provide your correct email address."
+                        flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                    
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
             
             # Check if JSON was generated (all data collected)
             parsed_json = _maybe_parse_json(reply)
@@ -728,7 +875,15 @@ async def whatsapp_webhook(request: Request):
         lead_service = LeadService(settings)
         rag_service = RAGService(settings)
         email_validation_service = EmailValidationService(settings)
-        phone_validation_service = PhoneValidationService(settings)
+        
+        # Initialize OpenAI client for phone formatting
+        from openai import AsyncOpenAI
+        openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        phone_validation_service = PhoneValidationService(
+            settings,
+            openai_client=openai_client,
+            gpt_model=settings.gpt_model
+        )
         
         # Use the Twilio number from the webhook as the reply-from number
         whatsapp_service.whatsapp_from = twilio_phone
@@ -956,24 +1111,89 @@ async def whatsapp_webhook(request: Request):
         # Check if we're in email OTP verification mode
         if email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
             logger.info(f"WhatsApp: In OTP verification mode, processing user input: {user_text}")
-            # User is entering OTP code - try to extract 6-digit code from text
-            otp_code = _extract_otp_from_text(user_text)
-            if otp_code:
-                logger.info(f"WhatsApp: Extracted OTP code: {otp_code}")
-                # Verify OTP
-                ok, message = await email_validation_service.verify_otp(
-                    user_id, 
-                    email_validation_state["email"], 
-                    otp_code
-                )
-                logger.info(f"WhatsApp Email OTP verification result: {ok} - {message}")
-                if ok:
-                    email_validation_state["otp_verified"] = True
-                    # Update flow controller OTP state
-                    flow_controller.otp_state["email_verified"] = True
-                    flow_controller.transition_to(flow_controller.get_next_state())
-                    # Get AI response to continue the flow
-                    reply = await response_generator.generate_response(flow_controller, "Email verified", conversation_history, context)
+            
+            # First, let ResponseGenerator check if it's a change/resend request
+            temp_reply = await response_generator.generate_response(flow_controller, user_text, conversation_history, context)
+            
+            # Check if it's a change/resend request
+            retry_type, extracted_value = _detect_retry_request(temp_reply)
+            if retry_type == 'resend_otp' and email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
+                # Resend OTP to existing email
+                customer_name = email_validation_state.get("customer_name", flow_controller.collected_data.get("leadName", "Customer"))
+                ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], customer_name)
+                reply = (f"I've sent a new verification code to {email_validation_state['email']}. Please enter the code." 
+                        if ok else "Sorry, I couldn't resend the verification email. Please try again.")
+                conversation_history.append({"role": "assistant", "content": reply})
+                success, message = await whatsapp_service.send_message(user_phone, reply)
+                if not success:
+                    logger.error("Failed to send WhatsApp email retry message: %s", message)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            elif retry_type == 'change_email':
+                # Reset email validation state to allow new email
+                email_validation_state["otp_sent"] = False
+                email_validation_state["otp_verified"] = False
+                email_validation_state["email"] = None
+                # Also update flow_controller
+                flow_controller.otp_state["email_sent"] = False
+                flow_controller.otp_state["email_verified"] = False
+                
+                if extracted_value:
+                    # LangChain provided the new email
+                    email = extracted_value
+                    email_validation_state["email"] = email
+                    email_validation_state["customer_name"] = flow_controller.collected_data.get("leadName", "Customer")
+                    flow_controller.collected_data["leadEmail"] = email
+                    
+                    # Try to get customer name from conversation history if not already in flow_controller
+                    if email_validation_state["customer_name"] == "Customer":
+                        for msg in reversed(conversation_history):
+                            if msg.get("role") == "user":
+                                content = msg.get("content", "").lower()
+                                if "name is" in content or "my name is" in content:
+                                    import re
+                                    name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
+                                    if name_match:
+                                        customer_name = name_match.group(1).strip()
+                                        email_validation_state["customer_name"] = customer_name
+                                        flow_controller.collected_data["leadName"] = customer_name
+                                        break
+                    
+                    logger.info(f"WhatsApp: Sending OTP to NEW email: {email}")
+                    ok, _ = await email_validation_service.send_otp_email(user_id, email, email_validation_state["customer_name"])
+                    if ok:
+                        email_validation_state["otp_sent"] = True
+                        flow_controller.otp_state["email_sent"] = True
+                        flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                    reply = (f"Perfect! I've sent a verification code to {email}. Please enter the code to verify your email." 
+                            if ok else "I found your email, but couldn't send the verification code. Please try again.")
+                else:
+                    reply = "No problem! Please provide your correct email address."
+                    flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                
+                conversation_history.append({"role": "assistant", "content": reply})
+                success, message = await whatsapp_service.send_message(user_phone, reply)
+                if not success:
+                    logger.error("Failed to send WhatsApp change email message: %s", message)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            else:
+                # Check if it's an OTP code
+                otp_code = _extract_otp_from_text(user_text)
+                if otp_code:
+                    logger.info(f"WhatsApp: Extracted OTP code: {otp_code}")
+                    # Verify OTP
+                    ok, message = await email_validation_service.verify_otp(
+                        user_id, 
+                        email_validation_state["email"], 
+                        otp_code
+                    )
+                    logger.info(f"WhatsApp Email OTP verification result: {ok} - {message}")
+                    if ok:
+                        email_validation_state["otp_verified"] = True
+                        # Update flow controller OTP state
+                        flow_controller.otp_state["email_verified"] = True
+                        flow_controller.transition_to(flow_controller.get_next_state())
+                        # Get AI response to continue the flow
+                        reply = await response_generator.generate_response(flow_controller, "Email verified", conversation_history, context)
                     
                     # Check if it's JSON (lead completion) - BEFORE sending
                     parsed_json = _maybe_parse_json(reply)
@@ -1008,16 +1228,11 @@ async def whatsapp_webhook(request: Request):
                         await whatsapp_service.send_message(user_phone, reply)
                         return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 else:
-                    # Send error message directly
-                    error_msg = "That code doesn't look right. Please check and try entering the 6-digit code again."
-                    conversation_history.append({"role": "assistant", "content": error_msg})
-                    await whatsapp_service.send_message(user_phone, error_msg)
-                    logger.info(f"WhatsApp: OTP verification failed, asking user to try again")
+                    # Not an OTP code - use ResponseGenerator's response (which might be an error message or natural response)
+                    reply = temp_reply
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await whatsapp_service.send_message(user_phone, reply)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
-            else:
-                logger.info(f"WhatsApp: No OTP code found in user input, letting GPT handle naturally")
-                # Let GPT handle non-OTP responses naturally
-                pass
         
         # Generate response using production-grade state machine
         reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
@@ -1057,7 +1272,9 @@ async def whatsapp_webhook(request: Request):
             parts = reply.split("|||SEND_PHONE:", 1)
             answer = parts[0].strip()
             phone = parts[1].strip()
-            phone = format_phone_number(phone)
+            # Format phone with GPT (handled inside send_sms_otp, but format here for storage)
+            from app.utils.phone_utils import format_phone_number_with_gpt
+            phone = await format_phone_number_with_gpt(phone, openai_client, settings.gpt_model)
             
             # Send the answer first
             conversation_history.append({"role": "assistant", "content": answer})
@@ -1106,7 +1323,9 @@ async def whatsapp_webhook(request: Request):
             # For WhatsApp, phone is already verified, so this shouldn't happen
             # But handle it just in case
             phone = reply.split(":", 1)[1].strip()
-            phone = format_phone_number(phone)
+            # Format phone with GPT (handled inside send_sms_otp, but format here for storage)
+            from app.utils.phone_utils import format_phone_number_with_gpt
+            phone = await format_phone_number_with_gpt(phone, openai_client, settings.gpt_model)
             flow_controller.collected_data["leadPhoneNumber"] = phone
             flow_controller.otp_state["phone_sent"] = True
             flow_controller.transition_to(ConversationState.PHONE_OTP_SENT)
@@ -1176,7 +1395,8 @@ async def whatsapp_webhook(request: Request):
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             elif retry_type == 'resend_otp' and email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
                 # Resend OTP to existing email
-                ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], "Customer")
+                customer_name = email_validation_state.get("customer_name", flow_controller.collected_data.get("leadName", "Customer"))
+                ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], customer_name)
                 reply = (f"I've sent a new verification code to {email_validation_state['email']}. Please enter the code." 
                         if ok else "Sorry, I couldn't resend the verification email. Please try again.")
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -1190,20 +1410,28 @@ async def whatsapp_webhook(request: Request):
                 phone_validation_state["otp_sent"] = False
                 phone_validation_state["otp_verified"] = False
                 phone_validation_state["phone"] = None
+                # Also update flow_controller
+                flow_controller.otp_state["phone_sent"] = False
+                flow_controller.otp_state["phone_verified"] = False
                 
                 if extracted_value:
-                    # LangChain provided the new phone
-                    phone = format_phone_number(extracted_value)
+                    # LangChain provided the new phone - format with GPT
+                    from app.utils.phone_utils import format_phone_number_with_gpt
+                    phone = await format_phone_number_with_gpt(extracted_value, openai_client, settings.gpt_model)
                     phone_validation_state["phone"] = phone
+                    flow_controller.collected_data["leadPhoneNumber"] = phone
                     
                     logger.info(f"WhatsApp: Sending OTP to NEW phone: {phone}")
                     ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
                     if ok:
                         phone_validation_state["otp_sent"] = True
+                        flow_controller.otp_state["phone_sent"] = True
+                        flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     reply = (f"Perfect! I've sent a verification code to {phone}. Please enter the code to verify your phone number." 
                             if ok else "I found your phone number, but couldn't send the verification code. Please try again.")
                 else:
                     reply = "No problem! Please provide your correct phone number."
+                    flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply)
@@ -1215,32 +1443,42 @@ async def whatsapp_webhook(request: Request):
                 email_validation_state["otp_sent"] = False
                 email_validation_state["otp_verified"] = False
                 email_validation_state["email"] = None
+                # Also update flow_controller
+                flow_controller.otp_state["email_sent"] = False
+                flow_controller.otp_state["email_verified"] = False
                 
                 if extracted_value:
                     # LangChain provided the new email
                     email = extracted_value
                     email_validation_state["email"] = email
-                    email_validation_state["customer_name"] = "Customer"  # Default
+                    email_validation_state["customer_name"] = flow_controller.collected_data.get("leadName", "Customer")
+                    flow_controller.collected_data["leadEmail"] = email
                     
-                    # Try to get customer name from conversation history
-                    for msg in reversed(conversation_history):
-                        if msg.get("role") == "user":
-                            content = msg.get("content", "").lower()
-                            if "name is" in content or "my name is" in content:
-                                import re
-                                name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
-                                if name_match:
-                                    email_validation_state["customer_name"] = name_match.group(1).strip()
-                                    break
+                    # Try to get customer name from conversation history if not already in flow_controller
+                    if email_validation_state["customer_name"] == "Customer":
+                        for msg in reversed(conversation_history):
+                            if msg.get("role") == "user":
+                                content = msg.get("content", "").lower()
+                                if "name is" in content or "my name is" in content:
+                                    import re
+                                    name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
+                                    if name_match:
+                                        customer_name = name_match.group(1).strip()
+                                        email_validation_state["customer_name"] = customer_name
+                                        flow_controller.collected_data["leadName"] = customer_name
+                                        break
                     
                     logger.info(f"WhatsApp: Sending OTP to NEW email: {email}")
                     ok, _ = await email_validation_service.send_otp_email(user_id, email, email_validation_state["customer_name"])
                     if ok:
                         email_validation_state["otp_sent"] = True
+                        flow_controller.otp_state["email_sent"] = True
+                        flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     reply = (f"Perfect! I've sent a verification code to {email}. Please enter the code to verify your email." 
                             if ok else "I found your email, but couldn't send the verification code. Please try again.")
                 else:
                     reply = "No problem! Please provide your correct email address."
+                    flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply)
@@ -1292,7 +1530,9 @@ async def whatsapp_webhook(request: Request):
                 validate_phone = context.get("integration", {}).get("validatePhoneNumber", True)
                 if not validate_phone:
                     # Phone validation is disabled - store phone and let AI respond naturally
-                    phone = format_phone_number(extracted_value)
+                    # Format phone with GPT for consistent storage
+                    from app.utils.phone_utils import format_phone_number_with_gpt
+                    phone = await format_phone_number_with_gpt(extracted_value, openai_client, settings.gpt_model)
                     phone_validation_state["phone"] = phone
                     # Add phone acknowledgment to conversation history (without the phone itself to avoid re-triggering)
                     conversation_history.append({"role": "user", "content": "Phone number provided"})
@@ -1303,7 +1543,9 @@ async def whatsapp_webhook(request: Request):
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 
                 # Phone validation is enabled - send OTP (Note: For WhatsApp, this shouldn't happen as phone is already verified)
-                phone = format_phone_number(extracted_value)
+                # Format phone with GPT
+                from app.utils.phone_utils import format_phone_number_with_gpt
+                phone = await format_phone_number_with_gpt(extracted_value, openai_client, settings.gpt_model)
                 phone_validation_state["phone"] = phone
                 
                 logger.info(f"WhatsApp: Sending OTP SMS to: {phone}")

@@ -2,6 +2,7 @@
 Phone number utilities for formatting and country detection
 """
 import logging
+from typing import Optional
 
 logger = logging.getLogger("assistly.phone_utils")
 
@@ -47,8 +48,54 @@ def detect_country_from_phone(phone: str) -> str:
             return 'US'
 
 
+async def format_phone_number_with_gpt(phone: str, client, model: str) -> str:
+    """Format phone number using GPT to detect and add country code"""
+    # Clean phone number
+    cleaned = ''.join(c for c in phone if c.isdigit() or c == '+')
+    
+    # If it already has a country code, return as is
+    if cleaned.startswith('+'):
+        return cleaned
+    
+    system_prompt = """You are a phone number formatter. Given a phone number without a country code, determine the correct country code and return the phone number in E.164 format (e.g., +1234567890).
+
+Return ONLY the formatted phone number with country code in E.164 format. Do not include any explanation or other text. Just the phone number starting with +.
+
+Examples:
+- Input: "4155551234" → Output: "+14155551234" (US)
+- Input: "07911123456" → Output: "+447911123456" (UK)
+- Input: "03001234567" → Output: "+923001234567" (Pakistan)
+- Input: "0412345678" → Output: "+61412345678" (Australia)
+- Input: "4165551234" → Output: "+14165551234" (Canada/US)"""
+
+    user_prompt = f"Format this phone number: {cleaned}"
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.1,
+        max_tokens=20
+    )
+    
+    formatted = response.choices[0].message.content.strip()
+    
+    # Validate and return the formatted phone number
+    if formatted.startswith('+') and all(c.isdigit() or c == '+' for c in formatted[1:]):
+        logger.info(f"GPT formatted phone {phone} -> {formatted}")
+        return formatted
+    else:
+        # If GPT returns invalid format, raise an error
+        raise ValueError(f"GPT returned invalid phone format: {formatted}")
+
+
 def format_phone_number(phone: str) -> str:
-    """Format phone number with proper country code"""
+    """Format phone number - simple passthrough if already has country code, otherwise return as-is.
+    
+    Note: This function is kept for backward compatibility. Actual formatting is done via GPT.
+    """
     # Remove any non-digit characters except +
     cleaned = ''.join(c for c in phone if c.isdigit() or c == '+')
     
@@ -56,30 +103,7 @@ def format_phone_number(phone: str) -> str:
     if cleaned.startswith('+'):
         return cleaned
     
-    # Detect country and add appropriate country code
-    country = detect_country_from_phone(cleaned)
-    
-    match country:
-        case 'US':
-            if len(cleaned) == 10:
-                cleaned = '+1' + cleaned
-            elif len(cleaned) == 11 and cleaned.startswith('1'):
-                cleaned = '+' + cleaned
-            else:
-                cleaned = '+1' + cleaned
-        case 'UK':
-            cleaned = '+44' + cleaned
-        case 'PK':
-            cleaned = '+92' + cleaned
-        case 'AU':
-            cleaned = '+61' + cleaned
-        case 'CA':
-            cleaned = '+1' + cleaned  # Canada uses same format as US
-        case _:
-            # Default to US
-            cleaned = '+1' + cleaned
-    
-    logger.info(f"Formatted phone {phone} -> {cleaned} (detected country: {country})")
+    # Otherwise return cleaned number (GPT will add country code)
     return cleaned
 
 

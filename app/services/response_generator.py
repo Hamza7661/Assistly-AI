@@ -131,6 +131,148 @@ Respond ONLY with valid JSON in this exact format (no other text):
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse JSON response from LLM: {e}, content: {content}")
     
+    async def _classify_otp_intent(
+        self, 
+        user_message: str, 
+        conversation_history: List[Dict[str, str]],
+        current_email: Optional[str] = None,
+        current_phone: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Classify OTP-related intent (change email/phone, resend OTP).
+        Returns: {
+            'otp_intent': str,  # 'change_email', 'change_phone', 'resend_otp', 'enter_otp', 'other'
+            'extracted_email': Optional[str],  # New email if change_email intent
+            'extracted_phone': Optional[str],  # New phone if change_phone intent
+            'confidence': float  # 0.0 to 1.0
+        }
+        """
+        if not self.client:
+            raise ValueError("LLM client not available - OTP intent classification requires LLM")
+        
+        # Extract email and phone from user message for context
+        extractor = DataExtractor()
+        extracted_email = extractor.extract_email(user_message)
+        extracted_phone = extractor.extract_phone(user_message)
+        
+        # Build context about current state
+        context_info = []
+        if current_email:
+            context_info.append(f"OTP was sent to email: {current_email}")
+        if current_phone:
+            context_info.append(f"OTP was sent to phone: {current_phone}")
+        if extracted_email:
+            context_info.append(f"User mentioned email: {extracted_email}")
+        if extracted_phone:
+            context_info.append(f"User mentioned phone: {extracted_phone}")
+        
+        context_text = "\n".join(context_info) if context_info else "No current contact information available"
+        
+        # Get recent conversation history for context
+        recent_history = ""
+        if conversation_history:
+            recent_msgs = conversation_history[-5:]  # Last 5 messages
+            recent_history = "\n".join([
+                f"{msg.get('role', 'unknown').upper()}: {msg.get('content', '')}"
+                for msg in recent_msgs
+            ])
+        
+        system_prompt = """You are an OTP intent classifier. Analyze the user message to determine their intent regarding OTP verification.
+
+Possible intents:
+1. change_email - User wants to change the email address to receive OTP (mentions different email or says "send to [email]", "wrong email", etc.)
+2. change_phone - User wants to change the phone number to receive OTP (mentions different phone or says "send to [phone]", "wrong number", etc.)
+3. resend_otp - User wants to resend OTP to the same contact (says "resend", "send again", "didn't receive", "send code again", etc.)
+4. enter_otp - User is providing the OTP code (6-digit number)
+5. other - Any other intent
+
+Rules:
+- If user mentions a different email/phone than the current one, it's ALWAYS change_email/change_phone
+- If user says "send it to [email]" or "send to [email]" and mentions an email, it's change_email
+- If user says "send it to [phone]" or "send to [phone]" and mentions a phone, it's change_phone
+- If user mentions resending but doesn't specify a different contact, it's resend_otp
+- If message contains a 6-digit number and user is clearly entering a code, it's enter_otp
+- Examples of change_email: "send it to new@email.com", "wrong email, send to new@email.com", "can u send it to new@email.com", "use new@email.com instead"
+- Examples of resend_otp: "resend code", "send again", "didn't receive", "send the code again"
+
+Respond ONLY with valid JSON in this exact format (no other text):
+{
+  "otp_intent": "change_email|change_phone|resend_otp|enter_otp|other",
+  "extracted_email": "email@example.com" or null,
+  "extracted_phone": "+1234567890" or null,
+  "confidence": 0.0-1.0
+}"""
+
+        user_prompt = f"""Context:
+{context_text}
+
+Recent conversation:
+{recent_history}
+
+User message: "{user_message}"
+
+Classify the intent:"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=150,
+                response_format={"type": "json_object"}
+            )
+        except Exception as json_mode_error:
+            # Fallback: model doesn't support JSON mode
+            logger.debug(f"JSON mode not supported for OTP intent, using prompt-based: {json_mode_error}")
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=150
+            )
+        
+        # Parse JSON response
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("Empty response from LLM for OTP intent classification")
+        
+        # Extract JSON from response
+        content_clean = content.strip()
+        json_start = content_clean.find('{')
+        json_end = content_clean.rfind('}') + 1
+        if json_start >= 0 and json_end > json_start:
+            content_clean = content_clean[json_start:json_end]
+        
+        try:
+            result = json.loads(content_clean)
+            otp_intent = result.get("otp_intent", "other")
+            extracted_email = result.get("extracted_email")
+            extracted_phone = result.get("extracted_phone")
+            confidence = float(result.get("confidence", 0.5))
+            
+            # Use extracted email/phone from message if LLM didn't extract them
+            if otp_intent == "change_email" and not extracted_email:
+                extracted_email = extractor.extract_email(user_message)
+            if otp_intent == "change_phone" and not extracted_phone:
+                extracted_phone = extractor.extract_phone(user_message)
+            
+            result = {
+                "otp_intent": otp_intent,
+                "extracted_email": extracted_email,
+                "extracted_phone": extracted_phone,
+                "confidence": max(0.0, min(1.0, confidence))
+            }
+            logger.debug(f"OTP intent classified: {result}")
+            return result
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON response from LLM for OTP intent: {e}, content: {content}")
+    
     async def generate_response(
         self,
         flow_controller: FlowController,
@@ -156,16 +298,64 @@ Respond ONLY with valid JSON in this exact format (no other text):
         if state == ConversationState.NAME_COLLECTION:
             name = extractor.extract_name(user_message, context.get("lead_types", []))
         
-        # Handle OTP verification states
+        # Handle OTP verification states - FIRST check for change/resend requests using intent classification
         if state == ConversationState.EMAIL_OTP_VERIFICATION:
+            current_email = flow_controller.collected_data.get("leadEmail")
+            
+            # First check if it's a valid OTP code
             if otp_code and validator.is_valid_otp(otp_code):
                 return "OTP_VERIFY_EMAIL:" + otp_code
-            return "That code doesn't look right. Please check and try entering the 6-digit code again."
+            
+            # Not a valid OTP - use intent classification to detect change/resend requests
+            try:
+                otp_intent_result = await self._classify_otp_intent(
+                    user_message, 
+                    conversation_history,
+                    current_email=current_email
+                )
+                otp_intent = otp_intent_result.get("otp_intent", "other")
+                
+                if otp_intent == "change_email":
+                    new_email = otp_intent_result.get("extracted_email")
+                    if new_email:
+                        return f"CHANGE_EMAIL_REQUESTED: {new_email}"
+                    else:
+                        return "CHANGE_EMAIL_REQUESTED"
+                elif otp_intent == "resend_otp":
+                    return "RETRY_OTP_REQUESTED"
+                # If intent is "enter_otp" but no valid OTP found, or "other", continue to normal flow
+            except Exception as e:
+                logger.error(f"Error in OTP intent classification: {e}")
+                # Continue to normal flow if classification fails
         
         if state == ConversationState.PHONE_OTP_VERIFICATION:
+            current_phone = flow_controller.collected_data.get("leadPhoneNumber")
+            
+            # First check if it's a valid OTP code
             if otp_code and validator.is_valid_otp(otp_code):
                 return "OTP_VERIFY_PHONE:" + otp_code
-            return "That code doesn't look right. Please check and try entering the 6-digit code again."
+            
+            # Not a valid OTP - use intent classification to detect change/resend requests
+            try:
+                otp_intent_result = await self._classify_otp_intent(
+                    user_message,
+                    conversation_history,
+                    current_phone=current_phone
+                )
+                otp_intent = otp_intent_result.get("otp_intent", "other")
+                
+                if otp_intent == "change_phone":
+                    new_phone = otp_intent_result.get("extracted_phone")
+                    if new_phone:
+                        return f"CHANGE_PHONE_REQUESTED: {new_phone}"
+                    else:
+                        return "CHANGE_PHONE_REQUESTED"
+                elif otp_intent == "resend_otp":
+                    return "RETRY_OTP_REQUESTED"
+                # If intent is "enter_otp" but no valid OTP found, or "other", continue to normal flow
+            except Exception as e:
+                logger.error(f"Error in OTP intent classification: {e}")
+                # Continue to normal flow if classification fails
         
         # Classify user intent (question detection using LLM)
         try:

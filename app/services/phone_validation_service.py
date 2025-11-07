@@ -8,21 +8,26 @@ import phonenumbers
 from phonenumbers import NumberParseException
 
 from ..utils.signing import build_signature, generate_nonce, generate_ts_millis
-from ..utils.phone_utils import format_phone_number, is_valid_phone_number
+from ..utils.phone_utils import format_phone_number_with_gpt, is_valid_phone_number
 
 logger = logging.getLogger("assistly.phone_validation")
 
 
 class PhoneValidationService:
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Any, openai_client=None, gpt_model: Optional[str] = None) -> None:
         self.backend_url: str = settings.api_base_url.rstrip("/")
         self.secret: Optional[str] = settings.tp_sign_secret
+        self.openai_client = openai_client
+        self.gpt_model = gpt_model
 
     async def send_sms_otp(self, user_id: str, phone: str) -> Tuple[bool, str]:
-        """Send SMS OTP to user's phone number using phone utils for formatting."""
+        """Send SMS OTP to user's phone number using GPT for formatting."""
         try:
-            # Format phone number using phone utils (automatically detects country)
-            formatted_phone = format_phone_number(phone)
+            # Format phone number using GPT
+            if not self.openai_client or not self.gpt_model:
+                return False, "OpenAI client not available for phone formatting"
+            
+            formatted_phone = await format_phone_number_with_gpt(phone, self.openai_client, self.gpt_model)
             
             # Validate phone number
             if not is_valid_phone_number(formatted_phone):
@@ -76,10 +81,13 @@ class PhoneValidationService:
             return False, f"Failed to send SMS OTP: {str(e)}"
                 
     async def verify_sms_otp(self, user_id: str, phone: str, otp: str) -> Tuple[bool, str]:
-        """Verify the SMS OTP code entered by user using phone utils for formatting."""
+        """Verify the SMS OTP code entered by user using GPT for formatting."""  
         try:
-            # Format phone number using phone utils (automatically detects country)
-            formatted_phone = format_phone_number(phone)
+            # Format phone number using GPT
+            if not self.openai_client or not self.gpt_model:
+                return False, "OpenAI client not available for phone formatting"
+            
+            formatted_phone = await format_phone_number_with_gpt(phone, self.openai_client, self.gpt_model)
             
             # Validate phone number
             if not is_valid_phone_number(formatted_phone):
