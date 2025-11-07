@@ -1616,8 +1616,10 @@ async def voice_webhook(websocket: WebSocket):
     """Bridge Twilio media stream with Deepgram Voice Agent and state machine."""
     await websocket.accept()
 
-    meta = websocket.query_params.get("meta", "")
-    logger.info("Voice: Meta: %s", meta)
+    call_sid = websocket.query_params.get("CallSid", "")
+    caller_phone = websocket.query_params.get("From", "")
+    twilio_phone = websocket.query_params.get("To", "")
+    user_id = websocket.query_params.get("user_id", "").strip()
 
     caller_phone = caller_phone.replace("tel:", "").strip()
     twilio_phone = twilio_phone.replace("tel:", "").strip() or caller_phone
