@@ -160,18 +160,22 @@ class FlowController:
         
         return True
     
-    def get_json_data(self) -> Dict[str, Any]:
+    def get_json_data(self, conversation_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         """Get collected data as JSON-ready dict"""
         data = {
             "leadType": self.collected_data["leadType"],
             "serviceType": self.collected_data["serviceType"],
-            "leadName": self.collected_data["leadName"],
+            "leadName": self.collected_data["leadName"],  # Customer name
             "leadEmail": self.collected_data["leadEmail"],
             "title": self.collected_data.get("title", "")
         }
         
         if not self.is_whatsapp:
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
+        
+        # Add conversation history if provided
+        if conversation_history:
+            data["history"] = conversation_history
         
         return data
     

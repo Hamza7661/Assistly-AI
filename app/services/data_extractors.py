@@ -147,9 +147,33 @@ class DataExtractor:
             text = str(lt.get("text", "")).lower().strip()
             value = str(lt.get("value", "")).lower().strip()
             
+            # Normalize both for better matching (remove punctuation, extra spaces)
+            import re
+            text_normalized = re.sub(r'[^\w\s]', '', text)
+            value_normalized = re.sub(r'[^\w\s]', '', value)
+            user_input_normalized = re.sub(r'[^\w\s]', '', user_input_lower)
+            
+            # Check if key words from text/value are in user input
+            if text_normalized:
+                text_words = set(word for word in text_normalized.split() if len(word) > 2)
+                user_words = set(word for word in user_input_normalized.split() if len(word) > 2)
+                # If majority of meaningful words match, consider it a match
+                if text_words and len(text_words.intersection(user_words)) >= min(2, len(text_words) * 0.6):
+                    logger.info(f"Matched lead type by text words: {lt.get('text')}")
+                    return lt
+            
             if text and (text in user_input_lower or user_input_lower in text):
                 logger.info(f"Matched lead type by text substring: {lt.get('text')}")
                 return lt
+            
+            # Check value matching with word overlap
+            if value_normalized:
+                value_words = set(word for word in value_normalized.split() if len(word) > 2)
+                user_words = set(word for word in user_input_normalized.split() if len(word) > 2)
+                # If key words from value are in user input (e.g., "appointment" in "arrange an appointment")
+                if value_words and value_words.intersection(user_words):
+                    logger.info(f"Matched lead type by value words: {lt.get('value')}")
+                    return lt
             
             if value and (value in user_input_lower or user_input_lower in value):
                 logger.info(f"Matched lead type by value substring: {lt.get('value')}")
@@ -191,11 +215,20 @@ class DataExtractor:
     
     @staticmethod
     def match_service(user_input: str, services: List[Any]) -> Optional[str]:
-        """Match user input to a service"""
+        """Match user input to a service - handles partial matches and single keywords"""
         if not user_input or not services:
             return None
         
         user_input_lower = user_input.lower().strip()
+        # Remove punctuation for better matching
+        import re
+        user_input_normalized = re.sub(r'[^\w\s]', '', user_input_lower)
+        
+        # Common words to ignore
+        common_words = {'i', 'would', 'like', 'to', 'a', 'an', 'the', 'my', 'me', 'for', 'with', 'is', 'are', 'am', 'well', 'can', 'you', 'tell', 'me', 'the', 'about', 'do', 'does', 'what', 'how', 'much', 'cost', 'price', 'pricing', 'information', 'info'}
+        
+        best_match = None
+        best_score = 0
         
         for service in services:
             service_name = None
@@ -209,23 +242,48 @@ class DataExtractor:
                 continue
             
             service_lower = service_name.lower()
+            service_normalized = re.sub(r'[^\w\s]', '', service_lower)
             
-            # Exact match
-            if service_lower == user_input_lower:
+            # Exact match (highest priority)
+            if service_lower == user_input_lower or service_normalized == user_input_normalized:
                 logger.info(f"Matched service (exact): {service_name}")
                 return service_name
             
-            # Contains match
+            # Contains match (high priority)
             if service_lower in user_input_lower or user_input_lower in service_lower:
                 logger.info(f"Matched service (contains): {service_name}")
                 return service_name
             
-            # Word match (at least 2 words match)
-            service_words = set(service_lower.split())
-            input_words = set(user_input_lower.split())
-            if len(service_words.intersection(input_words)) >= 2:
-                logger.info(f"Matched service (words): {service_name}")
-                return service_name
+            # Extract meaningful words (exclude common words and short words)
+            service_words = set(word for word in service_normalized.split() if word not in common_words and len(word) > 2)
+            input_words = set(word for word in user_input_normalized.split() if word not in common_words and len(word) > 2)
+            
+            if not service_words:
+                continue
+            
+            # Calculate overlap score
+            overlap = service_words.intersection(input_words)
+            score = len(overlap)
+            
+            # Match if:
+            # 1. At least 2 words match (strong match)
+            # 2. OR 1 key word matches AND it's a significant word (length >= 4) OR it's the only/main word in service name
+            if score >= 2:
+                if score > best_score:
+                    best_match = service_name
+                    best_score = score
+            elif score == 1 and overlap:
+                # Single word match - check if it's significant
+                matched_word = list(overlap)[0]
+                # If service name is 1-2 words and we matched one, or if matched word is >= 4 chars (significant)
+                if len(service_words) <= 2 or len(matched_word) >= 4:
+                    if score > best_score:
+                        best_match = service_name
+                        best_score = score
+        
+        if best_match:
+            logger.info(f"Matched service (keyword match, score {best_score}): {best_match}")
+            return best_match
         
         return None
 

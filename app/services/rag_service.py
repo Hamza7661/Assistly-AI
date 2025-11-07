@@ -26,6 +26,7 @@ class RAGService:
         self.retriever = None
         self.qa_chain = None
         self.qa_prompt = None
+        self._retriever_method = None  # Cache the correct method to use
         
         # RAG is always enabled - initialize embeddings and LLM if API key is available
         if self.openai_api_key:
@@ -46,6 +47,26 @@ class RAGService:
                 logger.error(f"Failed to initialize RAG components: {e}")
         else:
             logger.warning("OpenAI API key not provided, RAG will not be available")
+    
+    def _retrieve_documents(self, query: str) -> List[Document]:
+        """Retrieve documents using the retriever - handles API compatibility"""
+        if not self.retriever:
+            raise ValueError("Retriever not initialized")
+        
+        # Determine which method to use on first call and cache it
+        if self._retriever_method is None:
+            if hasattr(self.retriever, 'invoke'):
+                self._retriever_method = 'invoke'
+            elif hasattr(self.retriever, 'get_relevant_documents'):
+                self._retriever_method = 'get_relevant_documents'
+            else:
+                raise ValueError("Retriever doesn't have invoke() or get_relevant_documents() method")
+        
+        # Use the cached method
+        if self._retriever_method == 'invoke':
+            return self.retriever.invoke(query)
+        else:
+            return self.retriever.get_relevant_documents(query)
     
     def _prepare_documents_from_context(self, context: Dict[str, Any]) -> List[Document]:
         """Convert ALL context data into LangChain Documents for comprehensive RAG"""
@@ -84,15 +105,18 @@ class RAGService:
                             metadata={"source": "service", "index": service_index, "type": "service", "name": name}
                         ))
         
-        # Add Treatment Plans - merge into services (same as service types)
+        # Add Treatment Plans - index both as services AND as Q&A for answering questions
         treatment_plans = context.get("treatment_plans", [])
         if isinstance(treatment_plans, list):
-            for plan in treatment_plans:
+            for i, plan in enumerate(treatment_plans):
                 if isinstance(plan, dict):
                     question = plan.get("question", "")
+                    answer = plan.get("answer", "")
                     description = plan.get("description", "")
+                    
                     if question:
                         service_index += 1
+                        # Index as service option (for selection)
                         doc_text = f"Service Option {service_index}:\nName: {question}"
                         if description:
                             doc_text += f"\nDescription: {description}"
@@ -101,6 +125,23 @@ class RAGService:
                             page_content=doc_text,
                             metadata={"source": "service", "index": service_index, "type": "service", "name": question, "is_treatment_plan": True}
                         ))
+                        
+                        # Also index as Q&A document (for answering questions about this treatment)
+                        if answer:
+                            qa_text = f"Treatment Plan {i+1}:\nQuestion: {question}\nAnswer: {answer}"
+                            if description:
+                                qa_text += f"\nDescription: {description}"
+                            documents.append(Document(
+                                page_content=qa_text,
+                                metadata={"source": "treatment_plan", "index": i, "type": "treatment_plan_qa", "question": question, "has_answer": True}
+                            ))
+                        elif description:
+                            # If no answer but has description, use description as answer
+                            qa_text = f"Treatment Plan {i+1}:\nQuestion: {question}\nAnswer: {description}"
+                            documents.append(Document(
+                                page_content=qa_text,
+                                metadata={"source": "treatment_plan", "index": i, "type": "treatment_plan_qa", "question": question, "has_answer": True}
+                            ))
         
         # Add FAQs
         faqs = context.get("faqs", [])
@@ -156,7 +197,7 @@ class RAGService:
                     metadata={"source": "integration", "type": "integration", "validateEmail": validate_email, "validatePhoneNumber": validate_phone, "greeting": greeting}
                 ))
         
-        logger.info(f"Prepared {len(documents)} documents from context for RAG (including lead types, service types, and validation flags)")
+        logger.info(f"Prepared {len(documents)} documents from context for RAG (including lead types, service types, treatment plans with answers, FAQs, and validation flags)")
         return documents
     
     def build_vector_store(self, context: Dict[str, Any], persist_directory: Optional[str] = None) -> bool:
@@ -290,7 +331,7 @@ Response:"""
         
         try:
             # Retrieve relevant documents
-            docs = self.retriever.get_relevant_documents(query)
+            docs = self._retrieve_documents(query)
             
             if not docs:
                 logger.info(f"No relevant documents found for query: {query}")
@@ -453,7 +494,8 @@ Response:"""
                 context_data = self._merge_treatment_plans_into_services(context_data)
             
             # Retrieve relevant documents for context
-            docs = self.retriever.get_relevant_documents(query, k=self.rag_k * 2)
+            docs = self._retrieve_documents(query)
+            
             if not docs:
                 logger.info(f"No relevant documents found for query: {query}")
                 return None
@@ -870,7 +912,8 @@ Response:"""
         try:
             # Retrieve integration/greeting documents
             query = "greeting message initial"
-            docs = self.retriever.get_relevant_documents(query)
+            # Retrieve documents
+            docs = self._retrieve_documents(query)
             
             # Format context
             context = "\n\n".join([doc.page_content for doc in docs]) if docs else ""
