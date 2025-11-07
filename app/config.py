@@ -12,6 +12,12 @@ class Settings(BaseModel):
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     gpt_model: str = Field(default="gpt-5-nano", alias="GPT_MODEL")
 
+    deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
+    deepgram_listen_model: str = Field(default="nova-3", alias="DEEPGRAM_LISTEN_MODEL")
+    deepgram_think_model: str = Field(default="gpt-4o-mini", alias="DEEPGRAM_THINK_MODEL")
+    deepgram_speak_model: str = Field(default="aura-2-asteria-en", alias="DEEPGRAM_SPEAK_MODEL")
+    deepgram_sample_rate: int = Field(default=16000, alias="DEEPGRAM_SAMPLE_RATE")
+
     tp_sign_secret: Optional[str] = Field(default=None, alias="TP_SIGN_SECRET")
 
     max_history_messages: int = Field(default=10, alias="MAX_HISTORY_MESSAGES")

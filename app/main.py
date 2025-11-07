@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import re
@@ -11,6 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
 
+from deepgram.core.events import EventType
+from deepgram.extensions.types.sockets import (
+    AgentV1SocketClientResponse,
+    AgentV1MediaMessage,
+    AgentV1InjectAgentMessageMessage,
+)
+
 from .config import settings
 from .services.context_service import ContextService
 from .services.lead_service import LeadService
@@ -20,6 +28,7 @@ from .services.whatsapp_service import WhatsAppService
 from .services.rag_service import RAGService
 from .services.conversation_state import FlowController, ConversationState
 from .services.response_generator import ResponseGenerator
+from .services.voice_agent_service import VoiceAgentService
 from .services.data_extractors import DataExtractor
 from .utils.phone_utils import format_phone_number
 
@@ -1601,3 +1610,202 @@ async def whatsapp_webhook_verification(request: Request):
     """Handle WhatsApp webhook verification (GET request)"""
     # Twilio may send GET requests for webhook verification
     return {"status": "ok", "message": "WhatsApp webhook endpoint is active"}
+
+@app.websocket("/webhook/voice/stream")
+async def voice_webhook(websocket: WebSocket):
+    """Bridge Twilio media stream with Deepgram Voice Agent and state machine."""
+    await websocket.accept()
+
+    meta = websocket.query_params.get("meta", "")
+    logger.info("Voice: Meta: %s", meta)
+
+    caller_phone = caller_phone.replace("tel:", "").strip()
+    twilio_phone = twilio_phone.replace("tel:", "").strip() or caller_phone
+
+    logger.info("Voice: WebSocket connection established. caller=%s, twilio=%s, CallSid=%s", caller_phone, twilio_phone, call_sid)
+
+    # Initialize services
+    context_service = ContextService(settings)
+    lead_service = LeadService(settings)
+    rag_service = RAGService(settings)
+
+    try:
+        context = await context_service.fetch_user_context_by_twilio(twilio_phone)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Voice: Failed to fetch user context for Twilio number %s: %s", twilio_phone, exc)
+        await websocket.close(code=1011, reason="Failed to fetch context")
+        return
+
+    user_data = context.get("user", {})
+    user_id = user_data.get("id") or user_data.get("_id")
+    if not user_id:
+        logger.error("Voice: No user ID associated with Twilio number %s", twilio_phone)
+        await websocket.close(code=1011, reason="User not found")
+        return
+
+    rag_service.build_vector_store(context)
+
+    flow_controller = FlowController(context)
+    flow_controller.set_voice(True)
+    flow_controller.update_collected_data("leadPhoneNumber", caller_phone)
+    flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+
+    response_generator = ResponseGenerator(settings, rag_service)
+    response_generator.set_profession(str(context.get("profession") or "Clinic"))
+    response_generator.set_channel("voice")
+
+    voice_agent_service = VoiceAgentService(settings)
+
+    initial_greeting = await response_generator.generate_greeting(context, channel="voice", is_voice=True)
+    conversation_history: List[Dict[str, str]] = [{"role": "assistant", "content": initial_greeting}]
+
+    user_message_queue: asyncio.Queue[str] = asyncio.Queue()
+    agent_audio_queue: asyncio.Queue[str] = asyncio.Queue()
+    processing_lock = asyncio.Lock()
+    loop = asyncio.get_running_loop()
+
+    stream_sid: Optional[str] = None
+
+    async def forward_agent_audio():
+        while True:
+            payload = await agent_audio_queue.get()
+            if not stream_sid:
+                # Wait until stream is established
+                await asyncio.sleep(0.05)
+                agent_audio_queue.task_done()
+                continue
+            media_msg = json.dumps({
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": payload},
+            })
+            try:
+                await websocket.send_text(media_msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Voice: Failed sending media to Twilio: %s", exc)
+                break
+            agent_audio_queue.task_done()
+
+    def enqueue_user_text(text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        loop.call_soon_threadsafe(user_message_queue.put_nowait, text)
+
+    async with voice_agent_service.create_connection() as agent:
+        settings_message = voice_agent_service.create_settings_message(prompt='Reply only and explicitly with "OK".')
+        await agent.send_settings(settings_message)
+
+        async def send_agent_text(text: str) -> None:
+            try:
+                await agent.send_inject_agent_message(AgentV1InjectAgentMessageMessage(text=text))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Voice: Failed to inject agent message: %s", exc)
+
+        def on_agent_message(message: AgentV1SocketClientResponse | bytes) -> None:
+            try:
+                if isinstance(message, bytes):
+                    payload = base64.b64encode(message).decode("utf-8")
+                    loop.call_soon_threadsafe(agent_audio_queue.put_nowait, payload)
+                    return
+
+                payload = message.model_dump() if hasattr(message, "model_dump") else {}
+                msg_type = payload.get("type") or getattr(message, "type", "")
+
+                if msg_type == "conversation.text":
+                    text = payload.get("conversation", {}).get("text") or payload.get("text")
+                    if text:
+                        enqueue_user_text(text)
+                elif msg_type == "error":
+                    logger.error("Voice: Deepgram agent error: %s", payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Voice: Error handling agent message: %s", exc)
+
+        agent.on(EventType.OPEN, lambda *_: logger.info("Voice: Deepgram agent connection opened"))
+        agent.on(EventType.ERROR, lambda error: logger.error(f"Voice: Deepgram agent error: {error}"))
+        agent.on(EventType.CLOSE, lambda info=None: logger.info(f"Voice: Deepgram agent connection closed: {info}"))
+        agent.on(EventType.MESSAGE, on_agent_message)
+
+        await agent.start_listening()
+
+        # Speak the initial greeting
+        await send_agent_text(initial_greeting)
+
+        async def process_messages():
+            while True:
+                user_text = await user_message_queue.get()
+                async with processing_lock:
+                    logger.info("Voice: User said: %s", user_text)
+                    conversation_history.append({"role": "user", "content": user_text})
+
+                    reply = await response_generator.generate_response(
+                        flow_controller,
+                        user_text,
+                        conversation_history,
+                        context,
+                    )
+
+                    parsed_json = _maybe_parse_json(reply)
+                    if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
+                        if "leadPhoneNumber" not in parsed_json:
+                            parsed_json["leadPhoneNumber"] = caller_phone
+
+                        try:
+                            ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                            final_msg = (
+                                "Thanks! I have your details and someone will get back to you soon. Bye!"
+                                if ok
+                                else "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will follow up shortly. Bye!"
+                            )
+                        except Exception:  # noqa: BLE001
+                            final_msg = (
+                                "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will follow up shortly. Bye!"
+                            )
+
+                        conversation_history.append({"role": "assistant", "content": final_msg})
+                        await send_agent_text(final_msg)
+                        await websocket.close(code=1000)
+                        break
+
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await send_agent_text(reply)
+
+        async def forward_audio_task():
+            await forward_agent_audio()
+
+        processor = asyncio.create_task(process_messages())
+        audio_forwarder = asyncio.create_task(forward_audio_task())
+
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                try:
+                    event = json.loads(msg)
+                except json.JSONDecodeError:
+                    logger.debug("Voice: Non-JSON message from Twilio: %s", msg)
+                    continue
+
+                event_type = event.get("event")
+                if event_type == "start":
+                    stream_info = event.get("start", {})
+                    stream_sid = stream_info.get("streamSid", stream_sid)
+                    logger.info("Voice: Twilio stream started (streamSid=%s)", stream_sid)
+                elif event_type == "media":
+                    if stream_sid is None:
+                        continue
+                    payload = event.get("media", {}).get("payload")
+                    if payload:
+                        audio = base64.b64decode(payload)
+                        await agent.send_media(AgentV1MediaMessage(data=audio))
+                elif event_type == "mark":
+                    continue
+                elif event_type == "stop":
+                    logger.info("Voice: Twilio stream stopped")
+                    break
+        except WebSocketDisconnect:
+            logger.info("Voice: WebSocket disconnected by client (CallSid=%s)", call_sid)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Voice: Error in voice stream: %s", exc)
+        finally:
+            processor.cancel()
+            audio_forwarder.cancel()

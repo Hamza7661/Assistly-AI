@@ -47,6 +47,7 @@ class FlowController:
         self.validate_email = integration.get("validateEmail", True)
         self.validate_phone = integration.get("validatePhoneNumber", True)
         self.is_whatsapp = False  # Set externally
+        self.is_voice = False
     
     def set_whatsapp(self, is_whatsapp: bool):
         """Set WhatsApp mode (phone already verified)"""
@@ -57,6 +58,16 @@ class FlowController:
             # Extract phone from WhatsApp context if available
             # This would come from Twilio webhook
     
+    def set_voice(self, is_voice: bool):
+        """Configure voice mode (no OTPs, phone collected from caller)."""
+        self.is_voice = is_voice
+        if is_voice:
+            # Voice behaves like WhatsApp for verification purposes
+            self.set_whatsapp(True)
+            # Disable OTP validations explicitly for voice flows
+            self.validate_email = False
+            self.validate_phone = False
+
     def update_collected_data(self, field: str, value: Any):
         """Update collected data and handle title extraction"""
         self.collected_data[field] = value
@@ -148,7 +159,7 @@ class FlowController:
                 return False
         
         # Check phone (if not WhatsApp)
-        if not self.is_whatsapp and not self.collected_data.get("leadPhoneNumber"):
+        if not self.is_whatsapp or self.is_voice:
             return False
         
         # Check OTP verification
@@ -170,7 +181,7 @@ class FlowController:
             "title": self.collected_data.get("title", "")
         }
         
-        if not self.is_whatsapp:
+        if not self.is_whatsapp or self.is_voice:
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
         
         # Add conversation history if provided
