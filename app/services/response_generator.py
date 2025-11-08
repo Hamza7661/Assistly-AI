@@ -44,7 +44,35 @@ class ResponseGenerator:
         if len(cleaned) == 2:
             return f"{cleaned[0]} or {cleaned[1]}"
         return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
-    
+
+    def _voice_friendly_lead_text(self, text: str) -> str:
+        """Convert lead type text to a question-friendly voice format."""
+        if not text:
+            return ""
+
+        cleaned = text.strip()
+        lowered = cleaned.lower()
+        replacements = (
+            "i would like",
+            "i'd like",
+            "i want",
+        )
+
+        for prefix in replacements:
+            if lowered.startswith(prefix):
+                remainder = cleaned[len(prefix):].lstrip()
+                cleaned = f"Would you like {remainder}".strip()
+                break
+
+        if not cleaned.lower().startswith("would you like"):
+            cleaned = cleaned[0].upper() + cleaned[1:]
+
+        cleaned = cleaned.rstrip(". ")
+        if not cleaned.endswith("?"):
+            cleaned = f"{cleaned}?"
+
+        return cleaned
+
     def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Merge treatment plans into service_types array for unified service selection"""
         service_types = context.get("service_types", [])
@@ -839,9 +867,9 @@ If the context doesn't contain the answer, say "I don't have that information, b
             lead_names = []
             for lt in lead_types:
                 if isinstance(lt, dict):
-                    lead_names.append(lt.get("text", ""))
+                    lead_names.append(self._voice_friendly_lead_text(lt.get("text", "")))
                 else:
-                    lead_names.append(str(lt))
+                    lead_names.append(self._voice_friendly_lead_text(str(lt)))
             lead_voice_text = self._format_voice_list(lead_names)
 
             services = context.get("service_types", [])
