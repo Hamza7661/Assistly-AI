@@ -17,11 +17,14 @@ from .services.lead_service import LeadService
 from .services.email_validation_service import EmailValidationService
 from .services.phone_validation_service import PhoneValidationService
 from .services.whatsapp_service import WhatsAppService
+from .services.voice_agent_service import VoiceAgentService
 from .services.rag_service import RAGService
 from .services.conversation_state import FlowController, ConversationState
 from .services.response_generator import ResponseGenerator
 from .services.data_extractors import DataExtractor
 from .utils.phone_utils import format_phone_number
+
+from twilio.twiml.voice_response import VoiceResponse
 
 
 logger = logging.getLogger("assistly")
@@ -36,6 +39,9 @@ phone_to_session: Dict[str, str] = {}
 
 # Session timeout from environment variable (default: 5 minutes)
 SESSION_TIMEOUT = settings.session_timeout_seconds
+
+# Voice agent sessions
+voice_agent_service = VoiceAgentService(settings)
 
 def get_or_create_session(user_phone: str) -> tuple[str, bool]:
     """Get existing session or create new one. Returns (session_id, is_new)"""
@@ -454,6 +460,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     
     response_generator = ResponseGenerator(settings, rag_service)
     response_generator.set_profession(str(context.get("profession") or "Clinic"))
+    response_generator.set_channel("web")
     
     extractor = DataExtractor()
     conversation_history: List[Dict[str, str]] = []
@@ -471,7 +478,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         initial_reply = root_workflow.get("question", "")
         current_workflow_id = root_workflow.get("_id")
     else:
-        initial_reply = await response_generator.generate_greeting(context, is_whatsapp=False)
+        initial_reply = await response_generator.generate_greeting(context, channel="web")
         # Transition to lead type selection after greeting
         flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
     
@@ -852,6 +859,150 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         logger.info("WebSocket disconnected for user_id=%s", user_id)
 
 
+@app.post("/webhook/voice-agent")
+async def voice_agent_webhook(request: Request) -> Response:
+    """Handle incoming Twilio voice calls and connect them to the Deepgram voice agent."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    from_number = form.get("From")
+    to_number = form.get("To")
+
+    if not call_sid or not from_number:
+        logger.error("Voice agent webhook missing required params: CallSid=%s From=%s", call_sid, from_number)
+        failure = VoiceResponse()
+        failure.say("Sorry, something went wrong connecting your call.")
+        return Response(content=str(failure), media_type="text/xml")
+
+    logger.info("Voice agent webhook: call_sid=%s from=%s to=%s", call_sid, from_number, to_number)
+
+    try:
+        await voice_agent_service.start_session(call_sid, from_number, to_number)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unable to initialize voice agent session for %s: %s", call_sid, exc)
+        failure_response = VoiceResponse()
+        failure_response.say("Sorry, our assistant is unavailable at the moment. Please try again later.")
+        return Response(content=str(failure_response), media_type="text/xml")
+
+    twiml_response = VoiceResponse()
+    twiml_response.say("Connecting you to our virtual assistant now.")
+
+    stream_url = str(request.url_for("voice_agent_stream"))
+    if stream_url.startswith("http://"):
+        stream_url = stream_url.replace("http://", "ws://", 1)
+    elif stream_url.startswith("https://"):
+        stream_url = stream_url.replace("https://", "wss://", 1)
+    separator = "&" if "?" in stream_url else "?"
+    stream_url = f"{stream_url}{separator}call_sid={call_sid}"
+
+    connect = twiml_response.connect()
+    connect.stream(
+        url=stream_url,
+        name=call_sid
+    )
+    return Response(content=str(twiml_response), media_type="text/xml")
+
+
+@app.websocket("/webhook/voice/stream", name="voice_agent_stream")
+async def voice_agent_stream(websocket: WebSocket):
+    await websocket.accept()
+    query_params = dict(websocket.query_params)
+    logger.info("Voice agent stream connection params: %s", query_params)
+
+    buffered_messages: List[str] = []
+    start_payload: Optional[Dict[str, Any]] = None
+    call_sid_candidates: List[str] = []
+    try:
+        while start_payload is None:
+            message = await websocket.receive_text()
+            buffered_messages.append(message)
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                logger.warning("Voice agent stream received non-JSON message before start: %s", message)
+                continue
+
+            event_type = payload.get("event")
+            if event_type != "start":
+                logger.warning(
+                    "Voice agent stream waiting for start event; received %s",
+                    event_type,
+                )
+                continue
+
+            start_payload = payload
+            start_info = start_payload.get("start", {})
+            call_sid = start_info.get("callSid")
+            parent_call_sid = start_info.get("parentCallSid")
+            stream_name = start_info.get("name")
+
+            call_sid_candidates = [
+                call_sid,
+                parent_call_sid,
+                stream_name,
+                query_params.get("call_sid"),
+                query_params.get("CallSid"),
+                query_params.get("name"),
+            ]
+
+            if not any(call_sid_candidates):
+                logger.error("Voice agent stream start event missing identifiers: %s", start_payload)
+                await websocket.close(code=4400, reason="Missing CallSid")
+                return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Voice agent stream failed during initialization: %s", exc)
+        try:
+            await websocket.close(code=1011, reason="Failed to initialize stream")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    session = None
+    for candidate in call_sid_candidates:
+        if not candidate:
+            continue
+        session = voice_agent_service.get_session(candidate)
+        if session:
+            if candidate != session.call_sid:
+                logger.info(
+                    "Voice agent stream matched session %s via identifier %s",
+                    session.call_sid,
+                    candidate,
+                )
+            break
+
+    if not session:
+        logger.error(
+            "Voice agent stream received unknown identifiers: %s",
+            call_sid_candidates,
+        )
+        try:
+            await websocket.close(code=4404, reason="Session not found")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    try:
+        await voice_agent_service.attach_twilio_stream(session.call_sid, websocket, buffered_messages)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error handling Twilio stream for %s: %s", call_sid, exc)
+        try:
+            await websocket.close(code=1011, reason="Internal error")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.post("/webhook/voice-agent/status")
+async def voice_agent_status(request: Request) -> Response:
+    """Clean up voice agent sessions based on Twilio status callbacks."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    call_status = form.get("CallStatus")
+    logger.info("Voice agent status update: call_sid=%s status=%s", call_sid, call_status)
+    if call_sid and call_status and call_status.lower() in {"completed", "failed", "busy", "no-answer", "canceled"}:
+        await voice_agent_service.stop_session(call_sid)
+    return Response(content="", media_type="text/xml")
+
+
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
     """Handle incoming WhatsApp messages via Twilio webhook"""
@@ -943,12 +1094,13 @@ async def whatsapp_webhook(request: Request):
             
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Clinic"))
+            response_generator.set_channel("whatsapp")
             
             # Build RAG vector store
             rag_service.build_vector_store(context)
             
             # Generate initial greeting
-            initial_reply = await response_generator.generate_greeting(context, is_whatsapp=True)
+            initial_reply = await response_generator.generate_greeting(context, channel="whatsapp")
             whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
             whatsapp_sessions[session_id]["flow_controller"] = flow_controller
             whatsapp_sessions[session_id]["response_generator"] = response_generator
@@ -984,6 +1136,7 @@ async def whatsapp_webhook(request: Request):
             flow_controller.update_collected_data("leadPhoneNumber", user_phone)
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Clinic"))
+            response_generator.set_channel("whatsapp")
             session["flow_controller"] = flow_controller
             session["response_generator"] = response_generator
         

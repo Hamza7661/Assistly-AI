@@ -19,10 +19,31 @@ class ResponseGenerator:
         self.model = settings.gpt_model
         self.rag_service = rag_service
         self.profession = "Clinic"
+        self.channel: str = "web"
     
     def set_profession(self, profession: str):
         """Set profession for responses"""
         self.profession = profession or self.profession
+
+    def set_channel(self, channel: str):
+        """Set current channel (web, whatsapp, voice)"""
+        normalized = (channel or "web").lower()
+        if normalized not in {"web", "whatsapp", "voice"}:
+            normalized = "web"
+        logger.info(f"ResponseGenerator channel set to {normalized}")
+        self.channel = normalized
+
+    @staticmethod
+    def _format_voice_list(options: List[str]) -> str:
+        """Format options for voice channel (natural language list)"""
+        cleaned = [opt.strip() for opt in options if opt and opt.strip()]
+        if not cleaned:
+            return ""
+        if len(cleaned) == 1:
+            return cleaned[0]
+        if len(cleaned) == 2:
+            return f"{cleaned[0]} or {cleaned[1]}"
+        return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
     
     def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Merge treatment plans into service_types array for unified service selection"""
@@ -594,10 +615,22 @@ Classify the intent:"""
             else:
                 all_services.append(str(s))
         
-        # Format services as buttons
-        services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
-        
-        system_prompt = f"""You are a {self.profession} assistant. 
+        if self.channel == "voice":
+            services_text = self._format_voice_list(all_services)
+            system_prompt = f"""You are a {self.profession} assistant.
+
+CRITICAL RULES:
+1. The user has already selected a lead type (callback, appointment, or information request)
+2. Ask: "Which service are you interested in?" and LIST the service names verbally (no numbers, no buttons).
+3. Mention ALL services exactly once in natural language: {services_text or "No services provided"}
+4. DO NOT ask the user to pick a number or say 'option one' etc. Ask them to say the service name.
+5. Keep the response concise (one or two sentences) and return plain text only.
+6. DO NOT ask for date/time - that is NOT part of this flow.
+7. Service selection is MANDATORY - every user must select a service."""
+        else:
+            # Format services as buttons for text channels
+            services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
+            system_prompt = f"""You are a {self.profession} assistant. 
 
 CRITICAL RULES:
 1. The user has already selected a lead type (callback, appointment, or information request)
@@ -623,11 +656,23 @@ Your response should be brief: Ask for service selection and show the service bu
             )
             answer = (response.choices[0].message.content or "").strip()
             # Ensure services are included even if AI doesn't add them
-            if services_text not in answer:
-                return f"{answer} {services_text}" if answer else f"Which service are you interested in? {services_text}"
-            return answer
+            if self.channel == "voice":
+                if services_text and services_text.lower() not in answer.lower():
+                    prefix = "Which service are you interested in?"
+                    if answer:
+                        return f"{answer} Available services include {services_text}."
+                    return f"{prefix} Available services include {services_text}."
+                return answer
+            else:
+                if services_text not in answer:
+                    return f"{answer} {services_text}" if answer else f"Which service are you interested in? {services_text}"
+                return answer
         except Exception as e:
             logger.error(f"Error generating service selection response: {e}")
+            if self.channel == "voice":
+                if services_text:
+                    return f"Which service are you interested in? Available services include {services_text}."
+                return "Which service are you interested in?"
             return f"Which service are you interested in? {services_text}"
     
     async def _generate_data_collected_with_question_response(
@@ -788,6 +833,54 @@ If the context doesn't contain the answer, say "I don't have that information, b
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT show previous options - continue with phone collection.""",
         }
+
+        if self.channel == "voice":
+            lead_types = context.get("lead_types", [])
+            lead_names = []
+            for lt in lead_types:
+                if isinstance(lt, dict):
+                    lead_names.append(lt.get("text", ""))
+                else:
+                    lead_names.append(str(lt))
+            lead_voice_text = self._format_voice_list(lead_names)
+
+            services = context.get("service_types", [])
+            service_names = []
+            for srv in services:
+                if isinstance(srv, dict):
+                    service_names.append(srv.get("name", srv.get("title", "")))
+                else:
+                    service_names.append(str(srv))
+            service_voice_text = self._format_voice_list(service_names)
+
+            state_prompts[ConversationState.GREETING] = f"""You are a {self.profession} assistant interacting over voice.
+- Offer a friendly greeting.
+- Mention the available lead types verbally: {lead_voice_text or "No lead types provided"}.
+- Ask which lead type they would like without referencing option numbers.
+- Keep the response short (1-2 sentences)."""
+
+            state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant on a voice call.
+- If the user asks a question, answer briefly then guide them back to choosing a lead type.
+- List the lead type options naturally (no numbers, no buttons): {lead_voice_text or "No lead types provided"}.
+- Ask them which lead type they prefer and remind them to say the option name.
+- Do NOT ask for date/time."""
+
+            state_prompts[ConversationState.SERVICE_SELECTION] = f"""You are a {self.profession} assistant on a voice call.
+- The user has already selected a lead type.
+- If they ask a question, answer briefly then ask for a service selection.
+- Mention all service options verbally and naturally (no numbers): {service_voice_text or "No services provided"}.
+- Ask them to say the service name they are interested in.
+- Do NOT ask for date/time."""
+
+            state_prompts[ConversationState.NAME_COLLECTION] = f"""You are a {self.profession} assistant on a voice call.
+- If the user asks a question, answer briefly and then ask for their name.
+- Ask for their full name naturally (no buttons).
+- Keep the response short and polite."""
+
+            state_prompts[ConversationState.EMAIL_COLLECTION] = f"""You are a {self.profession} assistant on a voice call.
+- If the user asks a question, answer briefly then ask for their email address.
+- Ask for the email in a friendly, conversational way.
+- Do NOT mention numbers or buttons."""
         
         system_prompt = state_prompts.get(state, f"You are a {self.profession} assistant. Continue the conversation naturally.")
         
@@ -943,8 +1036,9 @@ Make it professional and informative."""
         
         return f"{customer_name} requested {lead_type} for {service_type}."
     
-    async def generate_greeting(self, context: Dict[str, Any], is_whatsapp: bool = False) -> str:
+    async def generate_greeting(self, context: Dict[str, Any], channel: Optional[str] = None) -> str:
         """Generate initial greeting"""
+        current_channel = (channel or self.channel or "web").lower()
         integration = context.get("integration", {})
         greeting = integration.get("greeting", "").strip()
         
@@ -957,11 +1051,22 @@ Make it professional and informative."""
                 greeting = "Thanks for reaching out. I am your virtual AI assistant how can i help you today"
         
         lead_types = context.get("lead_types", [])
-        
-        if is_whatsapp:
+
+        if current_channel == "whatsapp":
             # Numbered list for WhatsApp
             options = "\n".join([f"{i}. {lt.get('text', '')}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
             return f"{greeting}\n\n{options}\n\nPlease reply with the number of your choice."
+        elif current_channel == "voice":
+            option_names = []
+            for lt in lead_types:
+                if isinstance(lt, dict):
+                    option_names.append(lt.get("text", ""))
+                else:
+                    option_names.append(str(lt))
+            options_text = self._format_voice_list(option_names)
+            if options_text:
+                return f"{greeting}\n\nI can help with {options_text}. Which one would you like?"
+            return greeting
         else:
             # Buttons for web
             buttons = " ".join([f"<button>{lt.get('text', '')}</button>" for lt in lead_types if isinstance(lt, dict)])

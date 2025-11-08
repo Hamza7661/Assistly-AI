@@ -24,6 +24,9 @@ class Settings(BaseModel):
     twilio_auth_token: Optional[str] = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_whatsapp_from: Optional[str] = Field(default=None, alias="TWILIO_WHATSAPP_FROM")
     whatsapp_webhook_token: Optional[str] = Field(default=None, alias="WHATSAPP_WEBHOOK_TOKEN")
+
+    # Deepgram voice agent
+    deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
     
     # RAG (Retrieval-Augmented Generation) configuration
     rag_k: int = Field(default=3, alias="RAG_K")  # Number of documents to retrieve

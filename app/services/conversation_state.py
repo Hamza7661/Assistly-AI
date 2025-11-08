@@ -47,15 +47,29 @@ class FlowController:
         self.validate_email = integration.get("validateEmail", True)
         self.validate_phone = integration.get("validatePhoneNumber", True)
         self.is_whatsapp = False  # Set externally
+        self.channel: str = integration.get("channel", "web")
+        self.skip_phone_collection: bool = False
     
     def set_whatsapp(self, is_whatsapp: bool):
         """Set WhatsApp mode (phone already verified)"""
         self.is_whatsapp = is_whatsapp
         if is_whatsapp:
+            self.channel = "whatsapp"
+            self.skip_phone_collection = True
             # For WhatsApp, phone is already verified
             self.otp_state["phone_verified"] = True
             # Extract phone from WhatsApp context if available
             # This would come from Twilio webhook
+        else:
+            self.channel = "web"
+            self.skip_phone_collection = False
+
+    def set_voice_agent(self):
+        """Configure flow for voice agent channel (phone comes from Twilio caller)"""
+        self.channel = "voice"
+        self.skip_phone_collection = True
+        # Phone verification is implicit (caller ID)
+        self.otp_state["phone_verified"] = True
     
     def update_collected_data(self, field: str, value: Any):
         """Update collected data and handle title extraction"""
@@ -95,7 +109,7 @@ class FlowController:
                     return ConversationState.EMAIL_OTP_SENT
                 else:
                     # Skip email OTP, go to phone or complete
-                    if self.is_whatsapp:
+                    if self.is_whatsapp or self.skip_phone_collection:
                         return ConversationState.COMPLETE
                     else:
                         return ConversationState.PHONE_COLLECTION
@@ -106,13 +120,15 @@ class FlowController:
         
         elif self.state == ConversationState.EMAIL_OTP_VERIFICATION:
             if self.otp_state["email_verified"]:
-                if self.is_whatsapp:
+                if self.is_whatsapp or self.skip_phone_collection:
                     return ConversationState.COMPLETE
                 else:
                     return ConversationState.PHONE_COLLECTION
             return ConversationState.EMAIL_OTP_VERIFICATION
         
         elif self.state == ConversationState.PHONE_COLLECTION:
+            if self.skip_phone_collection:
+                return ConversationState.COMPLETE
             if self.collected_data["leadPhoneNumber"]:
                 if self.validate_phone:
                     return ConversationState.PHONE_OTP_SENT
@@ -147,15 +163,15 @@ class FlowController:
             if not self.collected_data.get(field):
                 return False
         
-        # Check phone (if not WhatsApp)
-        if not self.is_whatsapp and not self.collected_data.get("leadPhoneNumber"):
+        # Check phone (if not skipping phone collection)
+        if not self.skip_phone_collection and not self.collected_data.get("leadPhoneNumber"):
             return False
         
         # Check OTP verification
         if self.validate_email and not self.otp_state["email_verified"]:
             return False
         
-        if self.validate_phone and not self.is_whatsapp and not self.otp_state["phone_verified"]:
+        if self.validate_phone and not self.skip_phone_collection and not self.otp_state["phone_verified"]:
             return False
         
         return True
@@ -170,7 +186,7 @@ class FlowController:
             "title": self.collected_data.get("title", "")
         }
         
-        if not self.is_whatsapp:
+        if self.collected_data.get("leadPhoneNumber"):
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
         
         # Add conversation history if provided

@@ -15,3 +15,5 @@ langchain-text-splitters
 langchain-classic
 chromadb
 tiktoken
+websockets
+deepgram-sdk==3.10.1
