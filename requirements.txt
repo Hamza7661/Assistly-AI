@@ -17,3 +17,4 @@ chromadb
 tiktoken
 websockets
 deepgram-sdk==5.0.0
+python-multipart
