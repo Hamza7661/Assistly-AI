@@ -35,7 +35,7 @@ class ContextService:
         start_time = time.time()
         logger.info("Sending context API request at %s for user_id=%s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), user_id)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -93,7 +93,7 @@ class ContextService:
         logger.info("Sending context API request at %s for Twilio phone=%s", 
                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), clean_phone)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
             resp = await client.get(url, headers=headers)
             
             # Log response details
