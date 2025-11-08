@@ -15,4 +15,3 @@ langchain-text-splitters
 langchain-classic
 chromadb
 tiktoken
-deepgram-sdk
