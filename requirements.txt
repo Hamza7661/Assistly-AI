@@ -16,4 +16,4 @@ langchain-classic
 chromadb
 tiktoken
 websockets
-deepgram-sdk==3.10.1
+deepgram-sdk==5.0.0
