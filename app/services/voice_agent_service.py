@@ -89,6 +89,8 @@ class VoiceAgentSession:
     _last_user_text: Optional[str] = None
     _stopping: bool = False
     twilio_media_logged: int = 0
+    _last_injected_message: Optional[str] = None
+    _allow_agent_audio: bool = False
     socket_cm: Optional[Any] = None
     agent_socket: Optional[AsyncV1SocketClient] = None
 
@@ -263,6 +265,10 @@ class VoiceAgentSession:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to forward audio to Deepgram for call %s: %s", self.call_sid, exc)
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return " ".join((text or "").strip().split()).lower()
+
     async def _send_audio_to_twilio(self, audio_bytes: bytes) -> None:
         """Send Deepgram audio back to Twilio stream."""
         if not audio_bytes:
@@ -272,6 +278,13 @@ class VoiceAgentSession:
 
         if not self.twilio_websocket or not self.twilio_stream_sid:
             self.pending_audio.append(base64_payload)
+            return
+
+        if not self._allow_agent_audio:
+            logger.debug(
+                "Blocking Deepgram audio for call %s because it was not requested",
+                self.call_sid,
+            )
             return
 
         message = {
@@ -352,6 +365,7 @@ class VoiceAgentSession:
                 self.pending_agent_messages.append(message)
                 return
             await self.agent_socket.send_inject_agent_message(payload)
+            self._last_injected_message = self._normalize_text(message)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to send message to Deepgram for call %s: %s", self.call_sid, exc)
 
@@ -419,12 +433,29 @@ class VoiceAgentSession:
             return
 
         if isinstance(message, AgentV1ConversationTextEvent):
-            if message.role.lower() == "user":
+            role = (message.role or "").lower()
+            if role == "user":
                 await self._handle_user_input(message.content)
-            return
+                return
+            if role == "assistant":
+                logger.info(
+                    "Deepgram agent (%s) assistant output: %s",
+                    self.call_sid,
+                    message.content,
+                )
+                normalized = self._normalize_text(message.content)
+                if self._last_injected_message and normalized == self._last_injected_message:
+                    self._allow_agent_audio = True
+                else:
+                    self._allow_agent_audio = False
+                    logger.info(
+                        "Suppressing unsolicited Deepgram audio for call %s", self.call_sid
+                    )
+                return
 
         if isinstance(message, AgentV1AgentAudioDoneEvent):
             await self._flush_pending_agent_messages()
+            self._allow_agent_audio = False
             return
 
         if isinstance(message, AgentV1InjectionRefusedEvent):
