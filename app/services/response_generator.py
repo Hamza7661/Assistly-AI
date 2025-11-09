@@ -45,33 +45,27 @@ class ResponseGenerator:
             return f"{cleaned[0]} or {cleaned[1]}"
         return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
 
-    def _voice_friendly_lead_text(self, text: str) -> str:
-        """Convert lead type text to a question-friendly voice format."""
+    @staticmethod
+    def _normalize_lead_option_for_voice(text: str) -> str:
+        """Strip preference phrasing like 'I would like' for natural voice questions."""
         if not text:
             return ""
 
         cleaned = text.strip()
         lowered = cleaned.lower()
-        replacements = (
+        prefixes = (
             "i would like",
             "i'd like",
             "i want",
         )
 
-        for prefix in replacements:
+        for prefix in prefixes:
             if lowered.startswith(prefix):
-                remainder = cleaned[len(prefix):].lstrip()
-                cleaned = f"Would you like {remainder}".strip()
+                remainder = cleaned[len(prefix):].lstrip(" ,.")
+                cleaned = remainder or cleaned
                 break
 
-        if not cleaned.lower().startswith("would you like"):
-            cleaned = cleaned[0].upper() + cleaned[1:]
-
-        cleaned = cleaned.rstrip(". ")
-        if not cleaned.endswith("?"):
-            cleaned = f"{cleaned}?"
-
-        return cleaned
+        return cleaned.rstrip(" .?")
 
     def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """Merge treatment plans into service_types array for unified service selection"""
@@ -864,13 +858,16 @@ If the context doesn't contain the answer, say "I don't have that information, b
 
         if self.channel == "voice":
             lead_types = context.get("lead_types", [])
-            lead_names = []
+            lead_options = []
             for lt in lead_types:
                 if isinstance(lt, dict):
-                    lead_names.append(self._voice_friendly_lead_text(lt.get("text", "")))
+                    lead_options.append(self._normalize_lead_option_for_voice(lt.get("text", "")))
                 else:
-                    lead_names.append(self._voice_friendly_lead_text(str(lt)))
-            lead_voice_text = self._format_voice_list(lead_names)
+                    lead_options.append(self._normalize_lead_option_for_voice(str(lt)))
+            lead_voice_list = self._format_voice_list(lead_options)
+            lead_voice_question = (
+                f"Would you like {lead_voice_list}?" if lead_voice_list else "No lead types provided"
+            )
 
             services = context.get("service_types", [])
             service_names = []
@@ -882,33 +879,33 @@ If the context doesn't contain the answer, say "I don't have that information, b
             service_voice_text = self._format_voice_list(service_names)
 
             state_prompts[ConversationState.GREETING] = f"""You are a {self.profession} assistant interacting over voice.
-- Offer a friendly greeting.
-- Mention the available lead types verbally: {lead_voice_text or "No lead types provided"}.
-- Ask which lead type they would like without referencing option numbers.
-- Keep the response short (1-2 sentences)."""
+ - Offer a friendly greeting.
+ - Mention the available lead types verbally: {lead_voice_question}.
+ - Ask which lead type they would like without referencing option numbers.
+ - Keep the response short (1-2 sentences)."""
 
             state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant on a voice call.
-- If the user asks a question, answer briefly then guide them back to choosing a lead type.
-- List the lead type options naturally (no numbers, no buttons): {lead_voice_text or "No lead types provided"}.
-- Ask them which lead type they prefer and remind them to say the option name.
-- Do NOT ask for date/time."""
+ - If the user asks a question, answer briefly then guide them back to choosing a lead type.
+ - List the lead type options naturally (no numbers, no buttons): {lead_voice_question}.
+ - Ask them which lead type they prefer and remind them to say the option name.
+ - Do NOT ask for date/time."""
 
             state_prompts[ConversationState.SERVICE_SELECTION] = f"""You are a {self.profession} assistant on a voice call.
-- The user has already selected a lead type.
-- If they ask a question, answer briefly then ask for a service selection.
-- Mention all service options verbally and naturally (no numbers): {service_voice_text or "No services provided"}.
-- Ask them to say the service name they are interested in.
-- Do NOT ask for date/time."""
+ - The user has already selected a lead type.
+ - If they ask a question, answer briefly then ask for a service selection.
+ - Mention all service options verbally and naturally (no numbers): {service_voice_text or "No services provided"}.
+ - Ask them to say the service name they are interested in.
+ - Do NOT ask for date/time."""
 
             state_prompts[ConversationState.NAME_COLLECTION] = f"""You are a {self.profession} assistant on a voice call.
-- If the user asks a question, answer briefly and then ask for their name.
-- Ask for their full name naturally (no buttons).
-- Keep the response short and polite."""
+ - If the user asks a question, answer briefly and then ask for their name.
+ - Ask for their full name naturally (no buttons).
+ - Keep the response short and polite."""
 
             state_prompts[ConversationState.EMAIL_COLLECTION] = f"""You are a {self.profession} assistant on a voice call.
-- If the user asks a question, answer briefly then ask for their email address.
-- Ask for the email in a friendly, conversational way.
-- Do NOT mention numbers or buttons."""
+ - If the user asks a question, answer briefly then ask for their email address.
+ - Ask for the email in a friendly, conversational way.
+ - Do NOT mention numbers or buttons."""
         
         system_prompt = state_prompts.get(state, f"You are a {self.profession} assistant. Continue the conversation naturally.")
         
@@ -1088,12 +1085,12 @@ Make it professional and informative."""
             option_names = []
             for lt in lead_types:
                 if isinstance(lt, dict):
-                    option_names.append(lt.get("text", ""))
+                    option_names.append(self._normalize_lead_option_for_voice(lt.get("text", "")))
                 else:
-                    option_names.append(str(lt))
+                    option_names.append(self._normalize_lead_option_for_voice(str(lt)))
             options_text = self._format_voice_list(option_names)
             if options_text:
-                return f"{greeting}\n\nI can help with {options_text}. Which one would you like?"
+                return f"{greeting}\n\nWould you like {options_text}?"
             return greeting
         else:
             # Buttons for web

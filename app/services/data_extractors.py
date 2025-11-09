@@ -142,34 +142,41 @@ class DataExtractor:
         for lt in lead_types:
             if not isinstance(lt, dict):
                 continue
-            
+ 
             # Check if text is contained in user input (or vice versa)
             text = str(lt.get("text", "")).lower().strip()
             value = str(lt.get("value", "")).lower().strip()
-            
+ 
             # Normalize both for better matching (remove punctuation, extra spaces)
             import re
             text_normalized = re.sub(r'[^\w\s]', '', text)
             value_normalized = re.sub(r'[^\w\s]', '', value)
             user_input_normalized = re.sub(r'[^\w\s]', '', user_input_lower)
-            
+ 
+            def _meaningful_words(phrase: str) -> set[str]:
+                return {
+                    word
+                    for word in phrase.split()
+                    if len(word) > 2 and word not in common_words
+                }
+
             # Check if key words from text/value are in user input
             if text_normalized:
-                text_words = set(word for word in text_normalized.split() if len(word) > 2)
-                user_words = set(word for word in user_input_normalized.split() if len(word) > 2)
+                text_words = _meaningful_words(text_normalized)
+                user_words = _meaningful_words(user_input_normalized)
                 # If majority of meaningful words match, consider it a match
                 if text_words and len(text_words.intersection(user_words)) >= min(2, len(text_words) * 0.6):
                     logger.info(f"Matched lead type by text words: {lt.get('text')}")
                     return lt
-            
+ 
             if text and (text in user_input_lower or user_input_lower in text):
                 logger.info(f"Matched lead type by text substring: {lt.get('text')}")
                 return lt
             
             # Check value matching with word overlap
             if value_normalized:
-                value_words = set(word for word in value_normalized.split() if len(word) > 2)
-                user_words = set(word for word in user_input_normalized.split() if len(word) > 2)
+                value_words = _meaningful_words(value_normalized)
+                user_words = _meaningful_words(user_input_normalized)
                 # If key words from value are in user input (e.g., "appointment" in "arrange an appointment")
                 if value_words and value_words.intersection(user_words):
                     logger.info(f"Matched lead type by value words: {lt.get('value')}")
