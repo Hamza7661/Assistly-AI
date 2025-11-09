@@ -17,7 +17,6 @@ class ContextService:
         self.secret: Optional[str] = settings.tp_sign_secret
 
     async def fetch_user_context(self, user_id: str) -> Dict[str, Any]:
-        print("fuckkinnnng");
         path = f"/api/v1/users/public/{user_id}/context"
         url = f"{self.base_url}{path}"
 
