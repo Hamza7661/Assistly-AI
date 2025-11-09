@@ -17,7 +17,7 @@ class RAGService:
     
     def __init__(self, settings: Any) -> None:
         self.openai_api_key: Optional[str] = settings.openai_api_key
-        self.gpt_model: str = getattr(settings, 'gpt_model', 'gpt-4o-mini')
+        self.gpt_model: str = getattr(settings, 'gpt_model', 'gpt-4.1-nano')
         self.rag_k: int = getattr(settings, 'rag_k', 3)
         self.rag_persist_directory: Optional[str] = getattr(settings, 'rag_persist_directory', None)
         self.embeddings = None
@@ -39,7 +39,7 @@ class RAGService:
                 # Initialize LLM for QA chain
                 self.llm = ChatOpenAI(
                     openai_api_key=self.openai_api_key,
-                    model_name=self.gpt_model,
+                    model_name=self.gpt_model or "gpt-4.1-nano",
                     temperature=0.3
                 )
                 logger.info("RAG service initialized with OpenAI embeddings and LLM")

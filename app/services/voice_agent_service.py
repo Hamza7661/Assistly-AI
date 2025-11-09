@@ -602,7 +602,7 @@ class VoiceAgentService:
 
         listen_config = AgentV1Listen(provider=AgentV1ListenProvider(model="nova-3", smart_format=False))
         think_config = AgentV1Think(
-            provider=AgentV1OpenAiThinkProvider(model=self.gpt_model or "gpt-4o-mini", temperature=0.3),
+            provider=AgentV1OpenAiThinkProvider(model=self.gpt_model or "gpt-4.1-nano", temperature=0.3),
             prompt=agent_prompt,
         )
         speak_config = AgentV1SpeakProviderConfig(

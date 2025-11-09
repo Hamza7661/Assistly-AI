@@ -10,7 +10,7 @@ class Settings(BaseModel):
     api_base_url: str = Field(default="http://localhost:5000", alias="API_BASE_URL")
     frontend_base_url: str = Field(default="http://localhost:3000", alias="FRONTEND_BASE_URL")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
-    gpt_model: str = Field(default="gpt-5-nano", alias="GPT_MODEL")
+    gpt_model: str = Field(default="gpt-4.1-nano", alias="GPT_MODEL")
 
     tp_sign_secret: Optional[str] = Field(default=None, alias="TP_SIGN_SECRET")
 
