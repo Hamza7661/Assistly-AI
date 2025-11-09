@@ -232,16 +232,6 @@ class VoiceAgentSession:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to decode Twilio media for call %s: %s", self.call_sid, exc)
                     return
-                if self.twilio_media_logged < 5:
-                    logger.info(
-                        "Twilio media chunk #%d for call %s: b64_len=%d decoded_len=%d preview=%s",
-                        self.twilio_media_logged + 1,
-                        self.call_sid,
-                        len(audio_payload),
-                        len(audio_bytes),
-                        audio_bytes[:16],
-                    )
-                    self.twilio_media_logged += 1
                 if self.deepgram_ready:
                     await self._forward_audio_to_deepgram(audio_bytes)
                 else:
