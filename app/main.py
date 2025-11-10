@@ -248,18 +248,36 @@ def _get_root_workflow(workflows: List[Dict[str, Any]]) -> Optional[Dict[str, An
     if not workflows:
         return None
     for workflow in workflows:
-        if workflow.get("isRoot") and workflow.get("isActive"):
+        if workflow.get("isRoot") and workflow.get("isActive", True):
             return workflow
     return None
 
 def _find_workflow_by_id(workflows: List[Dict[str, Any]], workflow_id: str) -> Optional[Dict[str, Any]]:
-    """Find a workflow by its ID"""
+    """Find a workflow or question by its ID (searches in root workflows and their questions)"""
     if not workflows or not workflow_id:
         return None
+    
+    # First check root workflows
     for workflow in workflows:
         if workflow.get("_id") == workflow_id:
             return workflow
+        
+        # Check questions within this workflow
+        questions = workflow.get("questions", [])
+        for question in questions:
+            if question.get("_id") == workflow_id:
+                return question
+    
     return None
+
+def _get_all_workflow_items(workflows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Get a flat list of all workflow items (root workflows + their questions)"""
+    all_items = []
+    for workflow in workflows:
+        all_items.append(workflow)
+        questions = workflow.get("questions", [])
+        all_items.extend(questions)
+    return all_items
 
 def _match_option_to_response(user_text: str, options: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Match user response to workflow option (simple text matching for now)"""
@@ -300,6 +318,7 @@ def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any],
         return (option_text, None, True)
     
     if next_question_id:
+        # Search in all workflow items (root workflows + their questions)
         next_workflow = _find_workflow_by_id(workflows, next_question_id)
         if next_workflow:
             return (option_text, next_workflow.get("question"), False)

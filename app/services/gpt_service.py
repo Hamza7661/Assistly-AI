@@ -44,32 +44,32 @@ class GptService:
         return context
     
     def _get_workflow_prompt(self, context: Dict[str, Any]) -> str:
-        """Generate workflow instructions for GPT based on custom workflows"""
+        """Generate workflow instructions for GPT based on custom workflows with ordered questions"""
         workflows = context.get("workflows", [])
         if not workflows:
             return ""
         
-        # Find root workflows
-        root_workflows = [w for w in workflows if w.get("isRoot", False) and w.get("isActive", True)]
+        # Find root workflows (all workflows in the list are root workflows now)
+        root_workflows = [w for w in workflows if w.get("isRoot", True)]
         
         if not root_workflows:
             return ""
         
         workflow_instructions = [
-            "CUSTOM WORKFLOW CONVERSATION:",
-            "You have custom workflow questions defined. Use them to guide the conversation:",
+            "CUSTOM CONVERSATION FLOWS:",
+            "You have custom conversation flows defined with ordered questions. Use them to guide the conversation:",
             ""
         ]
         
-        # Build workflow tree information
+        # Build workflow tree information with ordered questions
         for workflow in root_workflows:
-            workflow_instructions.append(f"ROOT QUESTION: {workflow.get('title', 'Untitled')}")
-            workflow_instructions.append(f"Question: {workflow.get('question', '')}")
+            workflow_instructions.append(f"CONVERSATION FLOW: {workflow.get('title', 'Untitled')}")
+            workflow_instructions.append(f"Root Question: {workflow.get('question', '')}")
             
-            # Get options
+            # Get options for root question
             options = workflow.get("options", [])
             if options:
-                workflow_instructions.append("Options:")
+                workflow_instructions.append("Root Question Options:")
                 for opt in options:
                     opt_text = opt.get("text", "")
                     is_terminal = opt.get("isTerminal", False)
@@ -78,19 +78,56 @@ class GptService:
                     if is_terminal:
                         workflow_instructions.append(f"  - {opt_text} (terminates conversation)")
                     elif next_q_id:
-                        # Find the linked workflow
-                        linked_wf = next((w for w in workflows if w.get("_id") == next_q_id), None)
-                        if linked_wf:
-                            workflow_instructions.append(f"  - {opt_text} → leads to: {linked_wf.get('question', '')}")
+                        # Find the linked question in this workflow's questions array
+                        linked_q = None
+                        questions = workflow.get("questions", [])
+                        for q in questions:
+                            if q.get("_id") == next_q_id:
+                                linked_q = q
+                                break
+                        
+                        if linked_q:
+                            workflow_instructions.append(f"  - {opt_text} → leads to: {linked_q.get('question', '')}")
                         else:
                             workflow_instructions.append(f"  - {opt_text}")
                     else:
                         workflow_instructions.append(f"  - {opt_text}")
             
+            # Include ordered questions within this workflow
+            questions = workflow.get("questions", [])
+            if questions:
+                workflow_instructions.append("")
+                workflow_instructions.append("Ordered Questions in this Flow (in order):")
+                for idx, question in enumerate(questions, 1):
+                    workflow_instructions.append(f"  {idx}. {question.get('title', 'Question')}: {question.get('question', '')}")
+                    q_options = question.get("options", [])
+                    if q_options:
+                        for opt in q_options:
+                            opt_text = opt.get("text", "")
+                            is_terminal = opt.get("isTerminal", False)
+                            next_q_id = opt.get("nextQuestionId")
+                            
+                            if is_terminal:
+                                workflow_instructions.append(f"     - {opt_text} (terminates)")
+                            elif next_q_id:
+                                # Find next question in the same workflow
+                                next_q = None
+                                for q in questions:
+                                    if q.get("_id") == next_q_id:
+                                        next_q = q
+                                        break
+                                if next_q:
+                                    workflow_instructions.append(f"     - {opt_text} → {next_q.get('question', '')}")
+                                else:
+                                    workflow_instructions.append(f"     - {opt_text}")
+                            else:
+                                workflow_instructions.append(f"     - {opt_text}")
+            
             workflow_instructions.append("")
         
-        workflow_instructions.append("IMPORTANT: Follow the custom workflow structure. Present the options as buttons when appropriate.")
-        workflow_instructions.append("When user selects an option, progress to the next question in the workflow.")
+        workflow_instructions.append("IMPORTANT: Follow the custom conversation flow structure. Present the options as buttons when appropriate.")
+        workflow_instructions.append("When user selects an option, progress to the next question in the ordered flow.")
+        workflow_instructions.append("Questions are ordered - follow the sequence as defined in the flow.")
         workflow_instructions.append("")
         
         return "\n".join(workflow_instructions)
