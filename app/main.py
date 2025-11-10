@@ -248,7 +248,14 @@ def _get_root_workflow(workflows: List[Dict[str, Any]]) -> Optional[Dict[str, An
     if not workflows:
         return None
     for workflow in workflows:
+        # Check if root and active (default to True if not specified)
         if workflow.get("isRoot") and workflow.get("isActive", True):
+            # Also ensure it has active questions if it has any
+            questions = workflow.get("questions", [])
+            if questions:
+                active_questions = [q for q in questions if q.get("isActive", True)]
+                if not active_questions:
+                    continue  # Skip workflows with no active questions
             return workflow
     return None
 
@@ -299,31 +306,74 @@ def _match_option_to_response(user_text: str, options: List[Dict[str, Any]]) -> 
     
     return None
 
-def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], bool]:
+def _get_next_question_in_order(current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Get the next active question in order from the same workflow group"""
+    workflow_group_id = current_workflow.get("workflowGroupId")
+    current_order = current_workflow.get("order", 0)
+    
+    # If current workflow is root, get first active question in its questions array
+    if current_workflow.get("isRoot") or not workflow_group_id:
+        questions = current_workflow.get("questions", [])
+        if questions:
+            # Filter to only active questions and return first (lowest order)
+            active_questions = [q for q in questions if q.get("isActive", True)]
+            sorted_questions = sorted(active_questions, key=lambda q: q.get("order", 0))
+            return sorted_questions[0] if sorted_questions else None
+        return None
+    
+    # Find the workflow group (root workflow)
+    for workflow in workflows:
+        if workflow.get("_id") == workflow_group_id and workflow.get("isRoot"):
+            # Get all questions in this workflow group, filter to active only
+            questions = workflow.get("questions", [])
+            active_questions = [q for q in questions if q.get("isActive", True)]
+            # Find the next active question in order
+            sorted_questions = sorted(active_questions, key=lambda q: q.get("order", 0))
+            for question in sorted_questions:
+                if question.get("order", 0) > current_order:
+                    return question
+            return None
+    
+    return None
+
+def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], bool, Optional[str]]:
     """
     Process user response within a workflow
-    Returns: (option_text, next_question, is_terminal)
+    Returns: (option_text, next_question, is_terminal, next_workflow_id)
     """
+    question_type = current_workflow.get("questionType", "single_choice")
+    
+    # Handle text_response type - accept any response and proceed to next in order
+    if question_type == "text_response":
+        # Accept any text response
+        next_workflow = _get_next_question_in_order(current_workflow, workflows)
+        if next_workflow:
+            return (user_text, next_workflow.get("question"), False, next_workflow.get("_id"))
+        else:
+            # No more questions in order - end workflow
+            return (user_text, None, True, None)
+    
+    # Handle choice-based questions
     options = current_workflow.get("options", [])
     matched_option = _match_option_to_response(user_text, options)
     
     if not matched_option:
-        return (None, None, False)
+        return (None, None, False, None)
     
     option_text = matched_option.get("text", "")
     is_terminal = matched_option.get("isTerminal", False)
     next_question_id = matched_option.get("nextQuestionId")
     
     if is_terminal:
-        return (option_text, None, True)
+        return (option_text, None, True, None)
     
     if next_question_id:
         # Search in all workflow items (root workflows + their questions)
         next_workflow = _find_workflow_by_id(workflows, next_question_id)
         if next_workflow:
-            return (option_text, next_workflow.get("question"), False)
+            return (option_text, next_workflow.get("question"), False, next_workflow.get("_id"))
     
-    return (option_text, None, True)
+    return (option_text, None, True, None)
 
 def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: List[Any] = None) -> List[Dict[str, Any]]:
     """Convert services and treatment plans to WhatsApp list format"""
@@ -634,11 +684,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if workflow_state["current_workflow_id"]:
                 current_workflow = _find_workflow_by_id(workflow_state["workflows"], workflow_state["current_workflow_id"])
                 if current_workflow:
-                    option_text, next_question, is_terminal = _process_workflow_response(user_text, current_workflow, workflow_state["workflows"])
+                    question_type = current_workflow.get("questionType", "single_choice")
+                    option_text, next_question, is_terminal, next_workflow_id = _process_workflow_response(user_text, current_workflow, workflow_state["workflows"])
                     
-                    if option_text is not None:
-                        # User matched an option
-                        logger.info(f"Workflow: User selected '{option_text}' in workflow '{current_workflow.get('title')}'")
+                    if question_type == "text_response" or option_text is not None:
+                        # User responded (either text response or matched an option)
+                        if question_type == "text_response":
+                            logger.info(f"Workflow: User provided text response to text_response question '{current_workflow.get('question')}'")
+                        else:
+                            logger.info(f"Workflow: User selected '{option_text}' in workflow '{current_workflow.get('title')}'")
                         
                         if is_terminal:
                             # Terminal reached - fallback to normal conversation
@@ -647,11 +701,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         elif next_question:
                             # Move to next question
                             reply = next_question
-                            # Find and set the next workflow
-                            next_workflow = _find_workflow_by_id(workflow_state["workflows"], current_workflow.get("options", [])[next((i for i, opt in enumerate(current_workflow.get("options", [])) if opt.get("text") == option_text), -1)].get("nextQuestionId"))
-                            if next_workflow:
-                                workflow_state["current_workflow_id"] = next_workflow.get("_id")
-                                workflow_state["visited_workflows"].append(next_workflow.get("_id"))
+                            if next_workflow_id:
+                                workflow_state["current_workflow_id"] = next_workflow_id
+                                workflow_state["visited_workflows"].append(next_workflow_id)
                             else:
                                 workflow_state["current_workflow_id"] = None
                         else:
@@ -659,7 +711,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             reply = "Thank you for your response!"
                             workflow_state["current_workflow_id"] = None
                     else:
-                        # No match - could be a question or off-path response
+                        # No match for choice-based question - could be a question or off-path response
                         logger.info(f"Workflow: User response didn't match options, letting GPT handle")
                         reply = await gpt_service.agent_reply(conversation_history, user_text, context, {})
                 else:

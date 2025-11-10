@@ -99,9 +99,13 @@ class GptService:
                 workflow_instructions.append("")
                 workflow_instructions.append("Ordered Questions in this Flow (in order):")
                 for idx, question in enumerate(questions, 1):
-                    workflow_instructions.append(f"  {idx}. {question.get('title', 'Question')}: {question.get('question', '')}")
+                    q_type = question.get("questionType", "single_choice")
+                    q_type_label = "Text Response" if q_type == "text_response" else ("Single Choice" if q_type == "single_choice" else "Multiple Choice")
+                    workflow_instructions.append(f"  {idx}. [{q_type_label}] {question.get('question', '')}")
                     q_options = question.get("options", [])
-                    if q_options:
+                    if q_type == "text_response":
+                        workflow_instructions.append(f"     (Open text/voice input - no options, proceeds to next question in order)")
+                    elif q_options:
                         for opt in q_options:
                             opt_text = opt.get("text", "")
                             is_terminal = opt.get("isTerminal", False)
