@@ -9,13 +9,15 @@ logger = logging.getLogger("assistly.gpt")
 
 
 class GptService:
-    def __init__(self, settings: Any) -> None:
+    def __init__(self, settings: Any, rag_service: Optional[Any] = None) -> None:
         self.model: str = settings.gpt_model
         self.max_history: int = settings.max_history_messages
         self.client: Optional[AsyncOpenAI] = (
             AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
         )
         self.profession: str = "Clinic"
+        self.rag_service: Optional[Any] = rag_service  # RAG service for retrieval
+        self.current_context: Optional[Dict[str, Any]] = None  # Store current context for RAG
 
     def set_profession(self, profession: str) -> None:
         self.profession = profession or self.profession
@@ -194,6 +196,26 @@ class GptService:
         # Merge treatment plans into service types for unified service selection
         context = self._merge_treatment_plans_into_services(context)
         
+        # Initialize RAG (always enabled)
+        if self.rag_service:
+            self.current_context = context
+            # Build vector store from context
+            self.rag_service.build_vector_store(context)
+            logger.info("RAG vector store built from context")
+            
+            # Try to get initial greeting from LangChain (uses greeting from context)
+            try:
+                rag_greeting = await self.rag_service.get_initial_greeting(
+                    profession=self.profession,
+                    is_whatsapp=is_whatsapp,
+                    context_data=context
+                )
+                if rag_greeting:
+                    logger.info("Using LangChain-generated greeting")
+                    return rag_greeting
+            except Exception as e:
+                logger.warning(f"Could not get LangChain greeting, falling back to GPT: {e}")
+        
         # Get workflow instructions if custom workflows exist
         workflow_prompt = self._get_workflow_prompt(context)
         if workflow_prompt:
@@ -208,6 +230,12 @@ class GptService:
         
         # Merge treatment plans into service types for unified service selection
         context = self._merge_treatment_plans_into_services(context)
+        
+        # Update RAG if context changed (RAG is always enabled)
+        if self.rag_service and self.current_context != context:
+            self.current_context = context
+            self.rag_service.build_vector_store(context)
+            logger.info("RAG vector store rebuilt from updated context")
         
         # Get workflow instructions if custom workflows exist
         workflow_prompt = self._get_workflow_prompt(context)
@@ -253,96 +281,67 @@ class GptService:
             json_fields = "5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber)"
             final_instruction = "CRITICAL: When you have ALL 5 fields (leadType, serviceType, leadName, leadEmail, leadPhoneNumber), output ONLY the JSON immediately"
         
-        # Get workflow instructions if they exist
-        workflow_instructions = state.get("workflow_instructions", "")
+        # Get validation flags to adjust flow
+        validate_email = integration.get("validateEmail", True)
+        validate_phone = integration.get("validatePhoneNumber", True)
+        
+        # Simplified prompt - LangChain handles everything
+        # Note: For WhatsApp, phone is already verified, so skip phone OTP steps even if phone validation is enabled
+        if is_whatsapp:
+            if validate_email:
+                flow = "lead type → service type → name → email → send email OTP → verify email OTP → JSON (phone from WhatsApp, already verified)"
+            else:
+                flow = "lead type → service type → name → email → JSON (phone from WhatsApp, already verified)"
+            json_example = '{"leadType": "...", "serviceType": "...", "leadName": "...", "leadEmail": "..."}'
+        else:
+            # For web chat, include phone OTP steps if phone validation is enabled
+            if validate_email and validate_phone:
+                flow = "lead type → service type → name → email → send email OTP → verify email OTP → phone → send phone OTP → verify phone OTP → JSON"
+            elif validate_email:
+                flow = "lead type → service type → name → email → send email OTP → verify email OTP → phone → JSON"
+            elif validate_phone:
+                flow = "lead type → service type → name → email → phone → send phone OTP → verify phone OTP → JSON"
+            else:
+                flow = "lead type → service type → name → email → phone → JSON"
+            json_example = '{"leadType": "...", "serviceType": "...", "leadName": "...", "leadEmail": "...", "leadPhoneNumber": "..."}'
         
         system = (
-            "You are a friendly and professional lead-generation assistant for a {profession}.\n"
-            "Your goal is to have a natural conversation and collect all required information before creating a lead.\n\n"
+            f"You are a {self.profession} assistant. Follow the flow: {flow}.\n"
+            f"Match user input to options from context. Use exact values. Be conversational.\n"
+            f"Special responses: 'SEND_EMAIL: [email]', 'SEND_PHONE: [phone]', 'RETRY_OTP_REQUESTED', 'CHANGE_PHONE_REQUESTED: [phone]', 'CHANGE_EMAIL_REQUESTED: [email]'.\n"
+            f"IMPORTANT: Complete ALL OTP verification steps before generating JSON. Do NOT skip OTP steps.\n"
+            f"When all info collected AND OTP verification complete (if required), output ONLY JSON: {json_example}"
         )
-        
-        # Add workflow instructions if they exist
-        if workflow_instructions:
-            system += workflow_instructions
-        
-        system += (
-            "CRITICAL SYSTEM INSTRUCTIONS:\n"
-            "- When user indicates they want to resend OTP (lost, didn't receive, send again), respond with ONLY: 'RETRY_OTP_REQUESTED'\n"
-            "- When user indicates they want to change their phone number, respond with ONLY: 'CHANGE_PHONE_REQUESTED'\n"
-            "- When user indicates they want to change their email address, respond with ONLY: 'CHANGE_EMAIL_REQUESTED'\n"
-            "- CRITICAL: Use semantic understanding to detect user intent: if user provides different contact information than previously collected, this indicates a change request\n"
-            "- CRITICAL: Use semantic understanding to detect user intent: if user wants to resend to the same contact information, this indicates a retry request\n"
-            "- These special phrases are REQUIRED - do NOT add any other text or explanations\n"
-            "- Use semantic understanding to detect user intent, not exact word matching\n\n"
-            + flow_steps +
-            "VALIDATION RULES:\n"
-            "- Lead Type: Must be exactly one of the provided button options (use the 'value' field)\n"
-            "- Service Type: MANDATORY - Must be intelligently matched to one of the provided service or treatment plan options using semantic understanding and natural language processing. THIS FIELD IS REQUIRED FOR ALL LEAD TYPES INCLUDING CALLBACK\n"
-            "- Name: Must not be John Doe or Jane Doe\n"
-            "- Email: Must be valid email format (contains @ and domain)\n"
-            + ("" if is_whatsapp else "- Phone: Must be a valid phone number (digits, reasonable length)\n") +
-            "- If any input is invalid, politely ask for correction and show options again\n\n"
-            "IMPORTANT RULES:\n"
-            "- Be conversational and empathetic\n"
-            "- Present options as: <button> Option Text </button>\n"
-            "- Use the service_types array from context data to create service buttons (treatment plans are already merged into service_types)\n"
-            "- Present all services and treatment plans together as one unified list - do NOT ask about treatment plans separately\n"
-            "- INTELLIGENT SERVICE MATCHING: Use semantic understanding to match user's natural language to available services. Analyze the user's intent and match it to the closest service from the provided options.\n"
-            "- When user mentions any service-related terms, intelligently determine which service they're referring to and proceed immediately\n"
-            "- SERVICE QUESTIONS: If user asks questions about a service (pricing, discounts, details, rates, costs), ALWAYS answer them briefly and warmly FIRST, then continue with the next step (asking for name)\n"
-            "- Use your knowledge and understanding to provide helpful, accurate responses about services, pricing, and policies\n"
-            "- CRITICAL: Do NOT ask for confirmation or show options again if the match is clear\n"
-            "- Only show options if the user's request is completely unclear or doesn't match any available services\n"
-            "- If user asks a question, answer it briefly and warmly, then continue with the next required step\n"
-            "- Always guide the conversation back to collecting the required information\n"
-            "- For email: If user provides invalid email format, politely explain and ask again in the same message.\n"
-            "- For lead type: If user doesn't select from provided options, politely say 'Please choose from the options above' and show the buttons again\n"
-            "- For service type:Always show service type after lead type. Use semantic understanding to intelligently match user's natural language to available services. Analyze their intent and match to the closest service from the provided options.\n"
-            "- If user asks questions about the service (pricing, discounts, details), answer them briefly and warmly, then continue to next step\n"
-            "- Only ask for clarification if the user's request is completely unclear or doesn't match any available services\n"
-            "- For name: If user provides fake name like John Doe, politely say 'Please provide your correct name' and ask again\n"
-            "- For email: If user provides invalid email format, politely say 'Please provide a valid email address' and ask again\n"
-            "- For phone: If user provides invalid phone number, politely say 'Please provide a valid phone number' and ask again\n"
-            "- CRITICAL RETRY HANDLING: When user says they lost, didn't receive, or want to resend OTP, you MUST respond with ONLY: 'RETRY_OTP_REQUESTED'\n"
-            "- CRITICAL RETRY HANDLING: When user says they want to change phone number, you MUST respond with ONLY: 'CHANGE_PHONE_REQUESTED'\n"
-            "- CRITICAL RETRY HANDLING: When user says they want to change email, you MUST respond with ONLY: 'CHANGE_EMAIL_REQUESTED'\n"
-            "- CRITICAL: These special phrases are REQUIRED for the system to work. Do NOT add any other text, explanations, or responses.\n"
-            "- CRITICAL: If user asks for OTP resend, respond with ONLY 'RETRY_OTP_REQUESTED' - nothing else\n"
-            "- Be natural and conversational - don't give cold error messages\n"
-            "- If email validation is disabled in context, just collect email without OTP verification\n"
-            "- For OTP: If user asks questions or provides non-OTP responses, answer naturally and guide them back to entering the code\n"
-            "- For OTP: If user provides wrong OTP, be empathetic and ask them to try again in a friendly way\n"
-            "- For OTP: If user indicates they didn't receive the code or it's not working, respond with: 'RETRY_OTP_REQUESTED' - DO NOT provide any other text\n"
-            "- For OTP: If user indicates they provided wrong contact information, respond with: 'CHANGE_PHONE_REQUESTED' or 'CHANGE_EMAIL_REQUESTED' - DO NOT provide any other text\n"
-            + ("" if is_whatsapp else "- For phone: If user provides invalid phone number, politely explain the issue in their response in a way a simple user can understand like you didnt provide bla bla i asked for bla bla and ask again in the same message\n") +
-            ("" if is_whatsapp else "- For phone OTP: Handle phone verification naturally like email verification\n") +
-            ("- CRITICAL: The flow should be ask lead type first, then service type, then name, then email (we have phone from WhatsApp)\n" if is_whatsapp else "- CRITICAL: The flow should be ask lead type first, then service type, then name, then email and then phone number\n") +
-            "- CRITICAL: When user selects a service (either by number or natural language), immediately proceed to the next step (asking for name). Do NOT ask for confirmation or show options again.\n" +
-            f"- {final_instruction}\n"
-            "- JSON format: {{\"title\": \"...\", \"summary\": \"...\", \"description\": \"...\", \"leadName\": \"...\", \"leadPhoneNumber\": \"...\", \"leadEmail\": \"...\", \"leadType\": \"...\", \"serviceType\": \"...\"}}\n"
-            "- IMPORTANT: Use the 'value' field from lead_types for leadType (e.g., 'callback', 'appointment arrangement', 'further information')\n"
-            "- NEVER show JSON to user or ask for confirmation - just output the JSON when ready\n"
-            "- Help the user, if the user asks you to show something again do that. Help in booking\n"
-            "- Do NOT add any text before or after the JSON - just the JSON object\n"
-            "- CRITICAL: After collecting phone number, immediately generate the JSON - do NOT ask for anything else\n"
-            "- Do NOT repeat questions you've already asked - if you have all info, generate JSON\n"
-            + (
-                "- REMEMBER: Once you have leadType, serviceType, leadName, and leadEmail - output JSON immediately (phone from WhatsApp)\n"
-                "- FINAL STEP: After email verification, generate JSON immediately - do NOT ask for more information\n"
-                if is_whatsapp else
-                "- REMEMBER: Once you have leadType, serviceType, leadName, leadEmail, and leadPhoneNumber - output JSON immediately\n"
-                "- FINAL STEP: After phone number collection, generate JSON immediately - do NOT ask for more information\n"
-                "- SPECIAL CASE: If the last message mentions 'phone number has been verified' and you have all 5 fields, generate JSON immediately\n"
-            )
-        ).format(profession=self.profession, greeting=custom_greeting)
 
+        # Use LangChain for ALL responses - get accurate answer from RAG
+        rag_answer = None
+        if (self.rag_service and 
+            not is_init and 
+            user_message != "__INIT__"):
+            try:
+                # Get accurate answer using LangChain QA chain - handles everything
+                # Pass FULL context and conversation history to RAG so it knows the complete flow state
+                # Include current user message in history for context
+                # Use FULL history (not trimmed) so LangChain can see the entire conversation from the start
+                history_with_current = history + [{"role": "user", "content": user_message}]
+                rag_answer = await self.rag_service.get_accurate_answer(
+                    user_message, 
+                    profession=self.profession,
+                    is_whatsapp=is_whatsapp,
+                    context_data=context,
+                    conversation_history=history_with_current
+                )
+                
+                if rag_answer:
+                    logger.info(f"LangChain generated response: {rag_answer[:50]}...")
+                    # Use LangChain's answer directly - it's already correct and contextual
+                    return rag_answer
+            except Exception as e:
+                logger.error(f"Error getting LangChain answer: {e}")
+        
+        # Minimal messages - LangChain handles context via vector store
         trimmed = history[-self.max_history :] if self.max_history > 0 else history
         messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
-        
-        # Pass raw JSON context to GPT
-        context_json = json.dumps(context, indent=2)
-        messages.append({"role": "system", "content": f"User context data:\n{context_json}"})
-        
         messages.extend(trimmed)
         if is_init:
             messages.append({"role": "user", "content": "__INIT__"})
