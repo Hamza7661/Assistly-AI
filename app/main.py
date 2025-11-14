@@ -1164,6 +1164,12 @@ async def whatsapp_webhook(request: Request):
             
             # Initialize new session state
             current_time = time.time()
+            
+            # Check for workflows
+            workflows = context.get("workflows", [])
+            root_workflow = _get_root_workflow(workflows)
+            current_workflow_id = root_workflow.get("_id") if root_workflow else None
+            
             whatsapp_sessions[session_id] = {
                 "phone": user_phone,
                 "history": [],
@@ -1182,7 +1188,9 @@ async def whatsapp_webhook(request: Request):
                 "user_id": user_id,
                 "created_at": current_time,
                 "last_activity": current_time,
-                "is_whatsapp": True  # Flag to identify WhatsApp conversations
+                "is_whatsapp": True,  # Flag to identify WhatsApp conversations
+                "workflows": workflows,
+                "current_workflow_id": current_workflow_id
             }
             
             # Initialize production-grade components for WhatsApp
@@ -1199,8 +1207,12 @@ async def whatsapp_webhook(request: Request):
             # Build RAG vector store
             rag_service.build_vector_store(context)
             
-            # Generate initial greeting
-            initial_reply = await response_generator.generate_greeting(context, channel="whatsapp")
+            # Generate initial greeting - use workflow if available, otherwise use GPT
+            if root_workflow and workflows:
+                initial_reply = root_workflow.get("question", "")
+            else:
+                initial_reply = await response_generator.generate_greeting(context, channel="whatsapp")
+            
             whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
             whatsapp_sessions[session_id]["flow_controller"] = flow_controller
             whatsapp_sessions[session_id]["response_generator"] = response_generator
@@ -1223,6 +1235,10 @@ async def whatsapp_webhook(request: Request):
         phone_validation_state = session["phone_state"]
         context = session["context"]
         user_id = session["user_id"]
+        
+        # Load workflow state
+        workflows = session.get("workflows", context.get("workflows", []))
+        current_workflow_id = session.get("current_workflow_id")
         
         # Get flow controller and response generator from session (or create if missing)
         flow_controller = session.get("flow_controller")
@@ -1304,8 +1320,9 @@ async def whatsapp_webhook(request: Request):
         # Add user message to history (use enhanced text for better GPT understanding)
         conversation_history.append({"role": "user", "content": enhanced_user_text})
         
-        # Update session history
+        # Update session history and last activity
         whatsapp_sessions[session_id]["history"] = conversation_history
+        whatsapp_sessions[session_id]["last_activity"] = time.time()
         
         # Check if we need to handle email validation (similar to WebSocket flow)
         validate_email = context.get("integration", {}).get("validateEmail", True)
@@ -1487,8 +1504,78 @@ async def whatsapp_webhook(request: Request):
                     await whatsapp_service.send_message(user_phone, reply)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
-        # Generate response using production-grade state machine
-        reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
+        # Check if we're in a workflow - handle workflows before GPT response
+        reply = None
+        if current_workflow_id:
+            current_workflow = _find_workflow_by_id(workflows, current_workflow_id)
+            if current_workflow:
+                option_text, next_question, is_terminal, next_workflow_id = _process_workflow_response(user_text, current_workflow, workflows)
+                
+                if option_text is not None:
+                    # User matched an option
+                    logger.info(f"WhatsApp Workflow: User selected '{option_text}' in workflow '{current_workflow.get('title')}'")
+                    
+                    if is_terminal:
+                        # Terminal reached - fallback to normal conversation
+                        reply = "Thank you for your response!"
+                        current_workflow_id = None
+                    elif next_question:
+                        # Move to next question
+                        reply = next_question
+                        # Use the next_workflow_id from the function return
+                        if next_workflow_id:
+                            current_workflow_id = next_workflow_id
+                        else:
+                            # Fallback: try to find next workflow from options
+                            matched_option = next((opt for opt in current_workflow.get("options", []) if opt.get("text") == option_text), None)
+                            if matched_option:
+                                next_question_id = matched_option.get("nextQuestionId")
+                                if next_question_id:
+                                    next_workflow = _find_workflow_by_id(workflows, next_question_id)
+                                    if next_workflow:
+                                        current_workflow_id = next_workflow.get("_id")
+                                    else:
+                                        current_workflow_id = None
+                                else:
+                                    current_workflow_id = None
+                            else:
+                                current_workflow_id = None
+                    else:
+                        # No next question but not terminal - fallback
+                        reply = "Thank you for your response!"
+                        current_workflow_id = None
+                    
+                    # Update workflow state in session
+                    session["current_workflow_id"] = current_workflow_id
+                    
+                    # Send workflow response
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                        full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                        success, message = await whatsapp_service.send_message(user_phone, full_message)
+                    else:
+                        success, message = await whatsapp_service.send_message(user_phone, cleaned_reply)
+                    
+                    if not success:
+                        logger.error("Failed to send WhatsApp workflow message: %s", message)
+                    
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                else:
+                    # No match - could be a question or off-path response
+                    logger.info(f"WhatsApp Workflow: User response didn't match options, letting GPT handle")
+                    # Update session state and fall through to GPT handling below
+                    session["current_workflow_id"] = current_workflow_id
+            else:
+                # Current workflow not found - fallback to GPT
+                logger.info(f"WhatsApp Workflow: Current workflow not found, falling back to GPT")
+                current_workflow_id = None
+                session["current_workflow_id"] = None
+        
+        # Generate response using production-grade state machine (if not already set by workflow)
+        if reply is None:
+            reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
         
         # Handle special responses from response generator (SEND_EMAIL, SEND_PHONE)
         # Check for answer + SEND_EMAIL/PHONE format (when user asks question while providing email/phone)
