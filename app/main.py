@@ -310,6 +310,8 @@ def _get_next_question_in_order(current_workflow: Dict[str, Any], workflows: Lis
     """Get the next active question in order from the same workflow group"""
     workflow_group_id = current_workflow.get("workflowGroupId")
     current_order = current_workflow.get("order", 0)
+    current_treatment_plan_order = current_workflow.get("treatmentPlanOrder")
+    current_treatment_plan_id = current_workflow.get("treatmentPlanId")
     
     # If current workflow is root, get first active question in its questions array
     if current_workflow.get("isRoot") or not workflow_group_id:
@@ -319,6 +321,21 @@ def _get_next_question_in_order(current_workflow: Dict[str, Any], workflows: Lis
             active_questions = [q for q in questions if q.get("isActive", True)]
             sorted_questions = sorted(active_questions, key=lambda q: q.get("order", 0))
             return sorted_questions[0] if sorted_questions else None
+        
+        # If no questions in current workflow and it's part of a treatment plan sequence,
+        # find the next workflow in the treatment plan order
+        if current_treatment_plan_order is not None and current_treatment_plan_id:
+            # Find next workflow in treatment plan sequence
+            treatment_plan_workflows = [
+                w for w in workflows 
+                if w.get("treatmentPlanId") == current_treatment_plan_id 
+                and w.get("treatmentPlanOrder") is not None
+            ]
+            sorted_tp_workflows = sorted(treatment_plan_workflows, key=lambda w: w.get("treatmentPlanOrder", 0))
+            for workflow in sorted_tp_workflows:
+                if workflow.get("treatmentPlanOrder", 0) > current_treatment_plan_order:
+                    # Return the root question of this workflow
+                    return workflow
         return None
     
     # Find the workflow group (root workflow)
@@ -332,6 +349,20 @@ def _get_next_question_in_order(current_workflow: Dict[str, Any], workflows: Lis
             for question in sorted_questions:
                 if question.get("order", 0) > current_order:
                     return question
+            
+            # If no more questions in this workflow and it's part of a treatment plan sequence,
+            # find the next workflow in the treatment plan order
+            if workflow.get("treatmentPlanOrder") is not None and workflow.get("treatmentPlanId"):
+                treatment_plan_workflows = [
+                    w for w in workflows 
+                    if w.get("treatmentPlanId") == workflow.get("treatmentPlanId") 
+                    and w.get("treatmentPlanOrder") is not None
+                ]
+                sorted_tp_workflows = sorted(treatment_plan_workflows, key=lambda w: w.get("treatmentPlanOrder", 0))
+                for next_workflow in sorted_tp_workflows:
+                    if next_workflow.get("treatmentPlanOrder", 0) > workflow.get("treatmentPlanOrder", 0):
+                        # Return the root question of this workflow
+                        return next_workflow
             return None
     
     return None
