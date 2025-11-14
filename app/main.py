@@ -316,18 +316,43 @@ def _get_root_workflow(workflows: List[Dict[str, Any]]) -> Optional[Dict[str, An
     if not workflows:
         return None
     for workflow in workflows:
-        if workflow.get("isRoot") and workflow.get("isActive"):
+        # Check if root and active (default to True if not specified)
+        if workflow.get("isRoot") and workflow.get("isActive", True):
+            # Also ensure it has active questions if it has any
+            questions = workflow.get("questions", [])
+            if questions:
+                active_questions = [q for q in questions if q.get("isActive", True)]
+                if not active_questions:
+                    continue  # Skip workflows with no active questions
             return workflow
     return None
 
 def _find_workflow_by_id(workflows: List[Dict[str, Any]], workflow_id: str) -> Optional[Dict[str, Any]]:
-    """Find a workflow by its ID"""
+    """Find a workflow or question by its ID (searches in root workflows and their questions)"""
     if not workflows or not workflow_id:
         return None
+    
+    # First check root workflows
     for workflow in workflows:
         if workflow.get("_id") == workflow_id:
             return workflow
+        
+        # Check questions within this workflow
+        questions = workflow.get("questions", [])
+        for question in questions:
+            if question.get("_id") == workflow_id:
+                return question
+    
     return None
+
+def _get_all_workflow_items(workflows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Get a flat list of all workflow items (root workflows + their questions)"""
+    all_items = []
+    for workflow in workflows:
+        all_items.append(workflow)
+        questions = workflow.get("questions", [])
+        all_items.extend(questions)
+    return all_items
 
 def _match_option_to_response(user_text: str, options: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Match user response to workflow option (simple text matching for now)"""
@@ -349,30 +374,105 @@ def _match_option_to_response(user_text: str, options: List[Dict[str, Any]]) -> 
     
     return None
 
-def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], bool]:
+def _get_next_question_in_order(current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Get the next active question in order from the same workflow group"""
+    workflow_group_id = current_workflow.get("workflowGroupId")
+    current_order = current_workflow.get("order", 0)
+    current_treatment_plan_order = current_workflow.get("treatmentPlanOrder")
+    current_treatment_plan_id = current_workflow.get("treatmentPlanId")
+    
+    # If current workflow is root, get first active question in its questions array
+    if current_workflow.get("isRoot") or not workflow_group_id:
+        questions = current_workflow.get("questions", [])
+        if questions:
+            # Filter to only active questions and return first (lowest order)
+            active_questions = [q for q in questions if q.get("isActive", True)]
+            sorted_questions = sorted(active_questions, key=lambda q: q.get("order", 0))
+            return sorted_questions[0] if sorted_questions else None
+        
+        # If no questions in current workflow and it's part of a treatment plan sequence,
+        # find the next workflow in the treatment plan order
+        if current_treatment_plan_order is not None and current_treatment_plan_id:
+            # Find next workflow in treatment plan sequence
+            treatment_plan_workflows = [
+                w for w in workflows 
+                if w.get("treatmentPlanId") == current_treatment_plan_id 
+                and w.get("treatmentPlanOrder") is not None
+            ]
+            sorted_tp_workflows = sorted(treatment_plan_workflows, key=lambda w: w.get("treatmentPlanOrder", 0))
+            for workflow in sorted_tp_workflows:
+                if workflow.get("treatmentPlanOrder", 0) > current_treatment_plan_order:
+                    # Return the root question of this workflow
+                    return workflow
+        return None
+    
+    # Find the workflow group (root workflow)
+    for workflow in workflows:
+        if workflow.get("_id") == workflow_group_id and workflow.get("isRoot"):
+            # Get all questions in this workflow group, filter to active only
+            questions = workflow.get("questions", [])
+            active_questions = [q for q in questions if q.get("isActive", True)]
+            # Find the next active question in order
+            sorted_questions = sorted(active_questions, key=lambda q: q.get("order", 0))
+            for question in sorted_questions:
+                if question.get("order", 0) > current_order:
+                    return question
+            
+            # If no more questions in this workflow and it's part of a treatment plan sequence,
+            # find the next workflow in the treatment plan order
+            if workflow.get("treatmentPlanOrder") is not None and workflow.get("treatmentPlanId"):
+                treatment_plan_workflows = [
+                    w for w in workflows 
+                    if w.get("treatmentPlanId") == workflow.get("treatmentPlanId") 
+                    and w.get("treatmentPlanOrder") is not None
+                ]
+                sorted_tp_workflows = sorted(treatment_plan_workflows, key=lambda w: w.get("treatmentPlanOrder", 0))
+                for next_workflow in sorted_tp_workflows:
+                    if next_workflow.get("treatmentPlanOrder", 0) > workflow.get("treatmentPlanOrder", 0):
+                        # Return the root question of this workflow
+                        return next_workflow
+            return None
+    
+    return None
+
+def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any], workflows: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], bool, Optional[str]]:
     """
     Process user response within a workflow
-    Returns: (option_text, next_question, is_terminal)
+    Returns: (option_text, next_question, is_terminal, next_workflow_id)
     """
+    question_type = current_workflow.get("questionType", "single_choice")
+    
+    # Handle text_response type - accept any response and proceed to next in order
+    if question_type == "text_response":
+        # Accept any text response
+        next_workflow = _get_next_question_in_order(current_workflow, workflows)
+        if next_workflow:
+            return (user_text, next_workflow.get("question"), False, next_workflow.get("_id"))
+        else:
+            # No more questions in order - end workflow
+            return (user_text, None, True, None)
+    
+    # Handle choice-based questions
     options = current_workflow.get("options", [])
     matched_option = _match_option_to_response(user_text, options)
     
     if not matched_option:
-        return (None, None, False)
+        return (None, None, False, None)
     
     option_text = matched_option.get("text", "")
     is_terminal = matched_option.get("isTerminal", False)
     next_question_id = matched_option.get("nextQuestionId")
     
     if is_terminal:
-        return (option_text, None, True)
+        return (option_text, None, True, None)
     
     if next_question_id:
+        # Search in all workflow items (root workflows + their questions)
         next_workflow = _find_workflow_by_id(workflows, next_question_id)
         if next_workflow:
-            return (option_text, next_workflow.get("question"), False)
+            return (option_text, next_workflow.get("question"), False, next_workflow.get("_id"))
     
-    return (option_text, None, True)
+    return (option_text, None, True, None)
 
 def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: List[Any] = None) -> List[Dict[str, Any]]:
     """Convert services and treatment plans to WhatsApp list format"""
@@ -1064,6 +1164,12 @@ async def whatsapp_webhook(request: Request):
             
             # Initialize new session state
             current_time = time.time()
+            
+            # Check for workflows
+            workflows = context.get("workflows", [])
+            root_workflow = _get_root_workflow(workflows)
+            current_workflow_id = root_workflow.get("_id") if root_workflow else None
+            
             whatsapp_sessions[session_id] = {
                 "phone": user_phone,
                 "history": [],
@@ -1082,7 +1188,9 @@ async def whatsapp_webhook(request: Request):
                 "user_id": user_id,
                 "created_at": current_time,
                 "last_activity": current_time,
-                "is_whatsapp": True  # Flag to identify WhatsApp conversations
+                "is_whatsapp": True,  # Flag to identify WhatsApp conversations
+                "workflows": workflows,
+                "current_workflow_id": current_workflow_id
             }
             
             # Initialize production-grade components for WhatsApp
@@ -1099,8 +1207,12 @@ async def whatsapp_webhook(request: Request):
             # Build RAG vector store
             rag_service.build_vector_store(context)
             
-            # Generate initial greeting
-            initial_reply = await response_generator.generate_greeting(context, channel="whatsapp")
+            # Generate initial greeting - use workflow if available, otherwise use GPT
+            if root_workflow and workflows:
+                initial_reply = root_workflow.get("question", "")
+            else:
+                initial_reply = await response_generator.generate_greeting(context, channel="whatsapp")
+            
             whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
             whatsapp_sessions[session_id]["flow_controller"] = flow_controller
             whatsapp_sessions[session_id]["response_generator"] = response_generator
@@ -1123,6 +1235,10 @@ async def whatsapp_webhook(request: Request):
         phone_validation_state = session["phone_state"]
         context = session["context"]
         user_id = session["user_id"]
+        
+        # Load workflow state
+        workflows = session.get("workflows", context.get("workflows", []))
+        current_workflow_id = session.get("current_workflow_id")
         
         # Get flow controller and response generator from session (or create if missing)
         flow_controller = session.get("flow_controller")
@@ -1204,8 +1320,9 @@ async def whatsapp_webhook(request: Request):
         # Add user message to history (use enhanced text for better GPT understanding)
         conversation_history.append({"role": "user", "content": enhanced_user_text})
         
-        # Update session history
+        # Update session history and last activity
         whatsapp_sessions[session_id]["history"] = conversation_history
+        whatsapp_sessions[session_id]["last_activity"] = time.time()
         
         # Check if we need to handle email validation (similar to WebSocket flow)
         validate_email = context.get("integration", {}).get("validateEmail", True)
@@ -1387,8 +1504,78 @@ async def whatsapp_webhook(request: Request):
                     await whatsapp_service.send_message(user_phone, reply)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
-        # Generate response using production-grade state machine
-        reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
+        # Check if we're in a workflow - handle workflows before GPT response
+        reply = None
+        if current_workflow_id:
+            current_workflow = _find_workflow_by_id(workflows, current_workflow_id)
+            if current_workflow:
+                option_text, next_question, is_terminal, next_workflow_id = _process_workflow_response(user_text, current_workflow, workflows)
+                
+                if option_text is not None:
+                    # User matched an option
+                    logger.info(f"WhatsApp Workflow: User selected '{option_text}' in workflow '{current_workflow.get('title')}'")
+                    
+                    if is_terminal:
+                        # Terminal reached - fallback to normal conversation
+                        reply = "Thank you for your response!"
+                        current_workflow_id = None
+                    elif next_question:
+                        # Move to next question
+                        reply = next_question
+                        # Use the next_workflow_id from the function return
+                        if next_workflow_id:
+                            current_workflow_id = next_workflow_id
+                        else:
+                            # Fallback: try to find next workflow from options
+                            matched_option = next((opt for opt in current_workflow.get("options", []) if opt.get("text") == option_text), None)
+                            if matched_option:
+                                next_question_id = matched_option.get("nextQuestionId")
+                                if next_question_id:
+                                    next_workflow = _find_workflow_by_id(workflows, next_question_id)
+                                    if next_workflow:
+                                        current_workflow_id = next_workflow.get("_id")
+                                    else:
+                                        current_workflow_id = None
+                                else:
+                                    current_workflow_id = None
+                            else:
+                                current_workflow_id = None
+                    else:
+                        # No next question but not terminal - fallback
+                        reply = "Thank you for your response!"
+                        current_workflow_id = None
+                    
+                    # Update workflow state in session
+                    session["current_workflow_id"] = current_workflow_id
+                    
+                    # Send workflow response
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                        full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                        success, message = await whatsapp_service.send_message(user_phone, full_message)
+                    else:
+                        success, message = await whatsapp_service.send_message(user_phone, cleaned_reply)
+                    
+                    if not success:
+                        logger.error("Failed to send WhatsApp workflow message: %s", message)
+                    
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                else:
+                    # No match - could be a question or off-path response
+                    logger.info(f"WhatsApp Workflow: User response didn't match options, letting GPT handle")
+                    # Update session state and fall through to GPT handling below
+                    session["current_workflow_id"] = current_workflow_id
+            else:
+                # Current workflow not found - fallback to GPT
+                logger.info(f"WhatsApp Workflow: Current workflow not found, falling back to GPT")
+                current_workflow_id = None
+                session["current_workflow_id"] = None
+        
+        # Generate response using production-grade state machine (if not already set by workflow)
+        if reply is None:
+            reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
         
         # Handle special responses from response generator (SEND_EMAIL, SEND_PHONE)
         # Check for answer + SEND_EMAIL/PHONE format (when user asks question while providing email/phone)

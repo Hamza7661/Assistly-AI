@@ -226,6 +226,14 @@ class ContextService:
             "user_data",
         ], {})
 
+        # Extract workflows
+        workflows = first_present([
+            "workflows",
+            "Workflows",
+            "workflow",
+            "Workflow",
+        ], [])
+
         return {
             "lead_types": lead_types,
             "service_types": service_types,
@@ -235,4 +243,5 @@ class ContextService:
             "integration": integration,
             "country": country,
             "user": user_data,  # Preserve user data
+            "workflows": workflows,  # Include workflows with ordered questions
         }
