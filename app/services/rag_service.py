@@ -86,27 +86,9 @@ class RAGService:
                             metadata={"source": "lead_type", "index": i, "type": "lead_type", "value": value, "text": text}
                         ))
         
-        # Add Service Types - critical for matching user responses
-        services = context.get("service_types", [])
-        service_index = 0
-        if isinstance(services, list):
-            for service in services:
-                if isinstance(service, dict):
-                    name = service.get("name", service.get("title", ""))
-                    description = service.get("description", "")
-                    if name:
-                        service_index += 1
-                        doc_text = f"Service Option {service_index}:\nName: {name}"
-                        if description:
-                            doc_text += f"\nDescription: {description}"
-                        doc_text += "\nThis is a service option that users can select."
-                        documents.append(Document(
-                            page_content=doc_text,
-                            metadata={"source": "service", "index": service_index, "type": "service", "name": name}
-                        ))
-        
         # Add Treatment Plans - index both as services AND as Q&A for answering questions
         treatment_plans = context.get("treatment_plans", [])
+        service_index = 0
         if isinstance(treatment_plans, list):
             for i, plan in enumerate(treatment_plans):
                 if isinstance(plan, dict):
@@ -374,25 +356,12 @@ Response:"""
         
         # Get available options
         lead_types = context_data.get("lead_types", [])
-        services = context_data.get("service_types", [])
         treatment_plans = context_data.get("treatment_plans", [])
         
-        # Combine services and treatment plans (services may already be merged)
+        # Use treatment plans directly
         all_services = []
         seen_services = set()
         
-        # Services can be strings or dicts (after merging, treatment plans are dicts)
-        for s in services:
-            if isinstance(s, dict):
-                service_name = s.get("name", s.get("title", ""))
-            else:
-                service_name = str(s)
-            
-            if service_name and service_name.lower() not in seen_services:
-                all_services.append(service_name)
-                seen_services.add(service_name.lower())
-        
-        # Also check treatment_plans in case they weren't merged yet
         for tp in treatment_plans:
             if isinstance(tp, dict):
                 service_name = tp.get("question", "")
@@ -459,28 +428,6 @@ Response:"""
         
         return collected
     
-    def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge treatment plans into service_types array for unified service selection (same as gpt_service)"""
-        service_types = context.get("service_types", [])
-        treatment_plans = context.get("treatment_plans", [])
-        
-        # Convert treatment plans to service format and merge with service types
-        merged_services = list(service_types)  # Start with existing services (can be strings or dicts)
-        for plan in treatment_plans:
-            if isinstance(plan, dict) and "question" in plan:
-                # Convert treatment plan to service format
-                service_item = {
-                    "name": plan["question"],
-                    "title": plan["question"],
-                    "description": plan.get("description", ""),
-                    "is_treatment_plan": True
-                }
-                merged_services.append(service_item)
-        
-        # Update context with merged services
-        context = context.copy()
-        context["service_types"] = merged_services
-        return context
     
     async def get_accurate_answer(self, query: str, profession: str = "Clinic", is_whatsapp: bool = False, context_data: Optional[Dict[str, Any]] = None, conversation_history: Optional[List[Dict[str, str]]] = None) -> Optional[str]:
         """Get an accurate answer using LangChain - let AI handle flow progression and JSON generation"""
@@ -489,10 +436,6 @@ Response:"""
             return None
         
         try:
-            # Merge treatment plans into service types (same as gpt_service does)
-            if context_data:
-                context_data = self._merge_treatment_plans_into_services(context_data)
-            
             # Retrieve relevant documents for context
             docs = self._retrieve_documents(query)
             
@@ -564,21 +507,21 @@ Response:"""
             # Note: For WhatsApp, phone is already verified, so skip phone OTP steps even if phone validation is enabled
             if is_whatsapp:
                 if validate_email:
-                    flow = "lead type → service type → name → email → send email OTP → verify email OTP → JSON (phone from WhatsApp, already verified)"
+                    flow = "lead type → treatment plan → name → email → send email OTP → verify email OTP → JSON (phone from WhatsApp, already verified)"
                 else:
-                    flow = "lead type → service type → name → email → JSON (phone from WhatsApp, already verified)"
+                    flow = "lead type → treatment plan → name → email → JSON (phone from WhatsApp, already verified)"
                 json_fields = '{"leadType": "...", "serviceType": "...", "leadName": "...", "leadEmail": "...", "title": "..."}'
                 option_format = "NUMBERED LIST (1. Option 1, 2. Option 2, etc.)"
             else:
                 # For web chat, include phone OTP steps if phone validation is enabled
                 if validate_email and validate_phone:
-                    flow = "lead type → service type → name → email → send email OTP → verify email OTP → phone → send phone OTP → verify phone OTP → JSON"
+                    flow = "lead type → treatment plan → name → email → send email OTP → verify email OTP → phone → send phone OTP → verify phone OTP → JSON"
                 elif validate_email:
-                    flow = "lead type → service type → name → email → send email OTP → verify email OTP → phone → JSON"
+                    flow = "lead type → treatment plan → name → email → send email OTP → verify email OTP → phone → JSON"
                 elif validate_phone:
-                    flow = "lead type → service type → name → email → phone → send phone OTP → verify phone OTP → JSON"
+                    flow = "lead type → treatment plan → name → email → phone → send phone OTP → verify phone OTP → JSON"
                 else:
-                    flow = "lead type → service type → name → email → phone → JSON"
+                    flow = "lead type → treatment plan → name → email → phone → JSON"
                 json_fields = '{"leadType": "...", "serviceType": "...", "leadName": "...", "leadEmail": "...", "leadPhoneNumber": "...", "title": "..."}'
                 option_format = "BUTTONS: Use <button> Option Text </button> format for all options"
             
@@ -589,17 +532,17 @@ AVAILABLE OPTIONS:
 Lead Types:
 {lead_types_text}
 
-Services:
+Treatment Plans:
 {services_text}
 
 RULES:
-1. CRITICAL: Analyze the conversation history below CAREFULLY to determine what information has already been collected (lead type, service type, name, email, phone, title) - do NOT ask for information that's already collected
+1. CRITICAL: Analyze the conversation history below CAREFULLY to determine what information has already been collected (lead type, treatment plan, name, email, phone, title) - do NOT ask for information that's already collected
    - "title" is the text from the selected lead type (e.g., if user selected "I would like to arrange an appointment", title = "I would like to arrange an appointment")
 2. Match user input to exact values from the options above
 3. Follow the flow strictly: {flow}
    - IMPORTANT: OTP verification steps (send OTP → verify OTP) are MANDATORY if validation is enabled - do NOT skip them
    - Do NOT generate JSON until ALL OTP verification steps are complete (if validation is enabled)
-4. When showing options, use {option_format} and show ALL options for the CURRENT step only (lead types OR services, not both)
+4. When showing options, use {option_format} and show ALL options for the CURRENT step only (lead types OR treatment plans, not both)
    - CRITICAL: For buttons, use EXACT format: <button>Option Text</button> with NO spaces inside angle brackets
    - WRONG: < button >Text< /button > or <button >Text</ button>
    - CORRECT: <button>Text</button>
@@ -721,26 +664,12 @@ Response:"""
                 return f"{answer}\n\n{buttons}"
         
         elif current_step == "ask_service_type":
-            # Merge treatment plans into service types (same as gpt_service does)
-            services = context_data.get("service_types", [])
-            treatment_plans = context_data.get("treatment_plans", [])
+            # Use treatment plans directly
+            treatment_plans = context_data.get("treatment_plans", []) if context_data else []
             
-            # Start with regular services
             all_services = []
             seen_services = set()  # Track to avoid duplicates
             
-            # Add regular services (can be strings or dicts)
-            for s in services:
-                if isinstance(s, dict):
-                    service_name = s.get("name", s.get("title", ""))
-                else:
-                    service_name = str(s)
-                
-                if service_name and service_name not in seen_services:
-                    all_services.append(service_name)
-                    seen_services.add(service_name)
-            
-            # Add treatment plans as services
             for tp in treatment_plans:
                 if isinstance(tp, dict):
                     service_name = tp.get("question", "")
@@ -749,18 +678,18 @@ Response:"""
                         seen_services.add(service_name)
             
             if not all_services:
-                return "Which service are you interested in?"
+                return "Which treatment plan are you interested in?"
             
             service_text = "\n".join([f"- {s}" for s in all_services])
             
             prompt = f"""You are a {profession} assistant. The user said: "{query}"
 
-Available services:
+Available treatment plans:
 {service_text}
 
-If their input matches one of these services, acknowledge it briefly. Otherwise, ask "Which service are you interested in?" in a friendly way.
+If their input matches one of these treatment plans, acknowledge it briefly. Otherwise, ask "Which treatment plan are you interested in?" in a friendly way.
 
-IMPORTANT: Do NOT list all services in your response - just acknowledge or ask. All services will be shown as buttons/numbers separately.
+IMPORTANT: Do NOT list all treatment plans in your response - just acknowledge or ask. All treatment plans will be shown as buttons/numbers separately.
 
 Response (just the text, no buttons/numbers - they will be added separately):"""
             

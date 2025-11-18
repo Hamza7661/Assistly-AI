@@ -468,19 +468,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Build RAG vector store
     rag_service.build_vector_store(context)
     
-    # Check for workflows (keep workflow support for now)
-    workflows = context.get("workflows", [])
-    root_workflow = _get_root_workflow(workflows)
-    current_workflow_id = None
-    
-    # Send initial greeting
-    if root_workflow and workflows:
-        initial_reply = root_workflow.get("question", "")
-        current_workflow_id = root_workflow.get("_id")
-    else:
-        initial_reply = await response_generator.generate_greeting(context, channel="web")
-        # Transition to lead type selection after greeting
-        flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+    # Send initial greeting (workflows are now handled after treatment plan selection)
+    initial_reply = await response_generator.generate_greeting(context, channel="web")
+    # Transition to lead type selection after greeting
+    flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
     
     conversation_history.append({"role": "assistant", "content": initial_reply})
     await websocket.send_json({"type": "bot", "content": initial_reply})
@@ -502,28 +493,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Add user message to history
             conversation_history.append({"role": "user", "content": user_text})
             
-            # Handle workflows first (if active)
-            if current_workflow_id:
-                current_workflow = _find_workflow_by_id(workflows, current_workflow_id)
-                if current_workflow:
-                    option_text, next_question, is_terminal = _process_workflow_response(user_text, current_workflow, workflows)
-                    if option_text is not None:
-                        if is_terminal:
-                            current_workflow_id = None
-                            reply = "Thank you for your response!"
-                        elif next_question:
-                            reply = next_question
-                            next_workflow = _find_workflow_by_id(workflows, current_workflow.get("options", [])[next((i for i, opt in enumerate(current_workflow.get("options", [])) if opt.get("text") == option_text), -1)].get("nextQuestionId"))
-                            current_workflow_id = next_workflow.get("_id") if next_workflow else None
-                        else:
-                            current_workflow_id = None
-                            reply = "Thank you for your response!"
-                        
-                        conversation_history.append({"role": "assistant", "content": reply})
-                        await websocket.send_json({"type": "bot", "content": reply})
-                        continue
-            
-            # Production-grade state machine flow
+            # Production-grade state machine flow (workflows are now handled by response_generator after treatment plan selection)
             current_state = flow_controller.state
             logger.info(f"Current state: {current_state.value}")
             
@@ -1182,12 +1152,11 @@ async def whatsapp_webhook(request: Request):
                     logger.warning(f"WhatsApp: User selected invalid lead type number {number}, available: {len(lead_types)}")
                     
             elif has_lead_type and not has_service:
-                # Second selection - must be service
-                services = context.get("service_types", [])
-                treatments = context.get("treatment_plans", [])
-                all_options = services + [t.get("question", str(t)) for t in treatments if isinstance(t, dict)]
+                # Second selection - must be treatment plan
+                treatment_plans = context.get("treatment_plans", [])
+                all_options = [t.get("question", str(t)) for t in treatment_plans if isinstance(t, dict)]
                 
-                logger.info(f"WhatsApp: Detected service selection. Available options: {all_options}")
+                logger.info(f"WhatsApp: Detected treatment plan selection. Available options: {all_options}")
                 
                 if 1 <= number <= len(all_options):
                     selected = all_options[number - 1]

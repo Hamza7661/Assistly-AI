@@ -7,6 +7,7 @@ import json
 from app.services.conversation_state import FlowController, ConversationState
 from app.services.data_extractors import DataExtractor
 from app.services.validators import Validator
+from app.services.workflow_manager import WorkflowManager
 
 logger = logging.getLogger("assistly.response_generator")
 
@@ -67,28 +68,6 @@ class ResponseGenerator:
 
         return cleaned.rstrip(" .?")
 
-    def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge treatment plans into service_types array for unified service selection"""
-        service_types = context.get("service_types", [])
-        treatment_plans = context.get("treatment_plans", [])
-        
-        # Convert treatment plans to service format and merge with service types
-        merged_services = list(service_types)  # Start with existing services (can be strings or dicts)
-        for plan in treatment_plans:
-            if isinstance(plan, dict) and "question" in plan:
-                # Convert treatment plan to service format
-                service_item = {
-                    "name": plan["question"],
-                    "title": plan["question"],
-                    "description": plan.get("description", ""),
-                    "is_treatment_plan": True
-                }
-                merged_services.append(service_item)
-        
-        # Update context with merged services
-        context = context.copy()
-        context["service_types"] = merged_services
-        return context
     
     async def _classify_intent(self, user_message: str) -> Dict[str, Any]:
         """
@@ -324,12 +303,14 @@ Classify the intent:"""
         context: Dict[str, Any]
     ) -> str:
         """Generate response based on current state"""
-        # Merge treatment plans into service_types for unified handling
-        context = self._merge_treatment_plans_into_services(context)
-        
         state = flow_controller.state
         extractor = DataExtractor()
         validator = Validator()
+        
+        # Initialize or reuse workflow manager
+        if flow_controller.workflow_manager is None:
+            flow_controller.workflow_manager = WorkflowManager(context)
+        workflow_manager = flow_controller.workflow_manager
         
         # Extract data from user message (only extract what we need based on state)
         email = extractor.extract_email(user_message)
@@ -440,24 +421,109 @@ Classify the intent:"""
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
         
         if state == ConversationState.SERVICE_SELECTION:
-            # Services already include treatment plans (merged above)
-            services = context.get("service_types", [])
-            # Extract service names for matching
-            all_services = []
-            for s in services:
-                if isinstance(s, dict):
-                    all_services.append(s.get("name", s.get("title", "")))
+            # Use treatment plans directly
+            treatment_plans = context.get("treatment_plans", [])
+            # Extract treatment plan names for matching
+            all_treatment_plans = []
+            for plan in treatment_plans:
+                if isinstance(plan, dict):
+                    # Use "question" field as the identifier for treatment plans
+                    plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                    if plan_name:
+                        all_treatment_plans.append(plan_name)
                 else:
-                    all_services.append(str(s))
-            service = extractor.match_service(user_message, all_services)
+                    all_treatment_plans.append(str(plan))
+            
+            # Try to match against treatment plans first
+            service = extractor.match_service(user_message, all_treatment_plans)
+            
+            # Find the exact treatment plan name that was matched (for workflow detection)
+            matched_treatment_plan_name = None
             if service:
-                logger.info(f"Matched service: {service}")
+                # Find the exact treatment plan name from the list (case-insensitive match)
+                for plan_name in all_treatment_plans:
+                    if plan_name.lower() == service.lower():
+                        matched_treatment_plan_name = plan_name
+                        break
+                # If no exact match found, use the service as-is
+                if not matched_treatment_plan_name:
+                    matched_treatment_plan_name = service
+            
+            # If no match, accept user input as service type (user can choose any service)
+            if not service:
+                # Check if it's a question - if so, handle it but stay in service selection
+                if has_question:
+                    logger.info(f"User asked a question about services: '{user_message}'")
+                    rag_context = await self._get_rag_context(user_message, context)
+                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                
+                # Accept user input as service type even if not in treatment plans
+                service = user_message.strip()
+                logger.info(f"Accepted user input as service type (not in treatment plans): '{service}'")
+            
+            if service:
+                logger.info(f"Matched/selected service: {service}")
                 flow_controller.update_collected_data("serviceType", service)
-                flow_controller.transition_to(flow_controller.get_next_state())
+                
+                # ALWAYS check for workflows first (even if user asked a question)
+                # Use the exact treatment plan name for workflow detection
+                workflow_started = False
+                if matched_treatment_plan_name and matched_treatment_plan_name in all_treatment_plans:
+                    logger.info(f"Checking for workflows for treatment plan: '{matched_treatment_plan_name}' (matched from service: '{service}')")
+                    if workflow_manager.start_workflow_for_treatment_plan(matched_treatment_plan_name):
+                        # Start workflow questions
+                        flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+                        workflow_started = True
+                        logger.info(f"✓ Started workflow for treatment plan '{matched_treatment_plan_name}' - transitioning to WORKFLOW_QUESTION state")
+                        current_question = workflow_manager.get_current_question()
+                        if current_question:
+                            question_text = current_question.get("question", "")
+                            logger.info(f"✓ First workflow question: '{question_text}'")
+                            # If user asked a question, answer it briefly then ask workflow question
+                            if has_question:
+                                # Get a brief answer to the question using RAG
+                                try:
+                                    rag_context = await self._get_rag_context(f"{service} {user_message}", context)
+                                    if rag_context and self.client:
+                                        # Generate a brief answer (1-2 sentences)
+                                        response = await self.client.chat.completions.create(
+                                            model=self.model,
+                                            messages=[
+                                                {"role": "system", "content": f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."},
+                                                {"role": "user", "content": f"Context: {rag_context}\n\nQuestion: {user_message}"}
+                                            ],
+                                            max_tokens=100,
+                                            temperature=0.3
+                                        )
+                                        brief_answer = (response.choices[0].message.content or "").strip()
+                                        if brief_answer:
+                                            logger.info(f"✓ Answering question then asking workflow question")
+                                            return f"{brief_answer} Now, {question_text}"
+                                except Exception as e:
+                                    logger.warning(f"Failed to generate brief answer for question: {e}")
+                                    # If answer generation fails, just ask workflow question
+                            logger.info(f"✓ Returning workflow question (no user question to answer first)")
+                            return question_text
+                        else:
+                            # No questions found, continue to name collection
+                            logger.warning(f"Workflow started but no questions found - continuing to name collection")
+                            workflow_manager.reset()
+                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    else:
+                        # No workflow found
+                        logger.info(f"No workflow found for treatment plan '{matched_treatment_plan_name}' - continuing to name collection")
+                        workflow_manager.reset()
+                
+                # If workflow was NOT started, continue to name collection
+                if not workflow_started:
+                    logger.info(f"No workflow started - transitioning to name collection")
+                    workflow_manager.reset()
+                    flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
                 
-                # Check if user asked a question along with service selection
-                if has_question:
+                # Check if user asked a question along with service selection (only if no workflow)
+                if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                     # Get RAG context for the question (pricing, info about the service)
                     rag_context = await self._get_rag_context(f"{service} {user_message}", context)
                     # Generate response that answers question AND asks for name
@@ -465,15 +531,56 @@ Classify the intent:"""
                         "service", service, rag_context,
                         "name", conversation_history, context
                     )
-                else:
+                elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                     # Just acknowledge and move to name collection
                     rag_context = await self._get_rag_context("name collection", context)
                     return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
             else:
-                logger.warning(f"No service matched for user input: '{user_message}'. Available services: {all_services}")
+                # This shouldn't happen now, but keep as fallback
+                logger.warning(f"Could not determine service from user input: '{user_message}'. Available treatment plans: {all_treatment_plans}")
                 # No match - use AI to handle questions, but ensure it stays in service selection
                 rag_context = await self._get_rag_context(user_message if has_question else "service selection", context)
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
+        
+        if state == ConversationState.WORKFLOW_QUESTION:
+            # Handle workflow question
+            current_question = workflow_manager.get_current_question()
+            if not current_question:
+                # Workflow complete, store answers and move to name collection
+                workflow_answers = workflow_manager.get_workflow_answers()
+                flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                workflow_manager.reset()
+                flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                rag_context = await self._get_rag_context("name collection", context)
+                return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+            
+            # Record answer and move to next question
+            has_more = workflow_manager.record_answer(user_message)
+            
+            if has_more:
+                # More questions remain, ask next question
+                next_question = workflow_manager.get_current_question()
+                if next_question:
+                    return next_question.get("question", "")
+                else:
+                    # No more questions, complete workflow
+                    workflow_answers = workflow_manager.get_workflow_answers()
+                    flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                    workflow_manager.reset()
+                    flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                    rag_context = await self._get_rag_context("name collection", context)
+                    return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+            else:
+                # Last question answered, complete workflow
+                workflow_answers = workflow_manager.get_workflow_answers()
+                flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                workflow_manager.reset()
+                flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                rag_context = await self._get_rag_context("name collection", context)
+                return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
         
         if state == ConversationState.NAME_COLLECTION:
             if name and validator.is_valid_name(name):
@@ -623,19 +730,22 @@ Classify the intent:"""
         conversation_history: List[Dict[str, str]],
         context: Dict[str, Any]
     ) -> str:
-        """Generate service selection response with explicit service list"""
+        """Generate service selection response with explicit treatment plan list"""
         if not self.client:
             return "Which service are you interested in?"
         
-        # Get all services (already includes treatment plans merged above)
-        services = context.get("service_types", [])
+        # Get all treatment plans
+        treatment_plans = context.get("treatment_plans", [])
         all_services = []
         
-        for s in services:
-            if isinstance(s, dict):
-                all_services.append(s.get("name", s.get("title", "")))
+        for plan in treatment_plans:
+            if isinstance(plan, dict):
+                # Use "question" field as the identifier for treatment plans
+                plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                if plan_name:
+                    all_services.append(plan_name)
             else:
-                all_services.append(str(s))
+                all_services.append(str(plan))
         
         if self.channel == "voice":
             services_text = self._format_voice_list(all_services)
@@ -869,13 +979,15 @@ If the context doesn't contain the answer, say "I don't have that information, b
                 f"Would you like {lead_voice_list}?" if lead_voice_list else "No lead types provided"
             )
 
-            services = context.get("service_types", [])
+            treatment_plans = context.get("treatment_plans", [])
             service_names = []
-            for srv in services:
-                if isinstance(srv, dict):
-                    service_names.append(srv.get("name", srv.get("title", "")))
+            for plan in treatment_plans:
+                if isinstance(plan, dict):
+                    plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                    if plan_name:
+                        service_names.append(plan_name)
                 else:
-                    service_names.append(str(srv))
+                    service_names.append(str(plan))
             service_voice_text = self._format_voice_list(service_names)
 
             state_prompts[ConversationState.GREETING] = f"""You are a {self.profession} assistant interacting over voice.

@@ -6,11 +6,17 @@ import logging
 logger = logging.getLogger("assistly.conversation_state")
 
 
+# Forward declaration to avoid circular import
+class WorkflowManager:
+    pass
+
+
 class ConversationState(Enum):
     """Defines all possible conversation states"""
     GREETING = "greeting"
     LEAD_TYPE_SELECTION = "lead_type_selection"
     SERVICE_SELECTION = "service_selection"
+    WORKFLOW_QUESTION = "workflow_question"
     NAME_COLLECTION = "name_collection"
     EMAIL_COLLECTION = "email_collection"
     EMAIL_OTP_SENT = "email_otp_sent"
@@ -33,7 +39,8 @@ class FlowController:
             "leadName": None,
             "leadEmail": None,
             "leadPhoneNumber": None,
-            "title": None
+            "title": None,
+            "workflowAnswers": {}
         }
         self.otp_state = {
             "email_sent": False,
@@ -49,6 +56,7 @@ class FlowController:
         self.is_whatsapp = False  # Set externally
         self.channel: str = integration.get("channel", "web")
         self.skip_phone_collection: bool = False
+        self.workflow_manager: Optional[Any] = None  # Will be set by response_generator
     
     def set_whatsapp(self, is_whatsapp: bool):
         """Set WhatsApp mode (phone already verified)"""
@@ -95,8 +103,17 @@ class FlowController:
         
         elif self.state == ConversationState.SERVICE_SELECTION:
             if self.collected_data["serviceType"]:
+                # Check if workflow questions need to be asked
+                # This will be handled by response_generator checking workflow_manager
                 return ConversationState.NAME_COLLECTION
             return ConversationState.SERVICE_SELECTION
+        
+        elif self.state == ConversationState.WORKFLOW_QUESTION:
+            # Workflow questions are handled by workflow_manager
+            # Check if workflow is complete
+            if self.workflow_manager and self.workflow_manager.is_workflow_complete():
+                return ConversationState.NAME_COLLECTION
+            return ConversationState.WORKFLOW_QUESTION
         
         elif self.state == ConversationState.NAME_COLLECTION:
             if self.collected_data["leadName"]:
@@ -189,6 +206,11 @@ class FlowController:
         if self.collected_data.get("leadPhoneNumber"):
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
         
+        # Add workflow answers if present
+        workflow_answers = self.collected_data.get("workflowAnswers", {})
+        if workflow_answers:
+            data["workflowAnswers"] = workflow_answers
+        
         # Add conversation history if provided
         if conversation_history:
             data["history"] = conversation_history
@@ -201,6 +223,7 @@ class FlowController:
             ConversationState.GREETING: "Greet the user and present lead type options.",
             ConversationState.LEAD_TYPE_SELECTION: "Present lead type options and wait for selection.",
             ConversationState.SERVICE_SELECTION: "Present service options and wait for selection.",
+            ConversationState.WORKFLOW_QUESTION: "Ask workflow question and wait for answer.",
             ConversationState.NAME_COLLECTION: "Ask for the user's name.",
             ConversationState.EMAIL_COLLECTION: "Ask for the user's email address.",
             ConversationState.EMAIL_OTP_SENT: "Acknowledge OTP sent and wait for verification code.",

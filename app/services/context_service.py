@@ -160,14 +160,6 @@ class ContextService:
         else:
             lead_types = []
 
-        service_types = first_present([
-            "service_types",
-            "serviceTypes",
-            "services",
-            "treatments",
-            "treatmentOptions",
-        ], [])
-
         # FAQs may be under 'faq' on the root, or nested inside src
         faqs = first_present([
             "faqs",
@@ -226,13 +218,21 @@ class ContextService:
             "user_data",
         ], {})
 
+        # Extract workflows (needed for workflow questions)
+        workflows = first_present([
+            "workflows",
+            "Workflows",
+            "workflow",
+            "Workflow",
+        ], [])
+
         return {
             "lead_types": lead_types,
-            "service_types": service_types,
-            "faqs": faqs,
             "treatment_plans": treatment_plans,
+            "faqs": faqs,
             "profession": profession,
             "integration": integration,
             "country": country,
             "user": user_data,  # Preserve user data
+            "workflows": workflows,  # Preserve workflows for workflow questions
         }

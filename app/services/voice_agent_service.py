@@ -515,12 +515,15 @@ class VoiceAgentService:
         integration = context.get("integration", {}) or {}
         assistant_name = integration.get("assistantName") or "Assistant"
         lead_types = context.get("lead_types", []) or []
-        services = context.get("service_types", []) or []
+        treatment_plans = context.get("treatment_plans", []) or []
 
         lead_type_names = ", ".join(
             [lt.get("text", "") for lt in lead_types if isinstance(lt, dict) and lt.get("text")]
         ) or "our available services"
-        service_names = ", ".join([str(s) for s in services if s]) or "our services"
+        service_names = ", ".join([
+            plan.get("question", "") for plan in treatment_plans 
+            if isinstance(plan, dict) and plan.get("question")
+        ]) or "our services"
 
         prompt = (
             f"You are {assistant_name}, an AI assistant for a {profession}. "

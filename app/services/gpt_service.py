@@ -22,28 +22,6 @@ class GptService:
     def set_profession(self, profession: str) -> None:
         self.profession = profession or self.profession
 
-    def _merge_treatment_plans_into_services(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge treatment plans into service_types array for unified service selection"""
-        service_types = context.get("service_types", [])
-        treatment_plans = context.get("treatment_plans", [])
-        
-        # Convert treatment plans to service format and merge with service types
-        merged_services = list(service_types)  # Start with existing services
-        for plan in treatment_plans:
-            if isinstance(plan, dict) and "question" in plan:
-                # Convert treatment plan to service format
-                service_item = {
-                    "name": plan["question"],
-                    "title": plan["question"],
-                    "description": plan.get("description", ""),
-                    "is_treatment_plan": True
-                }
-                merged_services.append(service_item)
-        
-        # Update context with merged services
-        context = context.copy()
-        context["service_types"] = merged_services
-        return context
     
     def _get_workflow_prompt(self, context: Dict[str, Any]) -> str:
         """Generate workflow instructions for GPT based on custom workflows"""
@@ -152,9 +130,6 @@ class GptService:
                 lines.append(f"<button> {txt} </button>")
             return "\n".join(lines)
         
-        # Merge treatment plans into service types for unified service selection
-        context = self._merge_treatment_plans_into_services(context)
-        
         # Initialize RAG (always enabled)
         if self.rag_service:
             self.current_context = context
@@ -186,9 +161,6 @@ class GptService:
     async def agent_reply(self, history: List[Dict[str, str]], user_message: str, context: Dict[str, Any], state: Dict[str, Any], is_whatsapp: bool = False) -> str:
         if not self.client:
             return "Got it."
-        
-        # Merge treatment plans into service types for unified service selection
-        context = self._merge_treatment_plans_into_services(context)
         
         # Update RAG if context changed (RAG is always enabled)
         if self.rag_service and self.current_context != context:
@@ -248,20 +220,20 @@ class GptService:
         # Note: For WhatsApp, phone is already verified, so skip phone OTP steps even if phone validation is enabled
         if is_whatsapp:
             if validate_email:
-                flow = "lead type → service type → name → email → send email OTP → verify email OTP → JSON (phone from WhatsApp, already verified)"
+                flow = "lead type → treatment plan → name → email → send email OTP → verify email OTP → JSON (phone from WhatsApp, already verified)"
             else:
-                flow = "lead type → service type → name → email → JSON (phone from WhatsApp, already verified)"
+                flow = "lead type → treatment plan → name → email → JSON (phone from WhatsApp, already verified)"
             json_example = '{"leadType": "...", "serviceType": "...", "leadName": "...", "leadEmail": "..."}'
         else:
             # For web chat, include phone OTP steps if phone validation is enabled
             if validate_email and validate_phone:
-                flow = "lead type → service type → name → email → send email OTP → verify email OTP → phone → send phone OTP → verify phone OTP → JSON"
+                flow = "lead type → treatment plan → name → email → send email OTP → verify email OTP → phone → send phone OTP → verify phone OTP → JSON"
             elif validate_email:
-                flow = "lead type → service type → name → email → send email OTP → verify email OTP → phone → JSON"
+                flow = "lead type → treatment plan → name → email → send email OTP → verify email OTP → phone → JSON"
             elif validate_phone:
-                flow = "lead type → service type → name → email → phone → send phone OTP → verify phone OTP → JSON"
+                flow = "lead type → treatment plan → name → email → phone → send phone OTP → verify phone OTP → JSON"
             else:
-                flow = "lead type → service type → name → email → phone → JSON"
+                flow = "lead type → treatment plan → name → email → phone → JSON"
             json_example = '{"leadType": "...", "serviceType": "...", "leadName": "...", "leadEmail": "...", "leadPhoneNumber": "..."}'
         
         system = (
