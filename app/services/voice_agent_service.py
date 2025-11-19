@@ -11,9 +11,17 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from deepgram import AsyncDeepgramClient
 
-from .conversation_state import ConversationState, FlowController
-from .response_generator import ResponseGenerator
-from .rag_service import RAGService
+# Try to import Settings model if available
+try:
+    from deepgram.agent.v1.models import Settings
+    DEEPGRAM_SETTINGS_AVAILABLE = True
+except ImportError:
+    try:
+        from deepgram.agent.v1 import Settings
+        DEEPGRAM_SETTINGS_AVAILABLE = True
+    except ImportError:
+        DEEPGRAM_SETTINGS_AVAILABLE = False
+
 from .context_service import ContextService
 from .lead_service import LeadService
 from ..utils.phone_utils import format_phone_number_with_gpt
@@ -38,174 +46,472 @@ def _maybe_parse_json(text: str) -> Optional[Dict[str, Any]]:
 
 @dataclass
 class VoiceAgentSession:
-    """Manages a voice agent session using Deepgram STT + TTS."""
+    """Manages a voice agent session using Deepgram Voice Agent API."""
 
     call_sid: str
     caller_phone: str
     user_id: str
     context: Dict[str, Any]
-    flow_controller: FlowController
-    response_generator: ResponseGenerator
     lead_service: LeadService
-    rag_service: RAGService
     deepgram_client: AsyncDeepgramClient
-    gpt_model: str
-    conversation_history: List[Dict[str, str]] = field(default_factory=list)
     on_stop: Optional[Callable[[str], None]] = None
 
     twilio_websocket: Optional[WebSocket] = None
     twilio_stream_sid: Optional[str] = None
-    pending_audio: List[str] = field(default_factory=list)
     pending_twilio_audio: List[bytes] = field(default_factory=list)
     active: bool = True
-    _last_user_text: Optional[str] = None
     _stopping: bool = False
 
-    # Deepgram STT connection
-    deepgram_stt_connection: Optional[Any] = None
-    deepgram_stt_connection_cm: Optional[Any] = None
-    deepgram_stt_listen_task: Optional[asyncio.Task] = None
-    deepgram_stt_ready: bool = False
-    deepgram_stt_ready_event: Optional[asyncio.Event] = None
-    
-    # Pending greeting to send when Twilio stream is ready
-    pending_greeting: Optional[str] = None
+    # Deepgram Voice Agent API connection
+    deepgram_agent_connection: Optional[Any] = None
+    deepgram_agent_connection_cm: Optional[Any] = None
+    deepgram_agent_listen_task: Optional[asyncio.Task] = None
+    deepgram_agent_ready: bool = False
+    deepgram_agent_ready_event: Optional[asyncio.Event] = None
+    cached_trigger_audio: Optional[bytes] = None
+    _last_user_audio_time: Optional[float] = None  # Track when user last spoke
+    _first_response_sent: bool = False  # Track if we've sent first response chunk
 
     def __post_init__(self) -> None:
-        self.deepgram_stt_ready_event = asyncio.Event()
+        self.deepgram_agent_ready_event = asyncio.Event()
 
     async def start(self) -> None:
-        """Initialize session. Deepgram STT will start when Twilio stream is ready."""
-        # Don't start Deepgram STT yet - wait for Twilio stream to be ready
-        # This prevents timeout errors from Deepgram waiting for audio
+        """Initialize session. Deepgram Voice Agent will start when Twilio stream is ready."""
         logger.info("Voice agent session started for call %s", self.call_sid)
 
-    async def _start_deepgram_stt(self) -> None:
-        """Start Deepgram STT streaming connection."""
+    async def _build_agent_prompt(self) -> str:
+        """Build system prompt for Deepgram Voice Agent to collect lead information."""
+        profession = self.context.get("profession", "clinic")
+        integration = self.context.get("integration", {}) or {}
+        assistant_name = integration.get("assistantName") or "Assistant"
+        lead_types = self.context.get("lead_types", []) or []
+        treatment_plans = self.context.get("treatment_plans", []) or []
+        faqs = self.context.get("faqs", []) or []
+        workflows = self.context.get("workflows", []) or []
+
+        # Build lead types list
+        lead_type_list = []
+        for lt in lead_types:
+            if isinstance(lt, dict):
+                text = lt.get("text", "")
+                value = lt.get("value", "")
+                if text:
+                    lead_type_list.append(f"- {text} (value: {value})")
+        lead_types_text = "\n".join(lead_type_list) if lead_type_list else "No specific lead types"
+
+        # Build treatment plans with workflows
+        treatment_plans_text = []
+        for plan in treatment_plans:
+            if isinstance(plan, dict):
+                question = plan.get("question", "")
+                answer = plan.get("answer", "")
+                attached_workflows = plan.get("attachedWorkflows", [])
+                
+                plan_info = f"- {question}"
+                if answer:
+                    plan_info += f" (Answer: {answer})"
+                
+                # Check for workflows
+                if attached_workflows:
+                    workflow_questions = []
+                    for wf in attached_workflows:
+                        workflow = wf.get("workflow", {})
+                        if workflow:
+                            wf_questions = workflow.get("questions", [])
+                            for q in wf_questions:
+                                q_text = q.get("question", "")
+                                if q_text:
+                                    workflow_questions.append(f"  * {q_text}")
+                    
+                    if workflow_questions:
+                        plan_info += "\n  Workflow questions to ask:\n" + "\n".join(workflow_questions)
+                
+                treatment_plans_text.append(plan_info)
+        
+        treatment_plans_formatted = "\n".join(treatment_plans_text) if treatment_plans_text else "No specific treatment plans"
+
+        # Build FAQs/knowledge base
+        faqs_text = []
+        for faq in faqs:
+            if isinstance(faq, dict):
+                question = faq.get("question", "")
+                answer = faq.get("answer", "")
+                if question and answer:
+                    faqs_text.append(f"Q: {question}\nA: {answer}")
+        
+        faqs_formatted = "\n".join(faqs_text) if faqs_text else "No FAQs available"
+
+        prompt = f"""You are {assistant_name}, an AI assistant for a {profession}.
+
+KNOWLEDGE BASE (use this to answer questions):
+{faqs_formatted}
+
+AVAILABLE LEAD TYPES:
+{lead_types_text}
+
+AVAILABLE TREATMENT PLANS/SERVICES:
+{treatment_plans_formatted}
+
+INSTRUCTIONS:
+1. TRIGGER PHRASE: If you hear the phrase "initiate greeting", you MUST immediately greet the caller and start the conversation flow. Say hello and introduce yourself as {assistant_name}, then ask how you can help them.
+2. Answer questions from the knowledge base above when the caller asks.
+3. Collect the following information from the caller:
+   - Service/treatment plan (from the list above)
+   - Full name
+   - Email address
+   (Phone number is already known: {self.caller_phone})
+
+4. WORKFLOW QUESTIONS: If the caller selects a service/treatment plan that has workflow questions attached, you MUST ask those workflow questions in order before collecting name and email.
+
+5. When you have collected ALL required information (service type, name, email, and any workflow answers), output ONLY a JSON object in this exact format:
+{{
+  "leadType": "the lead type value based on the conversation (e.g., 'callback', 'appointment arrangement', 'further information')",
+  "serviceType": "the selected service/treatment plan name",
+  "leadName": "full name",
+  "leadEmail": "email address",
+  "leadPhoneNumber": "{self.caller_phone}",
+  "workflowAnswers": {{"question1": "answer1", "question2": "answer2"}} (if workflow questions were asked)
+}}
+
+IMPORTANT:
+- Use the knowledge base to answer questions accurately
+- If a service has workflow questions, ask them in order
+- Do NOT output JSON until you have service type, name, and email
+- Speak clearly and naturally in English only
+- Be friendly and professional
+- ASK ONE QUESTION AT A TIME: Do not list all options or ask multiple questions in a single response. Ask one question, wait for the answer, then ask the next question."""
+        return prompt
+
+    async def _start_deepgram_agent(self) -> None:
+        """Start Deepgram Voice Agent API connection."""
         try:
-            # Use Deepgram's live transcription API (Nova-3 for fastest STT)
-            # SDK 5.3 uses connect() as an async context manager
-            connection_cm = self.deepgram_client.listen.v1.connect(
-                model="nova-3",  # Using Nova-3 for fastest STT latency
-                language="en",
-                smart_format="false",
-                encoding="mulaw",
-                sample_rate="8000",
-                interim_results="true",
-            )
+            # Build agent prompt
+            agent_prompt = await self._build_agent_prompt()
+            
+            # Use Deepgram Voice Agent API - handles STT, LLM, and TTS
+            # Connect to the agent
+            connection_cm = self.deepgram_client.agent.v1.connect()
             
             # Store the context manager and enter it to get the connection
-            self.deepgram_stt_connection_cm = connection_cm
-            self.deepgram_stt_connection = await connection_cm.__aenter__()
+            self.deepgram_agent_connection_cm = connection_cm
+            self.deepgram_agent_connection = await connection_cm.__aenter__()
             
-            # Start a task to listen for messages
-            self.deepgram_stt_listen_task = asyncio.create_task(self._listen_deepgram_stt())
+            # Build greeting message
+            integration = self.context.get("integration", {}) or {}
+            assistant_name = integration.get("assistantName") or "Assistant"
+            greeting_text = f"Hello! I'm {assistant_name}. How can I help you today?"
             
-            self.deepgram_stt_ready = True
-            self.deepgram_stt_ready_event.set()
+            # Send configuration with prompt/instructions
+            # Build config dict first
+            config_dict = {
+                "audio": {
+                    "input": {
+                        "encoding": "mulaw",
+                        "sample_rate": 8000
+                    },
+                    "output": {
+                        "encoding": "mulaw",
+                        "sample_rate": 8000
+                    }
+                },
+                "agent": {
+                    "language": "en",
+                    "listen": {
+                        "provider": {
+                            "type": "deepgram",
+                            "model": "nova-2"
+                        }
+                    },
+                    "speak": {
+                        "provider": {
+                            "type": "deepgram",
+                            "model": "aura-asteria-en"
+                        }
+                    },
+                    "think": {
+                        "provider": {
+                            "type": "open_ai",
+                            "model": "gpt-4o-mini",
+                            "temperature": 0.7
+                        },
+                        "prompt": agent_prompt
+                    }
+                }
+            }
             
-            logger.info("Deepgram STT connection started for call %s", self.call_sid)
+            # Convert to Settings model if available, otherwise use dict
+            if DEEPGRAM_SETTINGS_AVAILABLE:
+                try:
+                    config = Settings(**config_dict)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to create Settings model, using dict: %s", exc)
+                    config = config_dict
+            else:
+                config = config_dict
+            
+            # Start a task to listen for messages FIRST (before sending config)
+            self.deepgram_agent_listen_task = asyncio.create_task(self._listen_deepgram_agent())
+            
+            # Send settings - try to use Settings model if available, otherwise send as JSON
+            settings_sent = False
+            if hasattr(self.deepgram_agent_connection, 'send_settings') and DEEPGRAM_SETTINGS_AVAILABLE:
+                try:
+                    settings_model = Settings(**config_dict)
+                    await self.deepgram_agent_connection.send_settings(settings_model)
+                    settings_sent = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to use send_settings() with Settings model: %s", exc)
+            
+            # Fallback: send as JSON message
+            if not settings_sent:
+                settings_message = {"type": "Settings", **config_dict}
+                await self._send_agent_message(settings_message)
+            
+            self.deepgram_agent_ready = True
+            self.deepgram_agent_ready_event.set()
+            
+            logger.info("Deepgram Voice Agent ready for call %s", self.call_sid)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to start Deepgram STT for call %s: %s", self.call_sid, exc)
+            logger.exception("Failed to start Deepgram Voice Agent for call %s: %s", self.call_sid, exc)
             raise
 
-    async def _listen_deepgram_stt(self) -> None:
-        """Listen for messages from Deepgram STT connection."""
+    async def _send_agent_message(self, message: Dict[str, Any]) -> None:
+        """Send a message to the Deepgram Voice Agent."""
+        if not self.deepgram_agent_connection:
+            logger.warning("Deepgram Voice Agent connection not ready for call %s", self.call_sid)
+            return
+        
+        # Check if connection is closed
+        if hasattr(self.deepgram_agent_connection, '_websocket'):
+            websocket = self.deepgram_agent_connection._websocket
+            if websocket and (websocket.closed or websocket.close_code is not None):
+                return
+        
         try:
-            if not self.deepgram_stt_connection:
+            sent = False
+            if hasattr(self.deepgram_agent_connection, 'configure'):
+                await self.deepgram_agent_connection.configure(message)
+                sent = True
+            elif hasattr(self.deepgram_agent_connection, 'send_message'):
+                await self.deepgram_agent_connection.send_message(message)
+                sent = True
+            elif hasattr(self.deepgram_agent_connection, 'send'):
+                if isinstance(message, dict):
+                    await self.deepgram_agent_connection.send(message)
+                else:
+                    await self.deepgram_agent_connection.send(json.dumps(message))
+                sent = True
+            elif hasattr(self.deepgram_agent_connection, '_send'):
+                if isinstance(message, dict):
+                    await self.deepgram_agent_connection._send(message)
+                else:
+                    await self.deepgram_agent_connection._send(json.dumps(message))
+                sent = True
+            elif hasattr(self.deepgram_agent_connection, 'write'):
+                if isinstance(message, dict):
+                    await self.deepgram_agent_connection.write(message)
+                else:
+                    await self.deepgram_agent_connection.write(json.dumps(message))
+                sent = True
+            
+            if not sent:
+                logger.error("Deepgram Voice Agent connection has no method to send messages for call %s", self.call_sid)
+        except (ConnectionError, OSError) as exc:
+            # Connection already closed - this is expected if connection was closed
+            logger.debug("Deepgram Voice Agent connection closed for call %s: %s", self.call_sid, exc)
+        except Exception as exc:  # noqa: BLE001
+            # Only log unexpected errors, not connection closed errors
+            if "closed" not in str(exc).lower() and "1005" not in str(exc):
+                logger.exception("Failed to send message to Deepgram Voice Agent for call %s: %s", self.call_sid, exc)
+
+    async def _listen_deepgram_agent(self) -> None:
+        """Listen for messages from Deepgram Voice Agent API."""
+        try:
+            if not self.deepgram_agent_connection:
+                logger.warning("Deepgram Agent connection is None, cannot listen for call %s", self.call_sid)
                 return
             
-            # Iterate over messages from the connection
-            async for message in self.deepgram_stt_connection:
-                await self._on_deepgram_stt_message(message)
+            # Check if connection is iterable
+            if not hasattr(self.deepgram_agent_connection, '__aiter__'):
+                logger.error("Deepgram Agent connection is not async iterable for call %s", self.call_sid)
+                return
+            
+            # Iterate over messages from the agent connection
+            async for message in self.deepgram_agent_connection:
+                # Handle different message types
+                if hasattr(message, 'type'):
+                    msg_type = message.type
+                    # Log error messages with full details
+                    if msg_type == "error" or hasattr(message, 'error'):
+                        error_details = {}
+                        if hasattr(message, 'error'):
+                            error_details['error'] = message.error
+                        if hasattr(message, 'message'):
+                            error_details['message'] = message.message
+                        if hasattr(message, 'code'):
+                            error_details['code'] = message.code
+                        logger.error("Deepgram Agent error for call %s: %s", self.call_sid, error_details)
+                
+                if isinstance(message, dict):
+                    msg_type = message.get("type", "unknown")
+                    # Log error messages specifically
+                    if msg_type == "error" or "error" in message:
+                        logger.error("Deepgram Agent error for call %s: %s", self.call_sid, message)
+                
+                await self._on_deepgram_agent_message(message)
         except asyncio.CancelledError:
             pass
+        except (ConnectionError, OSError):
+            pass
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Error in Deepgram STT listener for call %s: %s", self.call_sid, exc)
+            logger.exception("Error in Deepgram Voice Agent listener for call %s: %s", self.call_sid, exc)
 
-
-    def _on_deepgram_stt_open(self, *args, **kwargs) -> None:
-        """Handle Deepgram STT connection open."""
-        logger.info("Deepgram STT connection opened for call %s", self.call_sid)
-        self.deepgram_stt_ready = True
-        self.deepgram_stt_ready_event.set()
-
-    async def _on_deepgram_stt_message(self, message: Any) -> None:
-        """Handle Deepgram STT messages (including transcripts)."""
+    async def _on_deepgram_agent_message(self, message: Any) -> None:
+        """Handle messages from Deepgram Voice Agent API."""
         try:
-            # Handle different message types
-            transcript_text = None
-            is_final = False
+            # Handle raw bytes (audio data) - Deepgram sends audio as raw bytes
+            if isinstance(message, bytes):
+                # Calculate time since user last spoke (only log first chunk of response)
+                if self._last_user_audio_time and not self._first_response_sent:
+                    elapsed = time.time() - self._last_user_audio_time
+                    logger.info("Time to first audio for call %s: %.3fs (user spoke → first agent audio chunk)", self.call_sid, elapsed)
+                    self._first_response_sent = True  # Mark that we've sent first response
+                await self._send_audio_to_twilio(message)
+                return
             
+            # Handle message objects (AgentV1WelcomeMessage, AgentV1ErrorEvent, etc.)
+            if hasattr(message, 'type'):
+                msg_type = message.type
+                
+                # Handle error events
+                if msg_type == "error" or hasattr(message, 'error') or "error" in str(type(message)).lower():
+                    error_details = {}
+                    for attr in ['error', 'message', 'description', 'code', 'details', 'type']:
+                        if hasattr(message, attr):
+                            error_details[attr] = getattr(message, attr)
+                    if hasattr(message, '__dict__'):
+                        error_details.update(message.__dict__)
+                    logger.error("Deepgram Agent error for call %s: %s", self.call_sid, error_details)
+                    return
+                
+                # Handle welcome message
+                if msg_type == "welcome" or "welcome" in str(type(message)).lower():
+                    return
+                
+                # Handle audio messages
+                if hasattr(message, 'audio') or msg_type == "audio":
+                    audio_data = getattr(message, 'audio', None) or getattr(message, 'data', None)
+                    if audio_data:
+                        # Calculate time since user last spoke (only log first chunk of response)
+                        if self._last_user_audio_time and not self._first_response_sent:
+                            elapsed = time.time() - self._last_user_audio_time
+                            logger.info("Time to first audio for call %s: %.3fs (user spoke → first agent audio chunk)", self.call_sid, elapsed)
+                            self._first_response_sent = True  # Mark that we've sent first response
+                        if isinstance(audio_data, str):
+                            audio_bytes = base64.b64decode(audio_data)
+                        else:
+                            audio_bytes = audio_data
+                        await self._send_audio_to_twilio(audio_bytes)
+                    return
+                
+                # Handle transcript messages
+                if hasattr(message, 'transcript') or msg_type == "transcript":
+                    transcript = getattr(message, 'transcript', None) or getattr(message, 'text', None)
+                    if transcript:
+                        logger.info("Deepgram Agent transcript for call %s: %s", self.call_sid, transcript)
+                    return
+                
+                # Handle response/think messages
+                if hasattr(message, 'response') or hasattr(message, 'text') or hasattr(message, 'content') or msg_type in ("response", "think"):
+                    response_text = getattr(message, 'response', None) or getattr(message, 'text', None) or getattr(message, 'content', None)
+                    if response_text:
+                        # Log full response text
+                        logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
+                        parsed_json = _maybe_parse_json(response_text)
+                        if parsed_json:
+                            logger.info("Deepgram Agent returned JSON for call %s", self.call_sid)
+                            await self._handle_lead_json(parsed_json)
+                    return
+            
+            # Parse message if it's a string
+            if isinstance(message, str):
+                try:
+                    message = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse agent message as JSON for call %s: %s", self.call_sid, message[:100])
+                    return
+            
+            # Handle different message types from the agent
             if isinstance(message, dict):
                 msg_type = message.get("type")
-                if msg_type == "Results":
-                    # This is a transcript result
-                    channel = message.get("channel")
-                    if channel:
-                        alternatives = channel.get("alternatives", [])
-                        if alternatives:
-                            transcript_text = alternatives[0].get("transcript", "")
-                            is_final = message.get("is_final", False)
+                
+                # Audio output from agent
+                if msg_type == "audio" or "audio" in message:
+                    audio_data = message.get("audio") or message.get("data")
+                    if audio_data:
+                        # Decode if base64, or use directly
+                        if isinstance(audio_data, str):
+                            audio_bytes = base64.b64decode(audio_data)
+                        else:
+                            audio_bytes = audio_data
+                        await self._send_audio_to_twilio(audio_bytes)
+                
+                # Text/transcript from agent (for logging)
+                if msg_type == "transcript" or "transcript" in message:
+                    transcript = message.get("transcript") or message.get("text")
+                    if transcript:
+                        logger.info("Deepgram Agent transcript for call %s: %s", self.call_sid, transcript)
+                
+                # Response/think output from agent - check for JSON
+                if msg_type == "response" or msg_type == "think" or "response" in message or "text" in message:
+                    response_text = message.get("response") or message.get("text") or message.get("content")
+                    if response_text:
+                        # Log full response text
+                        logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
+                        # Check if it's JSON (lead data)
+                        parsed_json = _maybe_parse_json(response_text)
+                        if parsed_json:
+                            logger.info("Deepgram Agent returned JSON for call %s", self.call_sid)
+                            await self._handle_lead_json(parsed_json)
+                            
             elif hasattr(message, "type"):
-                # Object format
-                if message.type == "Results":
-                    channel = getattr(message, "channel", None)
-                    if channel:
-                        alternatives = getattr(channel, "alternatives", [])
-                        if alternatives and len(alternatives) > 0:
-                            transcript_text = alternatives[0].transcript
-                            is_final = getattr(message, "is_final", False)
-            
-            if transcript_text and is_final:
-                # Process final transcript
-                await self._handle_user_input(transcript_text)
+                # Object format - similar handling
+                if hasattr(message, "audio"):
+                    await self._send_audio_to_twilio(message.audio)
+                if hasattr(message, "transcript"):
+                    logger.info("Deepgram Agent transcript for call %s: %s", self.call_sid, message.transcript)
+                if hasattr(message, "response") or hasattr(message, "text"):
+                    response_text = getattr(message, "response", None) or getattr(message, "text", None)
+                    if response_text:
+                        # Log full response text
+                        logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
+                        parsed_json = _maybe_parse_json(response_text)
+                        if parsed_json:
+                            await self._handle_lead_json(parsed_json)
+                        
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Error processing Deepgram message for call %s: %s", self.call_sid, exc)
+            logger.exception("Error processing Deepgram Agent message for call %s: %s", self.call_sid, exc)
 
-    def _on_deepgram_stt_error(self, error: Any) -> None:
-        """Handle Deepgram STT error."""
-        logger.error("Deepgram STT error for call %s: %s", self.call_sid, error)
-
-    def _on_deepgram_stt_close(self) -> None:
-        """Handle Deepgram STT connection close."""
-        logger.info("Deepgram STT connection closed for call %s", self.call_sid)
-        self.deepgram_stt_ready = False
-        if self.active and not self._stopping:
-            asyncio.create_task(self.stop())
-
-    async def _text_to_speech_deepgram(self, text: str) -> bytes:
-        """Convert text to speech using Deepgram TTS and return μ-law audio bytes for Twilio."""
-        tts_start = time.perf_counter()
+    async def _handle_lead_json(self, lead_data: Dict[str, Any]) -> None:
+        """Handle JSON lead data from Deepgram Agent and create lead."""
         try:
-            # Use Deepgram TTS API - generate() returns an AsyncIterator[bytes]
-            audio_chunks = []
-            api_start = time.perf_counter()
-            async for chunk in self.deepgram_client.speak.v1.audio.generate(
-                text=text,
-                model="aura-2-asteria-en",  # High-quality English voice
-                encoding="mulaw",
-                sample_rate=8000,
-            ):
-                audio_chunks.append(chunk)
-            api_time = time.perf_counter() - api_start
+            # Ensure phone number is set
+            if not lead_data.get("leadPhoneNumber"):
+                lead_data["leadPhoneNumber"] = self.caller_phone
             
-            # Combine all chunks into a single bytes object
-            combine_start = time.perf_counter()
-            audio_data = b''.join(audio_chunks)
-            combine_time = time.perf_counter() - combine_start
+            # Create lead
+            ok, _ = await self.lead_service.create_public_lead(self.user_id, lead_data)
             
-            total_time = time.perf_counter() - tts_start
-            logger.info(
-                "TTS timing for call %s: API=%.3fs, combine=%.3fs, total=%.3fs, text_len=%d, audio_len=%d",
-                self.call_sid, api_time, combine_time, total_time, len(text), len(audio_data)
-            )
+            if ok:
+                logger.info("Successfully created lead from Deepgram Agent for call %s", self.call_sid)
+            else:
+                logger.warning("Failed to create lead from Deepgram Agent for call %s", self.call_sid)
             
-            # Deepgram TTS already outputs in μ-law format at 8kHz, so we can use it directly
-            return audio_data
+            # Stop the session after creating lead
+            await self.stop()
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to convert text to speech using Deepgram TTS for call %s: %s", self.call_sid, exc)
-            raise
+            logger.exception("Error handling lead JSON from Deepgram Agent for call %s: %s", self.call_sid, exc)
+
 
     async def stop(self) -> None:
         """Stop session, close sockets, and trigger cleanup."""
@@ -218,22 +524,22 @@ class VoiceAgentSession:
         self.active = False
 
 
-        # Stop Deepgram STT
-        if self.deepgram_stt_listen_task and not self.deepgram_stt_listen_task.done():
-            self.deepgram_stt_listen_task.cancel()
+        # Stop Deepgram Voice Agent
+        if self.deepgram_agent_listen_task and not self.deepgram_agent_listen_task.done():
+            self.deepgram_agent_listen_task.cancel()
             try:
-                await self.deepgram_stt_listen_task
+                await self.deepgram_agent_listen_task
             except asyncio.CancelledError:
                 pass
         
-        if self.deepgram_stt_connection_cm:
+        if self.deepgram_agent_connection_cm:
             try:
                 # Exit the context manager to close the connection
-                await self.deepgram_stt_connection_cm.__aexit__(None, None, None)
+                await self.deepgram_agent_connection_cm.__aexit__(None, None, None)
             except Exception:  # noqa: BLE001
-                logger.exception("Failed to close Deepgram STT connection for call %s", self.call_sid)
-            self.deepgram_stt_connection_cm = None
-            self.deepgram_stt_connection = None
+                logger.exception("Failed to close Deepgram Voice Agent connection for call %s", self.call_sid)
+            self.deepgram_agent_connection_cm = None
+            self.deepgram_agent_connection = None
 
         if self.on_stop:
             try:
@@ -244,51 +550,6 @@ class VoiceAgentSession:
                 self.on_stop = None
         self._stopping = False
 
-    async def enqueue_agent_message(self, message: str, *, add_to_history: bool = False) -> None:
-        """Convert text message to speech using Deepgram TTS and stream to Twilio."""
-        total_start = time.perf_counter()
-        if not message:
-            logger.warning("Attempted to enqueue empty message for call %s", self.call_sid)
-            return
-        
-        logger.info("Converting text to speech for call %s: %s", self.call_sid, message[:100])
-        
-        if add_to_history:
-            self.conversation_history.append({"role": "assistant", "content": message})
-        
-        try:
-            # Stream TTS audio directly to Twilio as chunks arrive (much faster!)
-            first_chunk_time = None
-            tts_start = time.perf_counter()
-            total_audio_size = 0
-            chunk_count = 0
-            
-            async for chunk in self.deepgram_client.speak.v1.audio.generate(
-                text=message,
-                model="aura-2-asteria-en",  # High-quality English voice
-                    encoding="mulaw",
-                sample_rate=8000,
-            ):
-                if first_chunk_time is None:
-                    first_chunk_time = time.perf_counter() - tts_start
-                    logger.info(
-                        "TTS first chunk timing for call %s: time_to_first_chunk=%.3fs",
-                        self.call_sid, first_chunk_time
-                    )
-                
-                # Send chunk immediately to Twilio
-                await self._send_audio_to_twilio(chunk)
-                total_audio_size += len(chunk)
-                chunk_count += 1
-            
-            tts_time = time.perf_counter() - tts_start
-            total_time = time.perf_counter() - total_start
-            logger.info(
-                "enqueue_agent_message timing for call %s: first_chunk=%.3fs, total_tts=%.3fs, total=%.3fs, chunks=%d, audio_size=%d bytes",
-                self.call_sid, first_chunk_time or 0, tts_time, total_time, chunk_count, total_audio_size
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to convert text to speech and send to Twilio for call %s: %s", self.call_sid, exc)
 
     async def handle_twilio_stream(
         self,
@@ -299,16 +560,14 @@ class VoiceAgentSession:
         self.twilio_websocket = websocket
         logger.info("Twilio websocket accepted for call %s", self.call_sid)
 
-        # Start Deepgram STT now that we have Twilio stream (will receive audio soon)
-        if not self.deepgram_stt_ready:
+        # Start Deepgram Voice Agent now that we have Twilio stream
+        if not self.deepgram_agent_ready:
             try:
-                await self._start_deepgram_stt()
+                await self._start_deepgram_agent()
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed to start Deepgram STT when Twilio stream connected for call %s: %s", self.call_sid, exc)
+                logger.exception("Failed to start Deepgram Voice Agent when Twilio stream connected for call %s: %s", self.call_sid, exc)
 
         await self._flush_pending_twilio_audio()
-        
-        # Don't send greeting here - wait for "start" event to set streamSid
 
         try:
             if initial_messages:
@@ -349,14 +608,12 @@ class VoiceAgentSession:
             )
             await self._flush_pending_twilio_audio()
             
-            # Now that streamSid is set, send the pending greeting
-            if hasattr(self, 'pending_greeting') and self.pending_greeting:
-                logger.info("Sending pending greeting now that streamSid is set for call %s", self.call_sid)
-                greeting = self.pending_greeting
-                self.pending_greeting = None
-                # Wait a moment for everything to be fully ready
-                await asyncio.sleep(0.2)
-                await self.enqueue_agent_message(greeting, add_to_history=True)
+            # Send cached trigger audio to initiate greeting
+            if self.deepgram_agent_ready and self.deepgram_agent_connection and self.cached_trigger_audio:
+                try:
+                    await self.deepgram_agent_connection.send_media(self.cached_trigger_audio)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to send trigger audio for greeting for call %s: %s", self.call_sid, exc)
         elif event_type == "media":
             media = payload.get("media", {})
             audio_payload = media.get("payload")
@@ -366,9 +623,14 @@ class VoiceAgentSession:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Failed to decode Twilio media for call %s: %s", self.call_sid, exc)
                     return
-                # Forward to Deepgram STT
-                if self.deepgram_stt_ready and self.deepgram_stt_connection:
-                    await self._forward_audio_to_deepgram_stt(audio_bytes)
+                # Forward to Deepgram Voice Agent
+                if self.deepgram_agent_ready and self.deepgram_agent_connection:
+                    # Track when user audio is received (only if we're waiting for a response)
+                    if self._first_response_sent or self._last_user_audio_time is None:
+                        # User started speaking (either first time or after previous response)
+                        self._last_user_audio_time = time.time()
+                        self._first_response_sent = False  # Reset flag, waiting for new response
+                    await self._forward_audio_to_deepgram_agent(audio_bytes)
                 else:
                     if not hasattr(self, "pending_twilio_audio"):
                         self.pending_twilio_audio = []
@@ -377,27 +639,26 @@ class VoiceAgentSession:
             logger.info("Twilio stream stopped for call %s", self.call_sid)
             await self.stop()
 
-    async def _forward_audio_to_deepgram_stt(self, audio_chunk: bytes) -> None:
-        """Forward raw μ-law audio from Twilio to Deepgram STT."""
-        if not self.deepgram_stt_connection:
-            logger.debug("Deepgram STT connection closed; dropping audio for call %s", self.call_sid)
+    async def _forward_audio_to_deepgram_agent(self, audio_chunk: bytes) -> None:
+        """Forward raw μ-law audio from Twilio to Deepgram Voice Agent."""
+        if not self.deepgram_agent_connection:
+            logger.debug("Deepgram Voice Agent connection closed; dropping audio for call %s", self.call_sid)
             return
+        
+        # Check if connection is closed before sending audio
+        if hasattr(self.deepgram_agent_connection, '_websocket'):
+            websocket = self.deepgram_agent_connection._websocket
+            if websocket and (websocket.closed or websocket.close_code is not None):
+                return
+        
         try:
-            # Deepgram SDK 5.3 - send audio data through the connection
-            # The error message suggests using _send() method
-            if hasattr(self.deepgram_stt_connection, '_send'):
-                await self.deepgram_stt_connection._send(audio_chunk)
-            elif hasattr(self.deepgram_stt_connection, 'send_audio'):
-                await self.deepgram_stt_connection.send_audio(audio_chunk)
-            elif hasattr(self.deepgram_stt_connection, 'write'):
-                await self.deepgram_stt_connection.write(audio_chunk)
-            elif hasattr(self.deepgram_stt_connection, '_websocket'):
-                # Access underlying websocket if available
-                await self.deepgram_stt_connection._websocket.send(audio_chunk)
-            else:
-                logger.error("Deepgram STT connection has no method to send audio for call %s", self.call_sid)
+            if hasattr(self.deepgram_agent_connection, 'send_media'):
+                await self.deepgram_agent_connection.send_media(audio_chunk)
+        except (ConnectionError, OSError):
+            pass
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to forward audio to Deepgram STT for call %s: %s", self.call_sid, exc)
+            if "closed" not in str(exc).lower() and "1005" not in str(exc):
+                logger.exception("Failed to forward audio to Deepgram Voice Agent for call %s: %s", self.call_sid, exc)
 
     async def _send_audio_to_twilio(self, audio_bytes: bytes) -> None:
         """Send audio back to Twilio stream."""
@@ -423,91 +684,37 @@ class VoiceAgentSession:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to relay audio to Twilio for call %s: %s", self.call_sid, exc)
 
+    async def _generate_and_cache_trigger_audio(self) -> None:
+        """Generate and cache trigger audio in parallel."""
+        try:
+            audio_chunks = []
+            async for chunk in self.deepgram_client.speak.v1.audio.generate(
+                text="initiate greeting",
+                model="aura-asteria-en",
+                encoding="mulaw",
+                sample_rate=8000,
+            ):
+                if chunk:
+                    audio_chunks.append(chunk)
+            
+            if audio_chunks:
+                self.cached_trigger_audio = b''.join(audio_chunks)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to generate trigger audio for call %s: %s", self.call_sid, exc)
+
     async def _flush_pending_twilio_audio(self) -> None:
-        """Flush pending Twilio audio to Deepgram STT."""
-        if not self.deepgram_stt_ready or not hasattr(self, "pending_twilio_audio"):
+        """Flush pending Twilio audio to Deepgram Voice Agent."""
+        if not self.deepgram_agent_ready or not hasattr(self, "pending_twilio_audio"):
             return
         if not self.pending_twilio_audio:
             return
         for chunk in list(self.pending_twilio_audio):
-            await self._forward_audio_to_deepgram_stt(chunk)
+            await self._forward_audio_to_deepgram_agent(chunk)
         self.pending_twilio_audio.clear()
-
-    async def _handle_user_input(self, user_text: str) -> None:
-        """Handle user transcript by generating our application response."""
-        input_start = time.perf_counter()
-        cleaned_text = user_text.strip()
-        if not cleaned_text:
-            return
-
-        if cleaned_text == self._last_user_text:
-            logger.debug("Skipping duplicate transcript for call %s: %s", self.call_sid, cleaned_text)
-            return
-        self._last_user_text = cleaned_text
-
-        logger.info("VoiceAgent (%s) user: %s", self.call_sid, cleaned_text)
-        self.conversation_history.append({"role": "user", "content": cleaned_text})
-
-        response_time = 0.0
-        try:
-            response_start = time.perf_counter()
-            reply = await self.response_generator.generate_response(
-                self.flow_controller,
-                cleaned_text,
-                self.conversation_history,
-                self.context,
-            )
-            response_time = time.perf_counter() - response_start
-            logger.info(
-                "Response generation timing for call %s: generate_response=%.3fs",
-                self.call_sid, response_time
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("VoiceAgent (%s) failed to generate response: %s", self.call_sid, exc)
-            fallback = (
-                "I'm sorry, I didn't catch that. Could you please repeat what you need?"
-            )
-            await self.enqueue_agent_message(fallback, add_to_history=True)
-            return
-
-        parsed_json = _maybe_parse_json(reply)
-        if parsed_json:
-            if not parsed_json.get("leadPhoneNumber"):
-                parsed_json["leadPhoneNumber"] = self.flow_controller.collected_data.get("leadPhoneNumber")
-            parsed_json.setdefault("history", self.conversation_history)
-
-            try:
-                ok, _ = await self.lead_service.create_public_lead(self.user_id, parsed_json)
-                final_msg = (
-                    "Thanks! I have your details and someone will follow up with you very soon."
-                    if ok
-                    else "Thanks! I captured your details. The team will follow up with you shortly."
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Failed to create lead for voice call %s: %s", self.call_sid, exc)
-                final_msg = "Thanks! I captured your details. The team will follow up with you shortly."
-
-            self.conversation_history.append({"role": "assistant", "content": final_msg})
-            await self.enqueue_agent_message(final_msg)
-            await self.stop()
-            return
-
-        logger.info("VoiceAgent (%s) reply: %s", self.call_sid, reply)
-        self.conversation_history.append({"role": "assistant", "content": reply})
-        
-        enqueue_start = time.perf_counter()
-        await self.enqueue_agent_message(reply)
-        enqueue_time = time.perf_counter() - enqueue_start
-        
-        total_time = time.perf_counter() - input_start
-        logger.info(
-            "Total _handle_user_input timing for call %s: response_gen=%.3fs, enqueue=%.3fs, total=%.3fs",
-            self.call_sid, response_time, enqueue_time, total_time
-        )
 
 
 class VoiceAgentService:
-    """Service for managing voice agent sessions using Deepgram STT + TTS."""
+    """Service for managing voice agent sessions using Deepgram Voice Agent API."""
 
     def __init__(self, settings: Any = app_settings):
         self.settings = settings
@@ -562,47 +769,26 @@ class VoiceAgentService:
         integration["validatePhoneNumber"] = False
         integration["channel"] = "voice"
 
-        rag_service = RAGService(self.settings)
-        rag_service.build_vector_store(context)
-
-        flow_controller = FlowController(context)
-        flow_controller.set_voice_agent()
-
         if not self.openai_client:
             raise ValueError("OpenAI client not configured for phone formatting")
         formatted_phone = await format_phone_number_with_gpt(caller_phone, self.openai_client, self.gpt_model)
-        flow_controller.update_collected_data("leadPhoneNumber", formatted_phone)
-        flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
-
-        response_generator = ResponseGenerator(self.settings, rag_service)
-        response_generator.set_profession(str(context.get("profession") or "Clinic"))
-        response_generator.set_channel("voice")
-
-        dynamic_greeting = await response_generator.generate_greeting(context, channel="voice")
 
         session = VoiceAgentSession(
             call_sid=call_sid,
             caller_phone=formatted_phone,
             user_id=user_id,
             context=context,
-            flow_controller=flow_controller,
-            response_generator=response_generator,
             lead_service=self.lead_service,
-            rag_service=rag_service,
             deepgram_client=self.deepgram_client,
-            gpt_model=self.gpt_model,
         )
 
         self.sessions[call_sid] = session
         session.on_stop = lambda sid: self.sessions.pop(sid, None)
 
-        await session.start()
+        # Generate trigger audio in parallel while starting session
+        asyncio.create_task(session._generate_and_cache_trigger_audio())
 
-        # Don't send greeting yet - wait for Twilio stream to be ready
-        # The greeting will be sent when the Twilio stream connects
-        if dynamic_greeting:
-            # Store greeting to send when Twilio stream is ready
-            session.pending_greeting = dynamic_greeting
+        await session.start()
 
         return session
 
