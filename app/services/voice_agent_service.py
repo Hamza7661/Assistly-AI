@@ -31,17 +31,45 @@ logger = logging.getLogger("assistly.voice_agent")
 
 
 def _maybe_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    """Parse JSON if the text looks like JSON."""
+    """Parse JSON if the text looks like JSON. Extracts JSON from anywhere in the text."""
     if not text:
         return None
     stripped = text.strip()
-    if not (stripped.startswith("{") and stripped.endswith("}")):
+    
+    # First try: if entire text is JSON
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            return json.loads(stripped)
+        except Exception:  # noqa: BLE001
+            pass
+    
+    # Second try: extract JSON object from anywhere in the text
+    # Find the first { and try to match it with the last }
+    start_idx = stripped.find("{")
+    if start_idx == -1:
         return None
-    try:
-        return json.loads(stripped)
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to parse JSON from voice agent response")
-        return None
+    
+    # Find matching closing brace
+    brace_count = 0
+    end_idx = -1
+    for i in range(start_idx, len(stripped)):
+        if stripped[i] == "{":
+            brace_count += 1
+        elif stripped[i] == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                end_idx = i
+                break
+    
+    if end_idx != -1:
+        json_str = stripped[start_idx:end_idx + 1]
+        try:
+            return json.loads(json_str)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to parse extracted JSON from voice agent response")
+            return None
+    
+    return None
 
 
 @dataclass
@@ -71,6 +99,7 @@ class VoiceAgentSession:
     cached_trigger_audio: Optional[bytes] = None
     _last_user_audio_time: Optional[float] = None  # Track when user last spoke
     _first_response_sent: bool = False  # Track if we've sent first response chunk
+    _json_buffer: str = ""  # Buffer for incomplete JSON messages
 
     def __post_init__(self) -> None:
         self.deepgram_agent_ready_event = asyncio.Event()
@@ -111,13 +140,23 @@ class VoiceAgentSession:
                 if answer:
                     plan_info += f" (Answer: {answer})"
                 
-                # Check for workflows
+                # Check for workflows - match workflowId with full workflows array
                 if attached_workflows:
                     workflow_questions = []
-                    for wf in attached_workflows:
-                        workflow = wf.get("workflow", {})
-                        if workflow:
-                            wf_questions = workflow.get("questions", [])
+                    for attached_wf in attached_workflows:
+                        workflow_id = attached_wf.get("workflowId") or attached_wf.get("workflow", {}).get("_id")
+                        # Find the full workflow from workflows array
+                        full_workflow = None
+                        for wf in workflows:
+                            if isinstance(wf, dict) and wf.get("_id") == workflow_id:
+                                full_workflow = wf
+                                break
+                        
+                        # Get questions from full workflow
+                        if full_workflow:
+                            wf_questions = full_workflow.get("questions", [])
+                            # Sort by order if available
+                            wf_questions = sorted(wf_questions, key=lambda x: x.get("order", 0))
                             for q in wf_questions:
                                 q_text = q.get("question", "")
                                 if q_text:
@@ -141,45 +180,54 @@ class VoiceAgentSession:
         
         faqs_formatted = "\n".join(faqs_text) if faqs_text else "No FAQs available"
 
-        prompt = f"""You are {assistant_name}, an AI assistant for a {profession}.
+        prompt = f"""You are {assistant_name}, a warm and empathetic British English speaking AI assistant for a {profession}. Be conversational and make callers feel heard.
 
-KNOWLEDGE BASE (use this to answer questions):
+KNOWLEDGE BASE (answer questions from this):
 {faqs_formatted}
 
-AVAILABLE LEAD TYPES:
+LEAD TYPES:
 {lead_types_text}
 
-AVAILABLE TREATMENT PLANS/SERVICES:
+SERVICES:
 {treatment_plans_formatted}
 
-INSTRUCTIONS:
-1. TRIGGER PHRASE: If you hear the phrase "initiate greeting", you MUST immediately greet the caller and start the conversation flow. Say hello and introduce yourself as {assistant_name}, then ask how you can help them.
-2. Answer questions from the knowledge base above when the caller asks.
-3. Collect the following information from the caller:
-   - Service/treatment plan (from the list above)
-   - Full name
-   - Email address
-   (Phone number is already known: {self.caller_phone})
+YOUR TASKS:
+1. When you hear "initiate greeting", say warmly: "Hi, I'm {assistant_name}, your virtual AI assistant. How can I help you today?"
+2. Answer questions using the knowledge base above - be helpful and friendly.
+3. Collect: service type, full name, email. (Phone: {self.caller_phone} is already known)
 
-4. WORKFLOW QUESTIONS: If the caller selects a service/treatment plan that has workflow questions attached, you MUST ask those workflow questions in order before collecting name and email.
+WORKFLOW QUESTIONS (CRITICAL):
+- If a service has "Workflow questions to ask" listed and user select's that service, you MUST ask those EXACT questions in order BEFORE asking for name/email.
+- Ask them word-for-word, do NOT rephrase or make up questions.
+- Be empathetic when asking - acknowledge their responses naturally.
 
-5. When you have collected ALL required information (service type, name, email, and any workflow answers), output ONLY a JSON object in this exact format:
+JSON OUTPUT (CRITICAL - ABSOLUTE RULE):
+- When you have service type, name, and email, you MUST output ONLY the JSON below in your internal response text.
+- DO NOT speak the JSON out loud - output it silently in your response text only. The JSON should NOT be converted to speech.
+- DO NOT say "Thank you", "Perfect", "Great", "Let me save that", "I'll output the JSON", "Here's your information", or ANY words before the JSON.
+- DO NOT say anything after the JSON.
+- DO NOT summarize or confirm verbally.
+- Just output the JSON object immediately in text only - no preamble, no summary, no confirmation, no announcements, no speaking it aloud.
+
+Output this JSON format:
 {{
-  "leadType": "the lead type value based on the conversation (e.g., 'callback', 'appointment arrangement', 'further information')",
-  "serviceType": "the selected service/treatment plan name",
+  "title": "text from lead type matching leadType value",
   "leadName": "full name",
   "leadEmail": "email address",
   "leadPhoneNumber": "{self.caller_phone}",
-  "workflowAnswers": {{"question1": "answer1", "question2": "answer2"}} (if workflow questions were asked)
+  "leadType": "lead type value",
+  "serviceType": "selected service name",
+  "summary": "brief conversation summary",
+  "description": "what customer wants"
 }}
 
-IMPORTANT:
-- Use the knowledge base to answer questions accurately
-- If a service has workflow questions, ask them in order
-- Do NOT output JSON until you have service type, name, and email
-- Speak clearly and naturally in English only
-- Be friendly and professional
-- ASK ONE QUESTION AT A TIME: Do not list all options or ask multiple questions in a single response. Ask one question, wait for the answer, then ask the next question."""
+RULES:
+- British English accent
+- Be warm, empathetic, and conversational - not robotic
+- Show understanding and acknowledge responses naturally
+- Ask one question at a time
+- If service has workflow questions, ask them first (exact wording, in order)
+- When ready: output JSON ONLY - no words before, no words after, no exceptions"""
         return prompt
 
     async def _start_deepgram_agent(self) -> None:
@@ -225,7 +273,7 @@ IMPORTANT:
                     "speak": {
                         "provider": {
                             "type": "deepgram",
-                            "model": "aura-asteria-en"
+                            "model": "aura-athena-en"
                         }
                     },
                     "think": {
@@ -366,6 +414,22 @@ IMPORTANT:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Error in Deepgram Voice Agent listener for call %s: %s", self.call_sid, exc)
 
+    def _extract_response_text(self, message: Any) -> Optional[str]:
+        """Extract response text from message in any format."""
+        # Try object format first
+        if hasattr(message, 'response'):
+            return getattr(message, 'response', None)
+        if hasattr(message, 'text'):
+            return getattr(message, 'text', None)
+        if hasattr(message, 'content'):
+            return getattr(message, 'content', None)
+        
+        # Try dict format
+        if isinstance(message, dict):
+            return message.get("response") or message.get("text") or message.get("content")
+        
+        return None
+
     async def _on_deepgram_agent_message(self, message: Any) -> None:
         """Handle messages from Deepgram Voice Agent API."""
         try:
@@ -420,18 +484,6 @@ IMPORTANT:
                     if transcript:
                         logger.info("Deepgram Agent transcript for call %s: %s", self.call_sid, transcript)
                     return
-                
-                # Handle response/think messages
-                if hasattr(message, 'response') or hasattr(message, 'text') or hasattr(message, 'content') or msg_type in ("response", "think"):
-                    response_text = getattr(message, 'response', None) or getattr(message, 'text', None) or getattr(message, 'content', None)
-                    if response_text:
-                        # Log full response text
-                        logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
-                        parsed_json = _maybe_parse_json(response_text)
-                        if parsed_json:
-                            logger.info("Deepgram Agent returned JSON for call %s", self.call_sid)
-                            await self._handle_lead_json(parsed_json)
-                    return
             
             # Parse message if it's a string
             if isinstance(message, str):
@@ -441,7 +493,7 @@ IMPORTANT:
                     logger.warning("Failed to parse agent message as JSON for call %s: %s", self.call_sid, message[:100])
                     return
             
-            # Handle different message types from the agent
+            # Handle dict format messages
             if isinstance(message, dict):
                 msg_type = message.get("type")
                 
@@ -455,39 +507,91 @@ IMPORTANT:
                         else:
                             audio_bytes = audio_data
                         await self._send_audio_to_twilio(audio_bytes)
+                    return
                 
                 # Text/transcript from agent (for logging)
                 if msg_type == "transcript" or "transcript" in message:
                     transcript = message.get("transcript") or message.get("text")
                     if transcript:
                         logger.info("Deepgram Agent transcript for call %s: %s", self.call_sid, transcript)
+                    return
+            
+            # Extract response text once (works for both object and dict formats)
+            response_text = self._extract_response_text(message)
+            if response_text:
+                # Log full response text
+                logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
                 
-                # Response/think output from agent - check for JSON
-                if msg_type == "response" or msg_type == "think" or "response" in message or "text" in message:
-                    response_text = message.get("response") or message.get("text") or message.get("content")
-                    if response_text:
-                        # Log full response text
-                        logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
-                        # Check if it's JSON (lead data)
-                        parsed_json = _maybe_parse_json(response_text)
-                        if parsed_json:
-                            logger.info("Deepgram Agent returned JSON for call %s", self.call_sid)
-                            await self._handle_lead_json(parsed_json)
-                            
-            elif hasattr(message, "type"):
-                # Object format - similar handling
-                if hasattr(message, "audio"):
-                    await self._send_audio_to_twilio(message.audio)
-                if hasattr(message, "transcript"):
-                    logger.info("Deepgram Agent transcript for call %s: %s", self.call_sid, message.transcript)
-                if hasattr(message, "response") or hasattr(message, "text"):
-                    response_text = getattr(message, "response", None) or getattr(message, "text", None)
-                    if response_text:
-                        # Log full response text
-                        logger.info("Deepgram Agent full response text for call %s: %s", self.call_sid, response_text)
-                        parsed_json = _maybe_parse_json(response_text)
-                        if parsed_json:
-                            await self._handle_lead_json(parsed_json)
+                # Check if response starts with { - if so, treat everything as JSON
+                stripped = response_text.strip()
+                starts_with_json = stripped.startswith("{")
+                
+                # If we're already buffering JSON, or this message starts with {, buffer it
+                if self._json_buffer or starts_with_json:
+                    # Add to JSON buffer
+                    if self._json_buffer:
+                        # If buffer doesn't end with } and new message doesn't start with {, add space
+                        if not self._json_buffer.rstrip().endswith("}") and not stripped.startswith("{"):
+                            self._json_buffer += " " + response_text
+                        else:
+                            self._json_buffer += response_text
+                    else:
+                        # Starting new JSON buffer
+                        self._json_buffer = response_text
+                    
+                    logger.info("Buffering JSON for call %s (buffer length: %d)", self.call_sid, len(self._json_buffer))
+                    
+                    # Try to parse the buffered JSON
+                    parsed_json = _maybe_parse_json(self._json_buffer)
+                    if parsed_json:
+                        logger.info("Deepgram Agent returned complete JSON for call %s: %s", self.call_sid, parsed_json)
+                        self._json_buffer = ""  # Clear buffer
+                        await self._handle_lead_json(parsed_json)
+                    else:
+                        # Check if JSON might be incomplete (doesn't end with } or has unmatched braces)
+                        brace_count = self._json_buffer.count("{") - self._json_buffer.count("}")
+                        if brace_count > 0:
+                            logger.debug("JSON buffer incomplete for call %s (unmatched braces: %d), waiting for more", self.call_sid, brace_count)
+                        elif len(self._json_buffer) > 20000:  # Prevent buffer from growing too large
+                            logger.warning("JSON buffer too large for call %s, clearing", self.call_sid)
+                            self._json_buffer = ""
+                        else:
+                            # Try to extract and fix incomplete JSON (e.g., incomplete history array)
+                            logger.warning("JSON buffer not parseable for call %s, attempting to fix: %s", self.call_sid, self._json_buffer[:500])
+                            # Try to close any open structures
+                            fixed_json = self._json_buffer.rstrip()
+                            # Count open vs closed braces
+                            open_braces = fixed_json.count("{")
+                            close_braces = fixed_json.count("}")
+                            # Count open vs closed brackets
+                            open_brackets = fixed_json.count("[")
+                            close_brackets = fixed_json.count("]")
+                            # Close any open structures
+                            while open_braces > close_braces:
+                                fixed_json += "}"
+                                close_braces += 1
+                            while open_brackets > close_brackets:
+                                fixed_json += "]"
+                                close_brackets += 1
+                            # Try parsing the fixed JSON
+                            try:
+                                parsed_json = json.loads(fixed_json)
+                                logger.info("Successfully parsed fixed JSON for call %s", self.call_sid)
+                                self._json_buffer = ""  # Clear buffer
+                                await self._handle_lead_json(parsed_json)
+                            except Exception:  # noqa: BLE001
+                                logger.debug("Could not fix JSON for call %s, waiting for more data", self.call_sid)
+                elif "{" in response_text and "leadType" in response_text:
+                    # JSON might be starting mid-message - extract from { onwards
+                    json_start = response_text.find("{")
+                    if json_start != -1:
+                        self._json_buffer = response_text[json_start:]
+                        logger.info("Starting JSON buffer from mid-message for call %s", self.call_sid)
+                else:
+                    # Not JSON, clear buffer if it exists
+                    if self._json_buffer:
+                        logger.warning("Clearing JSON buffer for call %s (non-JSON message received)", self.call_sid)
+                        self._json_buffer = ""
                         
         except Exception as exc:  # noqa: BLE001
             logger.exception("Error processing Deepgram Agent message for call %s: %s", self.call_sid, exc)
@@ -499,15 +603,53 @@ IMPORTANT:
             if not lead_data.get("leadPhoneNumber"):
                 lead_data["leadPhoneNumber"] = self.caller_phone
             
+            # Extract title from lead types if missing (to match web/WhatsApp format)
+            if not lead_data.get("title") and lead_data.get("leadType"):
+                lead_types = self.context.get("lead_types", [])
+                for lt in lead_types:
+                    if isinstance(lt, dict) and lt.get("value") == lead_data.get("leadType"):
+                        lead_data["title"] = lt.get("text", lead_data.get("leadType", ""))
+                        break
+                # Fallback: use leadType as title if not found
+                if not lead_data.get("title"):
+                    lead_data["title"] = lead_data.get("leadType", "")
+            
             # Create lead
             ok, _ = await self.lead_service.create_public_lead(self.user_id, lead_data)
             
             if ok:
                 logger.info("Successfully created lead from Deepgram Agent for call %s", self.call_sid)
+                closing_message = "Thanks! I have your details and someone will get back to you soon. Bye!"
             else:
                 logger.warning("Failed to create lead from Deepgram Agent for call %s", self.call_sid)
+                closing_message = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
             
-            # Stop the session after creating lead
+            # Generate and send closing message audio
+            audio_chunks = []
+            try:
+                # Check if we can still send audio
+                if not self.twilio_websocket or not self.active:
+                    logger.warning("Cannot send closing message - Twilio connection not active for call %s", self.call_sid)
+                else:
+                    async for chunk in self.deepgram_client.speak.v1.audio.generate(
+                        text=closing_message,
+                        model="aura-athena-en",
+                        encoding="mulaw",
+                        sample_rate=8000,
+                    ):
+                        if chunk and self.active and self.twilio_websocket:
+                            audio_chunks.append(chunk)
+                            await self._send_audio_to_twilio(chunk)
+                
+                # Wait for the message to play before ending the call
+                if audio_chunks:
+                    wait_time = 10.0  # Hardcoded 10 seconds to ensure message plays completely
+                    logger.info("Waiting %.2fs for closing message to play for call %s", wait_time, self.call_sid)
+                    await asyncio.sleep(wait_time)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to send closing message for call %s: %s", self.call_sid, exc)
+            
+            # Stop the session after creating lead and sending closing message
             await self.stop()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Error handling lead JSON from Deepgram Agent for call %s: %s", self.call_sid, exc)
@@ -523,6 +665,27 @@ IMPORTANT:
             return
         self.active = False
 
+        # Close Twilio websocket and hang up the call
+        if self.twilio_websocket:
+            try:
+                await self.twilio_websocket.close()
+                logger.info("Closed Twilio websocket for call %s", self.call_sid)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to close Twilio websocket for call %s", self.call_sid)
+            self.twilio_websocket = None
+        
+        # Hang up the Twilio call using REST API if credentials are available
+        try:
+            from twilio.rest import Client
+            from app.config import app_settings
+            if app_settings.twilio_account_sid and app_settings.twilio_auth_token:
+                twilio_client = Client(app_settings.twilio_account_sid, app_settings.twilio_auth_token)
+                call = twilio_client.calls(self.call_sid).update(status="completed")
+                logger.info("Hanged up Twilio call %s via REST API", self.call_sid)
+        except ImportError:
+            logger.debug("Twilio client not available for hanging up call %s", self.call_sid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to hang up Twilio call %s via REST API: %s", self.call_sid, exc)
 
         # Stop Deepgram Voice Agent
         if self.deepgram_agent_listen_task and not self.deepgram_agent_listen_task.done():
@@ -579,8 +742,14 @@ IMPORTANT:
                         continue
                     await self._process_twilio_event(payload)
 
-            while True:
-                message = await websocket.receive_text()
+            while self.active:
+                try:
+                    message = await websocket.receive_text()
+                except Exception:  # noqa: BLE001
+                    # WebSocket closed or error - break the loop
+                    if not self.active:
+                        logger.info("Twilio stream loop ending - session stopped for call %s", self.call_sid)
+                    break
                 try:
                     payload = json.loads(message)
                 except json.JSONDecodeError:
@@ -665,6 +834,11 @@ IMPORTANT:
         if not audio_bytes:
             return
 
+        # If we're buffering JSON, don't send audio (prevent JSON from being spoken)
+        if self._json_buffer:
+            logger.debug("Skipping audio send for call %s - JSON is being buffered", self.call_sid)
+            return
+
         if not self.twilio_websocket or not self.twilio_stream_sid:
             logger.warning("Twilio websocket or streamSid not ready for call %s", self.call_sid)
             return
@@ -690,7 +864,7 @@ IMPORTANT:
             audio_chunks = []
             async for chunk in self.deepgram_client.speak.v1.audio.generate(
                 text="initiate greeting",
-                model="aura-asteria-en",
+                model="aura-athena-en",
                 encoding="mulaw",
                 sample_rate=8000,
             ):
