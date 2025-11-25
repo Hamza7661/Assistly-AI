@@ -406,7 +406,7 @@ Classify the intent:"""
                 
                 # Check if user asked a question along with lead type selection
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_data_collected_with_question_response(
                         "lead type", lead_type.get("text"), rag_context, 
                         "service selection", conversation_history, context
@@ -417,7 +417,7 @@ Classify the intent:"""
             else:
                 logger.warning(f"No lead type matched for user input: '{user_message}'. Available lead types: {[lt.get('text') for lt in context.get('lead_types', [])]}")
                 # No match found - use AI to handle questions, but with strict prompt to only show lead types
-                rag_context = await self._get_rag_context(user_message if has_question else "lead type selection", context)
+                rag_context = await self._get_rag_context(user_message if has_question else "lead type selection", context, is_question=has_question)
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
         
         if state == ConversationState.SERVICE_SELECTION:
@@ -454,7 +454,7 @@ Classify the intent:"""
                 # Check if it's a question - if so, handle it but stay in service selection
                 if has_question:
                     logger.info(f"User asked a question about services: '{user_message}'")
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_state_response(state, rag_context, conversation_history, context)
                 
                 # Accept user input as service type even if not in treatment plans
@@ -483,7 +483,7 @@ Classify the intent:"""
                             if has_question:
                                 # Get a brief answer to the question using RAG
                                 try:
-                                    rag_context = await self._get_rag_context(f"{service} {user_message}", context)
+                                    rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                                     if rag_context and self.client:
                                         # Generate a brief answer (1-2 sentences)
                                         response = await self.client.chat.completions.create(
@@ -525,21 +525,20 @@ Classify the intent:"""
                 # Check if user asked a question along with service selection (only if no workflow)
                 if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                     # Get RAG context for the question (pricing, info about the service)
-                    rag_context = await self._get_rag_context(f"{service} {user_message}", context)
+                    rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                     # Generate response that answers question AND asks for name
                     return await self._generate_data_collected_with_question_response(
                         "service", service, rag_context,
                         "name", conversation_history, context
                     )
                 elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
-                    # Just acknowledge and move to name collection
-                    rag_context = await self._get_rag_context("name collection", context)
-                    return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+                    # Just acknowledge and move to name collection - no RAG needed
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 # This shouldn't happen now, but keep as fallback
                 logger.warning(f"Could not determine service from user input: '{user_message}'. Available treatment plans: {all_treatment_plans}")
                 # No match - use AI to handle questions, but ensure it stays in service selection
-                rag_context = await self._get_rag_context(user_message if has_question else "service selection", context)
+                rag_context = await self._get_rag_context(user_message if has_question else "service selection", context, is_question=has_question)
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
         
         if state == ConversationState.WORKFLOW_QUESTION:
@@ -552,9 +551,31 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                rag_context = await self._get_rag_context("name collection", context)
-                return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+                # No RAG needed for standard name collection prompt
+                return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             
+            # Check if user is asking a question instead of answering the workflow question
+            if has_question:
+                # User asked a question - answer it first, then re-ask the workflow question
+                logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
+                rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                current_question_text = current_question.get("question", "")
+                
+                # Generate answer to the question
+                if rag_context and self.client:
+                    try:
+                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        # Return answer + re-ask workflow question
+                        return f"{answer} Now, {current_question_text}"
+                    except Exception as e:
+                        logger.warning(f"Failed to generate answer for question: {e}")
+                        # Fallback: just re-ask workflow question
+                        return current_question_text
+                else:
+                    # No RAG context available, just re-ask workflow question
+                    return current_question_text
+            
+            # Not a question - treat as workflow answer
             # Record answer and move to next question
             has_more = workflow_manager.record_answer(user_message)
             
@@ -570,8 +591,8 @@ Classify the intent:"""
                     workflow_manager.reset()
                     flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                    rag_context = await self._get_rag_context("name collection", context)
-                    return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+                    # No RAG needed for standard name collection prompt
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 # Last question answered, complete workflow
                 workflow_answers = workflow_manager.get_workflow_answers()
@@ -579,8 +600,8 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                rag_context = await self._get_rag_context("name collection", context)
-                return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+                # No RAG needed for standard name collection prompt
+                return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
         
         if state == ConversationState.NAME_COLLECTION:
             if name and validator.is_valid_name(name):
@@ -590,23 +611,22 @@ Classify the intent:"""
                 
                 # Check if user asked a question along with name
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_data_collected_with_question_response(
                         "name", name, rag_context,
                         "email", conversation_history, context
                     )
                 else:
-                    rag_context = await self._get_rag_context("email collection", context)
-                    return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+                    # No question - just move to email collection
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 # Name not extracted - check if user asked a question
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_state_response(state, rag_context, conversation_history, context)
                 else:
-                    # Just ask for name again
-                    rag_context = await self._get_rag_context("name collection", context)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    # Just ask for name again - no RAG needed
+                    return await self._generate_state_response(state, "", conversation_history, context)
         
         if state == ConversationState.EMAIL_COLLECTION:
             if email and validator.is_valid_email(email):
@@ -614,7 +634,7 @@ Classify the intent:"""
                 
                 # Check if user asked a question along with email
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     # Answer question and acknowledge email, then proceed
                     if flow_controller.validate_email:
                         # Answer question, acknowledge email, then trigger OTP sending
@@ -645,16 +665,16 @@ Classify the intent:"""
                         if flow_controller.can_generate_json():
                             return await self._generate_json(flow_controller, conversation_history)
                         else:
-                            rag_context = await self._get_rag_context("phone collection", context)
-                            return await self._generate_state_response(flow_controller.state, rag_context, conversation_history, context)
+                            # No RAG needed for standard phone collection prompt
+                            return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 # Email not extracted - check if user asked a question
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_state_response(state, rag_context, conversation_history, context)
                 else:
-                    rag_context = await self._get_rag_context("email collection", context)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    # No RAG needed for standard email collection prompt
+                    return await self._generate_state_response(state, "", conversation_history, context)
         
         if state == ConversationState.PHONE_COLLECTION:
             if phone and validator.is_valid_phone(phone):
@@ -662,7 +682,7 @@ Classify the intent:"""
                 
                 # Check if user asked a question along with phone
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     if flow_controller.validate_phone:
                         # Answer question, acknowledge phone, then trigger OTP sending
                         answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
@@ -686,32 +706,41 @@ Classify the intent:"""
             else:
                 # Phone not extracted - check if user asked a question
                 if has_question:
-                    rag_context = await self._get_rag_context(user_message, context)
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_state_response(state, rag_context, conversation_history, context)
                 else:
-                    rag_context = await self._get_rag_context("phone collection", context)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    # No RAG needed for standard phone collection prompt
+                    return await self._generate_state_response(state, "", conversation_history, context)
         
         # Check if all data is collected and we can generate JSON
         if flow_controller.can_generate_json():
             return await self._generate_json(flow_controller, conversation_history)
         
-        # Generate natural response based on state
-        rag_context = await self._get_rag_context(flow_controller.get_state_prompt_context(), context)
-        return await self._generate_state_response(state, rag_context, conversation_history, context)
+        # Generate natural response based on state - no RAG needed for standard prompts
+        return await self._generate_state_response(state, "", conversation_history, context)
     
-    async def _get_rag_context(self, query: str, context: Dict[str, Any]) -> str:
-        """Get relevant context from RAG"""
+    async def _get_rag_context(self, query: str, context: Dict[str, Any], is_question: bool = False) -> str:
+        """Get relevant context from RAG. Only retrieves FAQs when is_question=True."""
         if not self.rag_service:
             logger.debug(f"RAG service not available for query: {query}")
             return ""
+        
+        # Only retrieve RAG context (including FAQs) when user is asking a question
+        # For generic queries like "name collection", "email collection", don't retrieve FAQs
+        if not is_question:
+            # Check if query looks like a generic state query (not an actual user question)
+            generic_queries = ["name collection", "email collection", "phone collection", 
+                             "lead type selection", "service selection", "service selection"]
+            if any(gq in query.lower() for gq in generic_queries):
+                logger.debug(f"Skipping RAG retrieval for generic query: '{query}' (not a question)")
+                return ""
         
         try:
             # Use the RAG service's method which handles retrieval correctly
             rag_context = await self.rag_service.get_relevant_context(query)
             
             # Log the retrieved context for debugging
-            logger.info(f"RAG Context retrieved for query '{query}':")
+            logger.info(f"RAG Context retrieved for query '{query}' (is_question={is_question}):")
             if rag_context:
                 # Extract document count and details from the context if available
                 # The get_relevant_context method returns formatted string, so we log it directly
@@ -888,9 +917,9 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
         def get_fallback_message() -> str:
             assistant_name = context.get("integration", {}).get("assistantName", "").strip()
             if assistant_name:
-                return f"Thanks for reaching out. My name is {assistant_name}, your virtual Ai assistant how can i help you today"
+                return f"Hi this is {assistant_name} your virtual ai assistant from Palm Dental Services. How can I help u today"
             else:
-                return "Thanks for reaching out. I am your virtual AI assistant how can i help you today"
+                return "Hi this is your virtual ai assistant from Palm Dental Services. How can I help u today"
         
         if not self.client:
             return get_fallback_message()
@@ -1183,9 +1212,9 @@ Make it professional and informative."""
         if not greeting:
             assistant_name = integration.get("assistantName", "").strip()
             if assistant_name:
-                greeting = f"Thanks for reaching out. My name is {assistant_name}, your virtual Ai assistant how can i help you today"
+                greeting = f"Hi this is {assistant_name} your virtual ai assistant from Palm Dental Services. How can I help u today"
             else:
-                greeting = "Thanks for reaching out. I am your virtual AI assistant how can i help you today"
+                greeting = "Hi this is your virtual ai assistant from Palm Dental Services. How can I help u today"
         
         lead_types = context.get("lead_types", [])
 
