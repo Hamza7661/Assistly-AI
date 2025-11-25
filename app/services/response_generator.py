@@ -788,53 +788,41 @@ CRITICAL RULES:
 5. Keep the response concise (one or two sentences) and return plain text only.
 6. DO NOT ask for date/time - that is NOT part of this flow.
 7. Service selection is MANDATORY - every user must select a service."""
-        else:
-            # Format services as buttons for text channels
-            services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
-            system_prompt = f"""You are a {self.profession} assistant. 
-
-CRITICAL RULES:
-1. The user has already selected a lead type (callback, appointment, or information request)
-2. You MUST ask: "Which service are you interested in?" 
-3. Show ALL services as buttons: {services_text}
-4. DO NOT ask for date/time - that is NOT part of this flow
-5. DO NOT show lead type options again - they already selected one
-6. DO NOT acknowledge the lead type selection in detail - just move to service selection
-7. Service selection is MANDATORY - every user must select a service
-
-Your response should be brief: Ask for service selection and show the service buttons."""
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        recent_history = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
-        messages.extend(recent_history)
-        
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=200,
-                temperature=0.3
-            )
-            answer = (response.choices[0].message.content or "").strip()
-            # Ensure services are included even if AI doesn't add them
-            if self.channel == "voice":
+            
+            messages = [{"role": "system", "content": system_prompt}]
+            recent_history = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
+            messages.extend(recent_history)
+            
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=200,
+                    temperature=0.3
+                )
+                answer = (response.choices[0].message.content or "").strip()
+                # Ensure services are included even if AI doesn't add them
                 if services_text and services_text.lower() not in answer.lower():
                     prefix = "Which service are you interested in?"
                     if answer:
                         return f"{answer} Available services include {services_text}."
                     return f"{prefix} Available services include {services_text}."
                 return answer
-            else:
-                if services_text not in answer:
-                    return f"{answer} {services_text}" if answer else f"Which service are you interested in? {services_text}"
-                return answer
-        except Exception as e:
-            logger.error(f"Error generating service selection response: {e}")
-            if self.channel == "voice":
+            except Exception as e:
+                logger.error(f"Error generating service selection response: {e}")
                 if services_text:
                     return f"Which service are you interested in? Available services include {services_text}."
                 return "Which service are you interested in?"
-            return f"Which service are you interested in? {services_text}"
+        else:
+            # Format services as buttons for text channels (web and WhatsApp)
+            services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
+            
+            # For web and WhatsApp, always return service buttons immediately
+            # No need for LLM - just show the services directly
+            if services_text:
+                return f"Which service are you interested in? {services_text}"
+            else:
+                return "Which service are you interested in?"
     
     async def _generate_data_collected_with_question_response(
         self,
@@ -848,6 +836,21 @@ Your response should be brief: Ask for service selection and show the service bu
         """Generate response when data is collected AND user asked a question"""
         if not self.client:
             if next_step == "service selection":
+                # For web and WhatsApp, include service buttons
+                if self.channel != "voice":
+                    treatment_plans = context.get("treatment_plans", [])
+                    all_services = []
+                    for plan in treatment_plans:
+                        if isinstance(plan, dict):
+                            plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                            if plan_name:
+                                all_services.append(plan_name)
+                        else:
+                            all_services.append(str(plan))
+                    
+                    services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
+                    if services_text:
+                        return f"Which service are you interested in? {services_text}"
                 return "Which service are you interested in?"
             elif next_step == "name":
                 return "What's your name?"
@@ -900,10 +903,45 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
             # Ensure it asks for next step if AI doesn't
             if next_question.lower() not in answer.lower():
                 answer += f" {next_question}"
+            
+            # For web and WhatsApp, if next step is service selection, add service buttons
+            if next_step == "service selection" and self.channel != "voice":
+                treatment_plans = context.get("treatment_plans", [])
+                all_services = []
+                for plan in treatment_plans:
+                    if isinstance(plan, dict):
+                        plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                        if plan_name:
+                            all_services.append(plan_name)
+                    else:
+                        all_services.append(str(plan))
+                
+                services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
+                if services_text and services_text not in answer:
+                    answer += f" {services_text}"
+            
             return answer
         except Exception as e:
             logger.error(f"Error generating data+question response: {e}")
-            return f"Great! I've noted your {data_type}: {data_value}. {next_question}"
+            fallback = f"Great! I've noted your {data_type}: {data_value}. {next_question}"
+            
+            # For web and WhatsApp, if next step is service selection, add service buttons
+            if next_step == "service selection" and self.channel != "voice":
+                treatment_plans = context.get("treatment_plans", [])
+                all_services = []
+                for plan in treatment_plans:
+                    if isinstance(plan, dict):
+                        plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                        if plan_name:
+                            all_services.append(plan_name)
+                    else:
+                        all_services.append(str(plan))
+                
+                services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
+                if services_text:
+                    fallback += f" {services_text}"
+            
+            return fallback
     
     async def _generate_question_response(
         self,
