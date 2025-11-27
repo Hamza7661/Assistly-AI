@@ -951,13 +951,10 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
         context: Dict[str, Any]
     ) -> str:
         """Generate response to answer a user's question using RAG context"""
-        # Helper to get fallback message based on assistant name
+        # Helper to get fallback message using greeting utility
         def get_fallback_message() -> str:
-            assistant_name = context.get("integration", {}).get("assistantName", "").strip()
-            if assistant_name:
-                return f"Hi this is {assistant_name} your virtual ai assistant from Palm Dental Services. How can I help u today"
-            else:
-                return "Hi this is your virtual ai assistant from Palm Dental Services. How can I help u today"
+            from ..utils.greeting_utils import get_greeting_with_fallback
+            return get_greeting_with_fallback(context)
         
         if not self.client:
             return get_fallback_message()
@@ -1242,17 +1239,12 @@ Make it professional and informative."""
     
     async def generate_greeting(self, context: Dict[str, Any], channel: Optional[str] = None) -> str:
         """Generate initial greeting"""
-        current_channel = (channel or self.channel or "web").lower()
-        integration = context.get("integration", {})
-        greeting = integration.get("greeting", "").strip()
+        from ..utils.greeting_utils import get_greeting_with_fallback
         
-        # Fallback to default greeting if empty or missing
-        if not greeting:
-            assistant_name = integration.get("assistantName", "").strip()
-            if assistant_name:
-                greeting = f"Hi this is {assistant_name} your virtual ai assistant from Palm Dental Services. How can I help u today"
-            else:
-                greeting = "Hi this is your virtual ai assistant from Palm Dental Services. How can I help u today"
+        current_channel = (channel or self.channel or "web").lower()
+        
+        # Get greeting from integration settings with placeholder replacement
+        greeting = get_greeting_with_fallback(context)
         
         lead_types = context.get("lead_types", [])
 

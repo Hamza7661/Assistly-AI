@@ -25,6 +25,7 @@ except ImportError:
 from .context_service import ContextService
 from .lead_service import LeadService
 from ..utils.phone_utils import format_phone_number_with_gpt
+from ..utils.greeting_utils import get_greeting_with_fallback
 from ..config import settings as app_settings
 
 logger = logging.getLogger("assistly.voice_agent")
@@ -180,6 +181,9 @@ class VoiceAgentSession:
         
         faqs_formatted = "\n".join(faqs_text) if faqs_text else "No FAQs available"
 
+        # Get greeting from integration settings with placeholder replacement
+        greeting_message = get_greeting_with_fallback(self.context)
+        
         prompt = f"""You are {assistant_name}, a warm and empathetic British English speaking AI assistant for a {profession}. Be conversational and make callers feel heard.
 
 KNOWLEDGE BASE (answer questions from this):
@@ -192,7 +196,7 @@ SERVICES:
 {treatment_plans_formatted}
 
 YOUR TASKS:
-1. When you hear "initiate greeting", say warmly: "Hi this is {assistant_name} your virtual ai assistant from Palm Dental Services. How can I help u today?"
+1. When you hear "initiate greeting", say warmly: "{greeting_message}"
 2. Answer questions using the knowledge base above - be helpful and friendly.
 3. Collect: service type, full name, email. (Phone: {self.caller_phone} is already known)
 
@@ -244,10 +248,8 @@ RULES:
             self.deepgram_agent_connection_cm = connection_cm
             self.deepgram_agent_connection = await connection_cm.__aenter__()
             
-            # Build greeting message
-            integration = self.context.get("integration", {}) or {}
-            assistant_name = integration.get("assistantName") or "Assistant"
-            greeting_text = f"Hello! I'm {assistant_name}. How can I help you today?"
+            # Build greeting message using integration settings
+            greeting_text = get_greeting_with_fallback(self.context)
             
             # Send configuration with prompt/instructions
             # Build config dict first
