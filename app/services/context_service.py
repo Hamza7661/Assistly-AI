@@ -124,6 +124,47 @@ class ContextService:
 
         return normalized
 
+    async def fetch_context_by_app(self, app_id: str) -> Dict[str, Any]:
+        """Fetch context by app ID (app-wise embedding; same user can have multiple apps)."""
+        path = f"/api/v1/users/public/apps/{quote(app_id, safe='')}/context"
+        url = f"{self.base_url}{path}"
+
+        ts = str(generate_ts_millis())
+        nonce = generate_nonce()
+        sign = build_signature_with_param(
+            self.secret,
+            ts,
+            nonce,
+            method="GET",
+            path=path,
+            param_name="appId",
+            param_value=app_id,
+        )
+
+        headers = {
+            "x-tp-ts": ts,
+            "x-tp-nonce": nonce,
+            "x-tp-sign": sign,
+            "accept": "application/json",
+        }
+
+        start_time = time.time()
+        logger.info("Sending context API request at %s for app_id=%s",
+                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), app_id)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info("Received context API response at %s (took %.3fs) for app_id=%s",
+                   time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)), duration, app_id)
+
+        normalized = self._normalize_context(data)
+        return normalized
+
     def _normalize_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # Many backends wrap payload inside a top-level 'data' key
         src = data.get("data", data) if isinstance(data, dict) else {}

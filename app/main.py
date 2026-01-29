@@ -422,10 +422,18 @@ def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: Lis
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
 
+    app_id: Optional[str] = websocket.query_params.get("app_id")
     user_id: Optional[str] = websocket.query_params.get("user_id")
 
-    if not user_id:
-        await websocket.send_json({"type": "error", "content": "Missing user_id in query params"})
+    # App-wise: accept app_id (embed widget) or legacy user_id
+    if app_id:
+        identifier = app_id
+        fetch_by_app = True
+    elif user_id:
+        identifier = user_id
+        fetch_by_app = False
+    else:
+        await websocket.send_json({"type": "error", "content": "Missing app_id or user_id in query params"})
         await websocket.close(code=1008)
         return
 
@@ -444,7 +452,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     )
 
     try:
-        context = await context_service.fetch_user_context(user_id)
+        if fetch_by_app:
+            context = await context_service.fetch_context_by_app(identifier)
+        else:
+            context = await context_service.fetch_user_context(identifier)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to fetch user context: %s", exc)
         await websocket.send_json({
@@ -453,6 +464,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         })
         await websocket.close(code=1011)
         return
+
+    # For OTP, leads, etc.: use user id from context (app owner when app_id was used)
+    user_id = str(context.get("user", {}).get("id") or identifier)
 
     # Initialize production-grade components
     flow_controller = FlowController(context)
