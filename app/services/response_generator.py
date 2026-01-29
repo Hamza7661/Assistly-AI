@@ -47,6 +47,40 @@ class ResponseGenerator:
         return ", ".join(cleaned[:-1]) + f", or {cleaned[-1]}"
 
     @staticmethod
+    def _filter_services_by_lead_type(
+        treatment_plans: List[Any],
+        lead_types: List[Dict[str, Any]],
+        collected_lead_type: Optional[str]
+    ) -> Optional[List[str]]:
+        """Filter service plans by lead type's relevantServicePlans. Returns None if no filtering needed."""
+        if not collected_lead_type or not lead_types:
+            return None
+        # Find the lead type that was selected
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            if (lt.get("value") or "").strip().lower() != collected_lead_type.strip().lower():
+                continue
+            # Found matching lead type - check for relevantServicePlans
+            relevant = lt.get("relevantServicePlans")
+            if not relevant or not isinstance(relevant, list):
+                return None  # No filtering configured
+            allowed = {str(s).strip().lower() for s in relevant if s}
+            if not allowed:
+                return None
+            # Filter treatment plans to only those in relevantServicePlans
+            filtered = []
+            for plan in treatment_plans:
+                if isinstance(plan, dict):
+                    name = (plan.get("question") or plan.get("name") or plan.get("title") or "").strip()
+                else:
+                    name = str(plan).strip()
+                if name and name.lower() in allowed:
+                    filtered.append(name)
+            return filtered if filtered else None
+        return None
+
+    @staticmethod
     def _normalize_lead_option_for_voice(text: str) -> str:
         """Strip preference phrasing like 'I would like' for natural voice questions."""
         if not text:
@@ -409,11 +443,15 @@ Classify the intent:"""
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_data_collected_with_question_response(
                         "lead type", lead_type.get("text"), rag_context, 
-                        "service selection", conversation_history, context
+                        "service selection", conversation_history, context,
+                        collected_lead_type=lead_type.get("value")
                     )
                 else:
-                    # Explicitly include services in prompt for service selection
-                    return await self._generate_service_selection_response(conversation_history, context)
+                    # Explicitly include services (filtered by lead type when configured)
+                    return await self._generate_service_selection_response(
+                        conversation_history, context,
+                        collected_lead_type=lead_type.get("value")
+                    )
             else:
                 logger.warning(f"No lead type matched for user input: '{user_message}'. Available lead types: {[lt.get('text') for lt in context.get('lead_types', [])]}")
                 # No match found - use AI to handle questions, but with strict prompt to only show lead types
@@ -421,20 +459,27 @@ Classify the intent:"""
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
         
         if state == ConversationState.SERVICE_SELECTION:
-            # Use treatment plans directly
             treatment_plans = context.get("treatment_plans", [])
-            # Extract treatment plan names for matching
-            all_treatment_plans = []
-            for plan in treatment_plans:
-                if isinstance(plan, dict):
-                    # Use "question" field as the identifier for treatment plans
-                    plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
-                    if plan_name:
-                        all_treatment_plans.append(plan_name)
-                else:
-                    all_treatment_plans.append(str(plan))
+            lead_types = context.get("lead_types", [])
+            collected_lead_type = flow_controller.collected_data.get("leadType")
             
-            # Try to match against treatment plans first
+            # Filter services by lead type's relevantServicePlans when configured
+            filtered_names = self._filter_services_by_lead_type(treatment_plans, lead_types, collected_lead_type)
+            if filtered_names is not None:
+                all_treatment_plans = filtered_names
+                logger.info(f"SERVICE_SELECTION: Filtered to {len(filtered_names)} services for lead type '{collected_lead_type}'")
+            else:
+                all_treatment_plans = []
+                for plan in treatment_plans:
+                    if isinstance(plan, dict):
+                        plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                        if plan_name:
+                            all_treatment_plans.append(plan_name)
+                    else:
+                        all_treatment_plans.append(str(plan))
+                logger.info(f"SERVICE_SELECTION: No filtering - showing all {len(all_treatment_plans)} services")
+            
+            # Match against filtered or all services
             service = extractor.match_service(user_message, all_treatment_plans)
             
             # Find the exact treatment plan name that was matched (for workflow detection)
@@ -757,24 +802,31 @@ Classify the intent:"""
     async def _generate_service_selection_response(
         self,
         conversation_history: List[Dict[str, str]],
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        collected_lead_type: Optional[str] = None
     ) -> str:
-        """Generate service selection response with explicit treatment plan list"""
+        """Generate service selection response. Filters by relevantServicePlans when configured."""
         if not self.client:
             return "Which service are you interested in?"
         
-        # Get all treatment plans
         treatment_plans = context.get("treatment_plans", [])
-        all_services = []
+        lead_types = context.get("lead_types", [])
         
-        for plan in treatment_plans:
-            if isinstance(plan, dict):
-                # Use "question" field as the identifier for treatment plans
-                plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
-                if plan_name:
-                    all_services.append(plan_name)
-            else:
-                all_services.append(str(plan))
+        # Try to filter by lead type's relevantServicePlans
+        filtered = self._filter_services_by_lead_type(treatment_plans, lead_types, collected_lead_type)
+        if filtered is not None:
+            all_services = filtered
+            logger.info(f"Filtered {len(filtered)} services for lead type '{collected_lead_type}': {filtered}")
+        else:
+            all_services = []
+            for plan in treatment_plans:
+                if isinstance(plan, dict):
+                    plan_name = plan.get("question", plan.get("name", plan.get("title", """))
+                    if plan_name:
+                        all_services.append(plan_name)
+                else:
+                    all_services.append(str(plan))
+            logger.info(f"No filtering - showing all {len(all_services)} services")
         
         if self.channel == "voice":
             services_text = self._format_voice_list(all_services)
@@ -831,23 +883,31 @@ CRITICAL RULES:
         rag_context: str,
         next_step: str,  # "service selection", "name", "email", "phone"
         conversation_history: List[Dict[str, str]],
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        collected_lead_type: Optional[str] = None
     ) -> str:
         """Generate response when data is collected AND user asked a question"""
+        def _get_service_list(ctx: Dict[str, Any], lead_type_val: Optional[str] = None) -> List[str]:
+            """Helper to get filtered or all services"""
+            treatment_plans = ctx.get("treatment_plans", [])
+            lead_types = ctx.get("lead_types", [])
+            filtered = self._filter_services_by_lead_type(treatment_plans, lead_types, lead_type_val)
+            if filtered is not None:
+                return filtered
+            all_services = []
+            for plan in treatment_plans:
+                if isinstance(plan, dict):
+                    plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                    if plan_name:
+                        all_services.append(plan_name)
+                else:
+                    all_services.append(str(plan))
+            return all_services
+        
         if not self.client:
             if next_step == "service selection":
-                # For web and WhatsApp, include service buttons
                 if self.channel != "voice":
-                    treatment_plans = context.get("treatment_plans", [])
-                    all_services = []
-                    for plan in treatment_plans:
-                        if isinstance(plan, dict):
-                            plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
-                            if plan_name:
-                                all_services.append(plan_name)
-                        else:
-                            all_services.append(str(plan))
-                    
+                    all_services = _get_service_list(context, collected_lead_type)
                     services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
                     if services_text:
                         return f"Which service are you interested in? {services_text}"
@@ -904,18 +964,9 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
             if next_question.lower() not in answer.lower():
                 answer += f" {next_question}"
             
-            # For web and WhatsApp, if next step is service selection, add service buttons
+            # For web and WhatsApp, if next step is service selection, add service buttons (filtered)
             if next_step == "service selection" and self.channel != "voice":
-                treatment_plans = context.get("treatment_plans", [])
-                all_services = []
-                for plan in treatment_plans:
-                    if isinstance(plan, dict):
-                        plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
-                        if plan_name:
-                            all_services.append(plan_name)
-                    else:
-                        all_services.append(str(plan))
-                
+                all_services = _get_service_list(context, collected_lead_type)
                 services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
                 if services_text and services_text not in answer:
                     answer += f" {services_text}"
@@ -925,18 +976,9 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
             logger.error(f"Error generating data+question response: {e}")
             fallback = f"Great! I've noted your {data_type}: {data_value}. {next_question}"
             
-            # For web and WhatsApp, if next step is service selection, add service buttons
+            # For web and WhatsApp, if next step is service selection, add service buttons (filtered)
             if next_step == "service selection" and self.channel != "voice":
-                treatment_plans = context.get("treatment_plans", [])
-                all_services = []
-                for plan in treatment_plans:
-                    if isinstance(plan, dict):
-                        plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
-                        if plan_name:
-                            all_services.append(plan_name)
-                    else:
-                        all_services.append(str(plan))
-                
+                all_services = _get_service_list(context, collected_lead_type)
                 services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
                 if services_text:
                     fallback += f" {services_text}"
