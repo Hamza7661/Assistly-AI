@@ -184,11 +184,15 @@ class ContextService:
 
         lead_types: List[Dict[str, Any]] = []
         if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
-            # Already in desired shape
+            # Already in desired shape; preserve relevantServicePlans for lead type → service filtering
             for idx, item in enumerate(lead_types_raw, start=1):
                 value = str(item.get("value") or item.get("id") or idx)
                 text = str(item.get("text") or value)
-                lead_types.append({"id": item.get("id") or idx, "value": value, "text": text})
+                entry: Dict[str, Any] = {"id": item.get("id") or idx, "value": value, "text": text}
+                # Include relevantServicePlans if present (for filtering services by lead type)
+                if isinstance(item.get("relevantServicePlans"), list) and item["relevantServicePlans"]:
+                    entry["relevantServicePlans"] = [str(s).strip() for s in item["relevantServicePlans"] if s]
+                lead_types.append(entry)
         elif isinstance(lead_types_raw, list):
             # List of strings; map to generic objects
             for idx, val in enumerate(lead_types_raw, start=1):
