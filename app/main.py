@@ -601,6 +601,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 if not json_data:
                                     # Fallback if JSON parsing fails
                                     json_data = flow_controller.get_json_data(conversation_history)
+                                # Add appId if available (for app-scoped leads)
+                                if app_id:
+                                    json_data["appId"] = app_id
                                 try:
                                     ok, _ = await lead_service.create_public_lead(user_id, json_data)
                                     final_msg = "Thanks! I have your details and someone will get back to you soon. Bye!" if ok else "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
@@ -816,6 +819,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Check if JSON was generated (all data collected)
             parsed_json = _maybe_parse_json(reply)
             if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
+                # Add appId if available (for app-scoped leads)
+                if app_id:
+                    parsed_json["appId"] = app_id
                 # Create lead
                 try:
                     ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
@@ -1034,9 +1040,11 @@ async def whatsapp_webhook(request: Request):
                 logger.exception("Failed to fetch user context for Twilio number %s: %s", twilio_phone, exc)
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I'm having trouble accessing your information. Please try again later."), media_type="text/xml")
             
-            # Extract user_id from context for lead creation
+            # Extract user_id and app_id from context for lead creation
             user_data = context.get("user", {})
             user_id = user_data.get("id")
+            app_data = context.get("app", {})
+            app_id = app_data.get("id") if app_data else None
             
             if not user_id:
                 logger.error(f"WhatsApp: No user_id found in context for Twilio number {twilio_phone}")
@@ -1044,7 +1052,7 @@ async def whatsapp_webhook(request: Request):
                 logger.error(f"WhatsApp: User data: {user_data}")
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I couldn't identify your account. Please contact support."), media_type="text/xml")
             
-            logger.info(f"WhatsApp: Using user_id '{user_id}' for Twilio number {twilio_phone}")
+            logger.info(f"WhatsApp: Using user_id '{user_id}' and app_id '{app_id}' for Twilio number {twilio_phone}")
             
             # Initialize new session state
             current_time = time.time()
@@ -1064,6 +1072,7 @@ async def whatsapp_webhook(request: Request):
                 },
                 "context": context,
                 "user_id": user_id,
+                "app_id": app_id,  # Store app_id for lead creation
                 "created_at": current_time,
                 "last_activity": current_time,
                 "is_whatsapp": True  # Flag to identify WhatsApp conversations
@@ -1107,6 +1116,7 @@ async def whatsapp_webhook(request: Request):
         phone_validation_state = session["phone_state"]
         context = session["context"]
         user_id = session["user_id"]
+        app_id = session.get("app_id")  # Get app_id for lead creation
         
         # Get flow controller and response generator from session (or create if missing)
         flow_controller = session.get("flow_controller")
@@ -1339,6 +1349,10 @@ async def whatsapp_webhook(request: Request):
                         if "leadPhoneNumber" not in parsed_json or not parsed_json.get("leadPhoneNumber"):
                             parsed_json["leadPhoneNumber"] = user_phone
                         
+                        # Add appId if available (for app-scoped WhatsApp leads)
+                        if app_id:
+                            parsed_json["appId"] = app_id
+                        
                         # Create lead and send friendly message
                         try:
                             ok_lead, _ = await lead_service.create_public_lead(user_id, parsed_json)
@@ -1496,6 +1510,9 @@ async def whatsapp_webhook(request: Request):
             phone_valid = True
             
             if email_valid and phone_valid:
+                # Add appId if available (for app-scoped WhatsApp leads)
+                if app_id:
+                    parsed_json["appId"] = app_id
                 # Create lead
                 try:
                     ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
