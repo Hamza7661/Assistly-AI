@@ -84,6 +84,7 @@ class VoiceAgentSession:
     lead_service: LeadService
     deepgram_client: AsyncDeepgramClient
     on_stop: Optional[Callable[[str], None]] = None
+    app_id: Optional[str] = None  # For app-scoped leads
 
     twilio_websocket: Optional[WebSocket] = None
     twilio_stream_sid: Optional[str] = None
@@ -616,6 +617,10 @@ RULES:
                 if not lead_data.get("title"):
                     lead_data["title"] = lead_data.get("leadType", "")
             
+            # Add appId if available (for app-scoped voice leads)
+            if self.app_id:
+                lead_data["appId"] = self.app_id
+            
             # Create lead
             ok, _ = await self.lead_service.create_public_lead(self.user_id, lead_data)
             
@@ -939,6 +944,10 @@ class VoiceAgentService:
         user_id = user_data.get("id")
         if not user_id:
             raise ValueError("User id missing in context response for voice call")
+        
+        # Extract app_id from context for app-scoped leads
+        app_data = context.get("app", {})
+        app_id = app_data.get("id") if app_data else None
 
         integration = context.setdefault("integration", {})
         integration["validateEmail"] = False
@@ -956,6 +965,7 @@ class VoiceAgentService:
             context=context,
             lead_service=self.lead_service,
             deepgram_client=self.deepgram_client,
+            app_id=app_id  # Pass app_id for app-scoped leads
         )
 
         self.sessions[call_sid] = session
