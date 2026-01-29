@@ -821,7 +821,7 @@ Classify the intent:"""
             all_services = []
             for plan in treatment_plans:
                 if isinstance(plan, dict):
-                    plan_name = plan.get("question", plan.get("name", plan.get("title", """))
+                    plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
                     if plan_name:
                         all_services.append(plan_name)
                 else:
