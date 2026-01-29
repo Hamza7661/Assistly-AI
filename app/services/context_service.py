@@ -227,12 +227,14 @@ class ContextService:
                 if isinstance(plan, dict) and "question" in plan:
                     plan["question"] = plan["question"].capitalize()
 
-        # Profession description may be under src['user']['professionDescription']
+        # Profession/industry: prefer app's industry over user's professionDescription
         profession = ""
         if isinstance(src, dict):
+            app_obj = src.get("app") or {}
             user_obj = src.get("user") or {}
             profession = (
-                user_obj.get("professionDescription")
+                app_obj.get("industry")  # ✅ FIRST: Use app's industry (e.g., "Food & Restaurant")
+                or user_obj.get("professionDescription")  # Fallback: user's description
                 or user_obj.get("profession")
                 or src.get("professionDescription")
                 or src.get("profession")

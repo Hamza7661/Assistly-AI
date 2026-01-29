@@ -473,7 +473,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     flow_controller.set_whatsapp(False)
     
     response_generator = ResponseGenerator(settings, rag_service)
-    response_generator.set_profession(str(context.get("profession") or "Clinic"))
+    response_generator.set_profession(str(context.get("profession") or "Business"))
     response_generator.set_channel("web")
     
     extractor = DataExtractor()
@@ -1086,7 +1086,7 @@ async def whatsapp_webhook(request: Request):
             flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
             
             response_generator = ResponseGenerator(settings, rag_service)
-            response_generator.set_profession(str(context.get("profession") or "Clinic"))
+            response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
             
             # Build RAG vector store
@@ -1129,7 +1129,7 @@ async def whatsapp_webhook(request: Request):
             # Store WhatsApp phone number from Twilio (caller's number)
             flow_controller.update_collected_data("leadPhoneNumber", user_phone)
             response_generator = ResponseGenerator(settings, rag_service)
-            response_generator.set_profession(str(context.get("profession") or "Clinic"))
+            response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
             session["flow_controller"] = flow_controller
             session["response_generator"] = response_generator

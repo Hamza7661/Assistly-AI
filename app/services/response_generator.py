@@ -19,7 +19,7 @@ class ResponseGenerator:
         self.client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
         self.model = settings.gpt_model
         self.rag_service = rag_service
-        self.profession = "Clinic"
+        self.profession = "Business"  # Default fallback - will be overridden by app's industry
         self.channel: str = "web"
     
     def set_profession(self, profession: str):
