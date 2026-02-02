@@ -1058,6 +1058,7 @@ async def whatsapp_webhook(request: Request):
             current_time = time.time()
             whatsapp_sessions[session_id] = {
                 "phone": user_phone,
+                "twilio_phone": twilio_phone,  # Store app's Twilio number for multi-app support
                 "history": [],
                 "email_state": {
                     "email": None,
@@ -1103,9 +1104,9 @@ async def whatsapp_webhook(request: Request):
             if buttons:
                 button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
                 full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
-                await whatsapp_service.send_message(user_phone, full_message)
+                await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             else:
-                await whatsapp_service.send_message(user_phone, initial_reply)
+                await whatsapp_service.send_message(user_phone, initial_reply, from_phone=twilio_phone)
             
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
@@ -1117,6 +1118,7 @@ async def whatsapp_webhook(request: Request):
         context = session["context"]
         user_id = session["user_id"]
         app_id = session.get("app_id")  # Get app_id for lead creation
+        twilio_phone = session.get("twilio_phone", twilio_phone)  # Get app's Twilio number from session
         
         # Get flow controller and response generator from session (or create if missing)
         flow_controller = session.get("flow_controller")
@@ -1246,7 +1248,7 @@ async def whatsapp_webhook(request: Request):
                     reply = (f"Great! I've sent a 6-digit verification code to {email}. Please enter the code to verify your email." 
                             if ok else "Sorry, I couldn't send the verification email. Please check your email address and try again.")
                     conversation_history.append({"role": "assistant", "content": reply})
-                    await whatsapp_service.send_message(user_phone, reply)
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     logger.info(f"WhatsApp: Email OTP sent, returning early to prevent JSON generation")
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 else:
@@ -1270,7 +1272,7 @@ async def whatsapp_webhook(request: Request):
                 reply = (f"I've sent a new verification code to {email_validation_state['email']}. Please enter the code." 
                         if ok else "Sorry, I couldn't resend the verification email. Please try again.")
                 conversation_history.append({"role": "assistant", "content": reply})
-                success, message = await whatsapp_service.send_message(user_phone, reply)
+                success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp email retry message: %s", message)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -1317,7 +1319,7 @@ async def whatsapp_webhook(request: Request):
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
                 
                 conversation_history.append({"role": "assistant", "content": reply})
-                success, message = await whatsapp_service.send_message(user_phone, reply)
+                success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp change email message: %s", message)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -1364,7 +1366,7 @@ async def whatsapp_webhook(request: Request):
                             final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                         
                         conversation_history.append({"role": "assistant", "content": final_msg})
-                        await whatsapp_service.send_message(user_phone, final_msg)
+                        await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
                         
                         # Clean up session after lead creation
                         del whatsapp_sessions[session_id]
@@ -1375,13 +1377,13 @@ async def whatsapp_webhook(request: Request):
                     else:
                         # Not JSON, send the regular response
                         conversation_history.append({"role": "assistant", "content": reply})
-                        await whatsapp_service.send_message(user_phone, reply)
+                        await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                         return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 else:
                     # Not an OTP code - use ResponseGenerator's response (which might be an error message or natural response)
                     reply = temp_reply
                     conversation_history.append({"role": "assistant", "content": reply})
-                    await whatsapp_service.send_message(user_phone, reply)
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Generate response using production-grade state machine
@@ -1396,7 +1398,7 @@ async def whatsapp_webhook(request: Request):
             
             # Send the answer first
             conversation_history.append({"role": "assistant", "content": answer})
-            await whatsapp_service.send_message(user_phone, answer)
+            await whatsapp_service.send_message(user_phone, answer, from_phone=twilio_phone)
             
             # Then handle email OTP sending
             flow_controller.collected_data["leadEmail"] = email
@@ -1415,7 +1417,7 @@ async def whatsapp_webhook(request: Request):
             reply = (f"Great! I've sent a 6-digit verification code to {email}. Please enter the code to verify your email." 
                     if ok else "Sorry, I couldn't send the verification email. Please check your email address and try again.")
             conversation_history.append({"role": "assistant", "content": reply})
-            await whatsapp_service.send_message(user_phone, reply)
+            await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         elif "|||SEND_PHONE:" in reply:
@@ -1428,7 +1430,7 @@ async def whatsapp_webhook(request: Request):
             
             # Send the answer first
             conversation_history.append({"role": "assistant", "content": answer})
-            await whatsapp_service.send_message(user_phone, answer)
+            await whatsapp_service.send_message(user_phone, answer, from_phone=twilio_phone)
             
             # Then handle phone OTP sending
             flow_controller.collected_data["leadPhoneNumber"] = phone
@@ -1445,7 +1447,7 @@ async def whatsapp_webhook(request: Request):
             reply = (f"Great! I've sent a 6-digit verification code to {phone}. Please enter the code to verify your phone number." 
                     if ok else "Sorry, I couldn't send the verification SMS. Please check your phone number and try again.")
             conversation_history.append({"role": "assistant", "content": reply})
-            await whatsapp_service.send_message(user_phone, reply)
+            await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         elif reply.startswith("SEND_EMAIL:"):
@@ -1466,7 +1468,7 @@ async def whatsapp_webhook(request: Request):
             reply = (f"Great! I've sent a 6-digit verification code to {email}. Please enter the code to verify your email." 
                     if ok else "Sorry, I couldn't send the verification email. Please check your email address and try again.")
             conversation_history.append({"role": "assistant", "content": reply})
-            await whatsapp_service.send_message(user_phone, reply)
+            await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         elif reply.startswith("SEND_PHONE:"):
@@ -1490,7 +1492,7 @@ async def whatsapp_webhook(request: Request):
             reply = (f"Great! I've sent a 6-digit verification code to {phone}. Please enter the code to verify your phone number." 
                     if ok else "Sorry, I couldn't send the verification SMS. Please check your phone number and try again.")
             conversation_history.append({"role": "assistant", "content": reply})
-            await whatsapp_service.send_message(user_phone, reply)
+            await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Check if JSON was generated (all data collected) - BEFORE checking retry requests
@@ -1523,7 +1525,7 @@ async def whatsapp_webhook(request: Request):
                 except Exception:
                     final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                 
-                await whatsapp_service.send_message(user_phone, final_msg)
+                await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
                 
                 # Clean up session after lead creation
                 del whatsapp_sessions[session_id]
@@ -1541,7 +1543,7 @@ async def whatsapp_webhook(request: Request):
                 reply = (f"I've sent a new verification code to {phone_validation_state['phone']}. Please enter the code." 
                         if ok else "Sorry, I couldn't resend the verification SMS. Please try again.")
                 conversation_history.append({"role": "assistant", "content": reply})
-                success, message = await whatsapp_service.send_message(user_phone, reply)
+                success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp retry message: %s", message)
                 # Return empty TwiML response (no automatic reply needed)
@@ -1553,7 +1555,7 @@ async def whatsapp_webhook(request: Request):
                 reply = (f"I've sent a new verification code to {email_validation_state['email']}. Please enter the code." 
                         if ok else "Sorry, I couldn't resend the verification email. Please try again.")
                 conversation_history.append({"role": "assistant", "content": reply})
-                success, message = await whatsapp_service.send_message(user_phone, reply)
+                success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp email retry message: %s", message)
                 # Return empty TwiML response (no automatic reply needed)
@@ -1587,7 +1589,7 @@ async def whatsapp_webhook(request: Request):
                     flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
                 
                 conversation_history.append({"role": "assistant", "content": reply})
-                success, message = await whatsapp_service.send_message(user_phone, reply)
+                success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp change phone message: %s", message)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -1634,7 +1636,7 @@ async def whatsapp_webhook(request: Request):
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
                 
                 conversation_history.append({"role": "assistant", "content": reply})
-                success, message = await whatsapp_service.send_message(user_phone, reply)
+                success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp change email message: %s", message)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -1650,7 +1652,7 @@ async def whatsapp_webhook(request: Request):
                     # Get AI response to continue the flow
                     reply = await response_generator.generate_response(flow_controller, "Email provided", conversation_history, context)
                     conversation_history.append({"role": "assistant", "content": reply})
-                    await whatsapp_service.send_message(user_phone, reply)
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 
                 # Email validation is enabled - send OTP
@@ -1676,7 +1678,7 @@ async def whatsapp_webhook(request: Request):
                 reply = (f"Great! I've sent a 6-digit verification code to {email}. Please enter the code to verify your email." 
                         if ok else "Sorry, I couldn't send the verification email. Please check your email address and try again.")
                 conversation_history.append({"role": "assistant", "content": reply})
-                await whatsapp_service.send_message(user_phone, reply)
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             elif retry_type == 'send_phone' and extracted_value:
                 # Check if phone validation is enabled (for WhatsApp, phone is already verified, so skip)
@@ -1692,7 +1694,7 @@ async def whatsapp_webhook(request: Request):
                     # Get AI response to continue the flow
                     reply = await response_generator.generate_response(flow_controller, "Phone number provided", conversation_history, context)
                     conversation_history.append({"role": "assistant", "content": reply})
-                    await whatsapp_service.send_message(user_phone, reply)
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 
                 # Phone validation is enabled - send OTP (Note: For WhatsApp, this shouldn't happen as phone is already verified)
@@ -1708,7 +1710,7 @@ async def whatsapp_webhook(request: Request):
                 reply = (f"Great! I've sent a 6-digit verification code to {phone}. Please enter the code to verify your phone number." 
                         if ok else "Sorry, I couldn't send the verification SMS. Please check your phone number and try again.")
                 conversation_history.append({"role": "assistant", "content": reply})
-                await whatsapp_service.send_message(user_phone, reply)
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Check if response contains buttons
@@ -1727,12 +1729,12 @@ async def whatsapp_webhook(request: Request):
             # (interactive buttons don't work well in Twilio sandbox)
             button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
             full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
-            success, message = await whatsapp_service.send_message(user_phone, full_message)
+            success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
         else:
             # Send simple text message (ensure no button tags)
-            success, message = await whatsapp_service.send_message(user_phone, cleaned_reply)
+            success, message = await whatsapp_service.send_message(user_phone, cleaned_reply, from_phone=twilio_phone)
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
         
@@ -1754,3 +1756,4 @@ async def whatsapp_webhook_verification(request: Request):
     """Handle WhatsApp webhook verification (GET request)"""
     # Twilio may send GET requests for webhook verification
     return {"status": "ok", "message": "WhatsApp webhook endpoint is active"}
+
