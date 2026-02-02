@@ -265,6 +265,14 @@ class ContextService:
             "user_data",
         ], {})
 
+        # Extract app data (for multi-app support)
+        app_data = first_present([
+            "app",
+            "App",
+            "appData",
+            "app_data",
+        ], {})
+
         # Extract workflows (needed for workflow questions)
         workflows = first_present([
             "workflows",
@@ -281,5 +289,6 @@ class ContextService:
             "integration": integration,
             "country": country,
             "user": user_data,  # Preserve user data
+            "app": app_data,  # Preserve app data for multi-app support
             "workflows": workflows,  # Preserve workflows for workflow questions
         }
