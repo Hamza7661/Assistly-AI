@@ -57,7 +57,7 @@ class ContextService:
         return normalized
     
     async def fetch_user_context_by_twilio(self, twilio_phone: str) -> Dict[str, Any]:
-        """Fetch user context using Twilio phone number"""
+        """Fetch app context using Twilio phone number (apps have Twilio numbers, not users)"""
         # Remove 'whatsapp:' prefix if present
         clean_phone = twilio_phone.replace("whatsapp:", "")
         
@@ -65,7 +65,7 @@ class ContextService:
         encoded_phone = quote(clean_phone, safe='')
         
         # Path for signature (use encoded version)
-        path = f"/api/v1/users/by-twilio/{encoded_phone}/context"
+        path = f"/api/v1/apps/by-twilio/{encoded_phone}/context"
         url = f"{self.base_url}{path}"
 
         ts = str(generate_ts_millis())
