@@ -19,12 +19,13 @@ class WhatsAppService:
         if self.account_sid and self.auth_token:
             self.client = Client(self.account_sid, self.auth_token)
     
-    async def send_message(self, to_phone: str, message: str) -> Tuple[bool, str]:
+    async def send_message(self, to_phone: str, message: str, from_phone: Optional[str] = None) -> Tuple[bool, str]:
         """Send a simple text message via WhatsApp
         
         Args:
             to_phone: Phone number in international format (e.g., +1234567890)
             message: Text message to send
+            from_phone: Sender phone number (for multi-app support). If not provided, uses default from settings (if available).
         """
         if not self.client:
             logger.warning("Twilio client not initialized - WhatsApp message not sent")
@@ -32,8 +33,13 @@ class WhatsAppService:
         
         try:
             whatsapp_to = f"whatsapp:{to_phone}"
+            # Use provided from_phone or fallback to default (if configured)
+            sender = from_phone or self.whatsapp_from
+            if not sender:
+                logger.error("No sender phone number provided and no default configured")
+                return False, "No sender phone number available"
             # Ensure whatsapp_from has whatsapp: prefix
-            whatsapp_from = self.whatsapp_from if self.whatsapp_from.startswith('whatsapp:') else f"whatsapp:{self.whatsapp_from}"
+            whatsapp_from = sender if sender.startswith('whatsapp:') else f"whatsapp:{sender}"
             
             start_time = time.time()
             logger.info("Sending WhatsApp message at %s to %s", 
@@ -56,15 +62,26 @@ class WhatsAppService:
             logger.error("Failed to send WhatsApp message: %s", str(e))
             return False, f"Failed to send message: {str(e)}"
     
-    async def send_interactive_buttons(self, to_phone: str, body_text: str, buttons: List[Dict[str, str]]) -> Tuple[bool, str]:
-        """Send an interactive message with buttons via WhatsApp"""
+    async def send_interactive_buttons(self, to_phone: str, body_text: str, buttons: List[Dict[str, str]], from_phone: Optional[str] = None) -> Tuple[bool, str]:
+        """Send an interactive message with buttons via WhatsApp
+        
+        Args:
+            to_phone: Phone number in international format (e.g., +1234567890)
+            body_text: Main message text
+            buttons: List of button dictionaries
+            from_phone: Sender phone number (for multi-app support). If not provided, uses default from settings (if available).
+        """
         if not self.client:
             logger.warning("Twilio client not initialized - WhatsApp interactive message not sent")
             return False, "WhatsApp service not configured"
         
         try:
             whatsapp_to = f"whatsapp:{to_phone}"
-            whatsapp_from = f"whatsapp:{self.whatsapp_from}"
+            sender = from_phone or self.whatsapp_from
+            if not sender:
+                logger.error("No sender phone number provided and no default configured")
+                return False, "No sender phone number available"
+            whatsapp_from = sender if sender.startswith('whatsapp:') else f"whatsapp:{sender}"
             
             # Limit to 3 buttons as per WhatsApp API
             buttons = buttons[:3]
