@@ -374,8 +374,8 @@ def _process_workflow_response(user_text: str, current_workflow: Dict[str, Any],
     
     return (option_text, None, True)
 
-def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: List[Any] = None) -> List[Dict[str, Any]]:
-    """Convert services and treatment plans to WhatsApp list format"""
+def _convert_services_to_whatsapp_list(services: List[Any], service_plans: List[Any] = None) -> List[Dict[str, Any]]:
+    """Convert services and service plans to WhatsApp list format"""
     sections = []
     items = []
     
@@ -394,9 +394,9 @@ def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: Lis
             "description": description
         })
     
-    # Add treatment plans
-    if treatment_plans:
-        for i, plan in enumerate(treatment_plans, len(services) + 1):
+    # Add service plans
+    if service_plans:
+        for i, plan in enumerate(service_plans, len(services) + 1):
             if isinstance(plan, dict):
                 title = plan.get("question", plan.get("title", str(plan)))
                 description = plan.get("description", "")
@@ -405,14 +405,14 @@ def _convert_services_to_whatsapp_list(services: List[Any], treatment_plans: Lis
                 description = ""
             
             items.append({
-                "id": f"treatment_{i}",
+                "id": f"service_plan_{i}",
                 "title": title,
                 "description": description
             })
     
     if items:
         sections.append({
-            "title": "Services & Treatments",
+            "title": "Services & Service Plans",
             "rows": items
         })
     
@@ -482,7 +482,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Build RAG vector store
     rag_service.build_vector_store(context)
     
-    # Send initial greeting (workflows are now handled after treatment plan selection)
+    # Send initial greeting (workflows are now handled after service plan selection)
     initial_reply = await response_generator.generate_greeting(context, channel="web")
     # Transition to lead type selection after greeting
     flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
@@ -507,7 +507,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Add user message to history
             conversation_history.append({"role": "user", "content": user_text})
             
-            # Production-grade state machine flow (workflows are now handled by response_generator after treatment plan selection)
+            # Production-grade state machine flow (workflows are now handled by response_generator after service plan selection)
             current_state = flow_controller.state
             logger.info(f"Current state: {current_state.value}")
             
@@ -1178,17 +1178,26 @@ async def whatsapp_webhook(request: Request):
                     logger.warning(f"WhatsApp: User selected invalid lead type number {number}, available: {len(lead_types)}")
                     
             elif has_lead_type and not has_service:
-                # Second selection - must be treatment plan
-                treatment_plans = context.get("treatment_plans", [])
-                all_options = [t.get("question", str(t)) for t in treatment_plans if isinstance(t, dict)]
+                # Second selection - must be service plan
+                # Use the SAME filtered list shown to the user (by lead type's relevantServicePlans)
+                service_plans = context.get("service_plans", context.get("treatment_plans", []))
+                lead_types = context.get("lead_types", [])
+                collected_lead_type = flow_controller.collected_data.get("leadType")
+                filtered_names = ResponseGenerator._filter_services_by_lead_type(
+                    service_plans, lead_types, collected_lead_type
+                )
+                if filtered_names is not None:
+                    all_options = filtered_names
+                    logger.info(f"WhatsApp: Filtered to {len(filtered_names)} service plans for lead type '{collected_lead_type}'")
+                else:
+                    all_options = [t.get("question", str(t)) for t in service_plans if isinstance(t, dict)]
                 
-                logger.info(f"WhatsApp: Detected treatment plan selection. Available options: {all_options}")
+                logger.info(f"WhatsApp: Detected service plan selection. Available options: {all_options}")
                 
                 if 1 <= number <= len(all_options):
-                    selected = all_options[number - 1]
-                    service_name = selected.get("question", selected) if isinstance(selected, dict) else selected
+                    service_name = all_options[number - 1]
                     enhanced_user_text = f"{number} - {service_name}"
-                    logger.info(f"WhatsApp: User selected service #{number} -> '{service_name}'")
+                    logger.info(f"WhatsApp: User selected service plan #{number} -> '{service_name}'")
                 else:
                     logger.warning(f"WhatsApp: User selected invalid service number {number}, available: {len(all_options)}")
             else:
