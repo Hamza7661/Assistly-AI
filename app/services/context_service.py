@@ -61,12 +61,11 @@ class ContextService:
         # Remove 'whatsapp:' prefix if present
         clean_phone = twilio_phone.replace("whatsapp:", "")
         
-        # URL encode the phone number for the actual request URL
+        # URL encode the phone number for the actual request URL only
         encoded_phone = quote(clean_phone, safe='')
-        
-        # Path for signature (use encoded version)
-        path = f"/api/v1/apps/by-twilio/{encoded_phone}/context"
-        url = f"{self.base_url}{path}"
+        # Path for signature: use decoded (canonical) form so it matches backend's decodeURIComponent(path)
+        path_for_sign = f"/api/v1/apps/by-twilio/{clean_phone}/context"
+        url = f"{self.base_url}/api/v1/apps/by-twilio/{encoded_phone}/context"
 
         ts = str(generate_ts_millis())
         nonce = generate_nonce()
@@ -76,9 +75,9 @@ class ContextService:
             ts, 
             nonce, 
             method="GET", 
-            path=path, 
+            path=path_for_sign, 
             param_name="twilioPhoneNumber",
-            param_value=clean_phone  # Use non-encoded phone in the signature
+            param_value=clean_phone,
         )
 
         headers = {
