@@ -431,7 +431,17 @@ Classify the intent:"""
         
         # Handle data collection states - extract and validate before AI generation
         if state == ConversationState.LEAD_TYPE_SELECTION:
-            lead_type = extractor.match_lead_type(user_message, context.get("lead_types", []))
+            lead_types_list = context.get("lead_types", [])
+            lead_type = None
+            # Numeric selection (same as WhatsApp): "1", "2", "3" = first, second, third option in displayed list
+            if user_message.strip().isdigit():
+                num = int(user_message.strip())
+                if 1 <= num <= len(lead_types_list):
+                    lead_type = lead_types_list[num - 1] if isinstance(lead_types_list[num - 1], dict) else None
+                    if lead_type:
+                        logger.info(f"Matched lead type by number #{num}: {lead_type.get('text')} (value: {lead_type.get('value')})")
+            if not lead_type:
+                lead_type = extractor.match_lead_type(user_message, lead_types_list)
             if lead_type:
                 logger.info(f"Matched lead type: {lead_type.get('text')} (value: {lead_type.get('value')})")
                 flow_controller.update_collected_data("leadType", lead_type.get("value"))
@@ -479,8 +489,15 @@ Classify the intent:"""
                         all_treatment_plans.append(str(plan))
                 logger.info(f"SERVICE_SELECTION: No filtering - showing all {len(all_treatment_plans)} services")
             
-            # Match against filtered or all services
-            service = extractor.match_service(user_message, all_treatment_plans)
+            # Numeric selection: "1", "2" = first, second service in the list shown to user
+            service = None
+            if user_message.strip().isdigit():
+                num = int(user_message.strip())
+                if 1 <= num <= len(all_treatment_plans):
+                    service = all_treatment_plans[num - 1]
+                    logger.info(f"SERVICE_SELECTION: Matched service by number #{num}: '{service}'")
+            if not service:
+                service = extractor.match_service(user_message, all_treatment_plans)
             
             # Find the exact treatment plan name that was matched (for workflow detection)
             matched_treatment_plan_name = None
