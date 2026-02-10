@@ -610,6 +610,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 except Exception:
                                     final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                                 
+                                integration = context.get("integration") or {}
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                    await websocket.send_json({
+                                        "type": "review_prompt",
+                                        "content": "We'd love to hear from you! If you have a moment, please leave us a review on Google.",
+                                        "reviewUrl": integration["googleReviewUrl"].strip(),
+                                    })
                                 await websocket.send_json({"type": "bot", "content": final_msg})
                                 await websocket.close(code=1000)
                                 break
@@ -829,6 +836,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 except Exception:
                     final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                 
+                integration = context.get("integration") or {}
+                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                    await websocket.send_json({
+                        "type": "review_prompt",
+                        "content": "We'd love to hear from you! If you have a moment, please leave us a review on Google.",
+                        "reviewUrl": integration["googleReviewUrl"].strip(),
+                    })
                 await websocket.send_json({"type": "bot", "content": final_msg})
                 await websocket.close(code=1000)
                 break
