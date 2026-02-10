@@ -26,6 +26,7 @@ from .context_service import ContextService
 from .lead_service import LeadService
 from ..utils.phone_utils import format_phone_number_with_gpt
 from ..utils.greeting_utils import get_greeting_with_fallback
+from ..utils.text_utils import strip_emojis_for_voice
 from ..config import settings as app_settings
 
 logger = logging.getLogger("assistly.voice_agent")
@@ -99,6 +100,8 @@ class VoiceAgentSession:
     deepgram_agent_ready: bool = False
     deepgram_agent_ready_event: Optional[asyncio.Event] = None
     cached_trigger_audio: Optional[bytes] = None
+    cached_greeting_audio: Optional[bytes] = None  # Actual greeting TTS played to caller first
+    _cache_audio_task: Optional[asyncio.Task] = None  # So we can wait for it on stream start
     _last_user_audio_time: Optional[float] = None  # Track when user last spoke
     _first_response_sent: bool = False  # Track if we've sent first response chunk
     _json_buffer: str = ""  # Buffer for incomplete JSON messages
@@ -182,9 +185,14 @@ class VoiceAgentSession:
         
         faqs_formatted = "\n".join(faqs_text) if faqs_text else "No FAQs available"
 
-        # Get greeting from integration settings with placeholder replacement
-        greeting_message = get_greeting_with_fallback(self.context)
-        
+        # Strip emojis from prompt content so TTS/voice never gets them (avoids breaks)
+        assistant_name = strip_emojis_for_voice(assistant_name) or "Assistant"
+        faqs_formatted = strip_emojis_for_voice(faqs_formatted) or "No FAQs available"
+        lead_types_text = strip_emojis_for_voice(lead_types_text) or "No specific lead types"
+        treatment_plans_formatted = strip_emojis_for_voice(treatment_plans_formatted) or "No specific treatment plans"
+        profession = strip_emojis_for_voice(profession) or "business"
+
+        # Greeting is played by us to Twilio first; agent only says a short follow-up when triggered
         prompt = f"""You are {assistant_name}, a warm and empathetic British English speaking AI assistant for a {profession}. Be conversational and make callers feel heard.
 
 KNOWLEDGE BASE (answer questions from this):
@@ -197,7 +205,7 @@ SERVICES:
 {treatment_plans_formatted}
 
 YOUR TASKS:
-1. When you hear "initiate greeting", say warmly: "{greeting_message}"
+1. When you hear "initiate greeting", say only this short follow-up (nothing else): "How can I help you today?"
 2. Answer questions using the knowledge base above - be helpful and friendly.
 3. Collect: service type, full name, email. (Phone: {self.caller_phone} is already known)
 
@@ -638,8 +646,9 @@ RULES:
                 if not self.twilio_websocket or not self.active:
                     logger.warning("Cannot send closing message - Twilio connection not active for call %s", self.call_sid)
                 else:
+                    closing_clean = strip_emojis_for_voice(closing_message)
                     async for chunk in self.deepgram_client.speak.v1.audio.generate(
-                        text=closing_message,
+                        text=closing_clean,
                         model="aura-athena-en",
                         encoding="mulaw",
                         sample_rate=8000,
@@ -783,8 +792,27 @@ RULES:
                 self.twilio_stream_sid,
             )
             await self._flush_pending_twilio_audio()
-            
-            # Send cached trigger audio to initiate greeting
+
+            # Wait for greeting/trigger TTS cache so we don't play nothing (race: cache runs in background)
+            if self._cache_audio_task and not self._cache_audio_task.done():
+                try:
+                    await asyncio.wait_for(self._cache_audio_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Greeting/trigger cache not ready in time for call %s", self.call_sid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Cache audio task failed for call %s: %s", self.call_sid, exc)
+
+            # Play the actual greeting to the caller first (so they hear the configured greeting, not random LLM output)
+            if self.cached_greeting_audio and self.twilio_websocket and self.twilio_stream_sid:
+                try:
+                    chunk_size = 320  # 20ms mulaw at 8kHz; send in chunks to avoid message size limits
+                    for i in range(0, len(self.cached_greeting_audio), chunk_size):
+                        await self._send_audio_to_twilio(self.cached_greeting_audio[i : i + chunk_size])
+                    logger.info("Played greeting TTS to caller for call %s", self.call_sid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to send greeting TTS to Twilio for call %s: %s", self.call_sid, exc)
+
+            # Then send trigger to agent so it says short follow-up ("How can I help you today?")
             if self.deepgram_agent_ready and self.deepgram_agent_connection and self.cached_trigger_audio:
                 try:
                     await self.deepgram_agent_connection.send_media(self.cached_trigger_audio)
@@ -866,9 +894,9 @@ RULES:
             logger.exception("Failed to relay audio to Twilio for call %s: %s", self.call_sid, exc)
 
     async def _generate_and_cache_trigger_audio(self) -> None:
-        """Generate and cache trigger audio in parallel."""
+        """Generate and cache trigger audio and actual greeting TTS. Greeting is played to caller first."""
         try:
-            audio_chunks = []
+            trigger_chunks = []
             async for chunk in self.deepgram_client.speak.v1.audio.generate(
                 text="initiate greeting",
                 model="aura-athena-en",
@@ -876,12 +904,28 @@ RULES:
                 sample_rate=8000,
             ):
                 if chunk:
-                    audio_chunks.append(chunk)
-            
-            if audio_chunks:
-                self.cached_trigger_audio = b''.join(audio_chunks)
+                    trigger_chunks.append(chunk)
+            if trigger_chunks:
+                self.cached_trigger_audio = b''.join(trigger_chunks)
+
+            greeting_text = get_greeting_with_fallback(self.context)
+            if greeting_text:
+                greeting_text = strip_emojis_for_voice(greeting_text)
+            if greeting_text:
+                greeting_chunks = []
+                async for chunk in self.deepgram_client.speak.v1.audio.generate(
+                    text=greeting_text,
+                    model="aura-athena-en",
+                    encoding="mulaw",
+                    sample_rate=8000,
+                ):
+                    if chunk:
+                        greeting_chunks.append(chunk)
+                if greeting_chunks:
+                    self.cached_greeting_audio = b''.join(greeting_chunks)
+                    logger.info("Cached greeting TTS for call %s (%d bytes)", self.call_sid, len(self.cached_greeting_audio))
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Failed to generate trigger audio for call %s: %s", self.call_sid, exc)
+            logger.exception("Failed to generate trigger/greeting audio for call %s: %s", self.call_sid, exc)
 
     async def _flush_pending_twilio_audio(self) -> None:
         """Flush pending Twilio audio to Deepgram Voice Agent."""
@@ -971,8 +1015,8 @@ class VoiceAgentService:
         self.sessions[call_sid] = session
         session.on_stop = lambda sid: self.sessions.pop(sid, None)
 
-        # Generate trigger audio in parallel while starting session
-        asyncio.create_task(session._generate_and_cache_trigger_audio())
+        # Generate trigger + greeting audio in parallel; store task so stream can wait for it
+        session._cache_audio_task = asyncio.create_task(session._generate_and_cache_trigger_audio())
 
         await session.start()
 
