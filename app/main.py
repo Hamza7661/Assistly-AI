@@ -1388,6 +1388,12 @@ async def whatsapp_webhook(request: Request):
                         except Exception:
                             final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                         
+                        integration = context.get("integration") or {}
+                        if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                            review_url = integration["googleReviewUrl"].strip()
+                            review_msg = f"We'd love to hear from you! If you have a moment, please leave us a review on Google: {review_url}"
+                            conversation_history.append({"role": "assistant", "content": review_msg})
+                            await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                         conversation_history.append({"role": "assistant", "content": final_msg})
                         await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
                         
@@ -1548,6 +1554,11 @@ async def whatsapp_webhook(request: Request):
                 except Exception:
                     final_msg = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
                 
+                integration = context.get("integration") or {}
+                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                    review_url = integration["googleReviewUrl"].strip()
+                    review_msg = f"We'd love to hear from you! If you have a moment, please leave us a review on Google: {review_url}"
+                    await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                 await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
                 
                 # Clean up session after lead creation
