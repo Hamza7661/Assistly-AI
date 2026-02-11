@@ -21,7 +21,21 @@ class ResponseGenerator:
         self.rag_service = rag_service
         self.profession = "Business"  # Default fallback - will be overridden by app's industry
         self.channel: str = "web"
-    
+        self.response_language: Optional[str] = None  # e.g. "Spanish" for prompts; None/English = no instruction
+
+    def set_response_language(self, language_name: Optional[str]) -> None:
+        """Set language for all user-facing replies (e.g. 'Spanish'). None or 'English' = keep default."""
+        self.response_language = language_name
+
+    def _language_instruction(self) -> str:
+        """Return system instruction to respond in response_language, or empty string if English/default."""
+        if not self.response_language:
+            return ""
+        name = (self.response_language or "").strip()
+        if name.lower() in ("en", "english", ""):
+            return ""
+        return f"Respond only in {name}. All your replies must be in this language."
+
     def set_profession(self, profession: str):
         """Set profession for responses"""
         self.profession = profession or self.profession
@@ -548,10 +562,13 @@ Classify the intent:"""
                                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                                     if rag_context and self.client:
                                         # Generate a brief answer (1-2 sentences)
+                                        brief_system = f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."
+                                        if self._language_instruction():
+                                            brief_system += "\n\n" + self._language_instruction()
                                         response = await self.client.chat.completions.create(
                                             model=self.model,
                                             messages=[
-                                                {"role": "system", "content": f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."},
+                                                {"role": "system", "content": brief_system},
                                                 {"role": "user", "content": f"Context: {rag_context}\n\nQuestion: {user_message}"}
                                             ],
                                             max_tokens=100,
@@ -857,6 +874,8 @@ CRITICAL RULES:
 5. Keep the response concise (one or two sentences) and return plain text only.
 6. DO NOT ask for date/time - that is NOT part of this flow.
 7. Service selection is MANDATORY - every user must select a service."""
+            if self._language_instruction():
+                system_prompt += "\n\n" + self._language_instruction()
             
             messages = [{"role": "system", "content": system_prompt}]
             recent_history = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
@@ -958,6 +977,8 @@ CRITICAL RULES:
 7. Move forward to the next step: {next_step}
 
 Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. {next_question}"""
+        if self._language_instruction():
+            system_prompt += "\n\n" + self._language_instruction()
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -1021,6 +1042,8 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
         system_prompt = f"""You are a {self.profession} assistant. 
 Answer the user's question briefly (1-2 sentences) using ONLY the context provided below.
 If the context doesn't contain the answer, say "I don't have that information, but let me help you with..." and continue the conversation."""
+        if self._language_instruction():
+            system_prompt += "\n\n" + self._language_instruction()
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -1143,6 +1166,8 @@ If the context doesn't contain the answer, say "I don't have that information, b
  - Do NOT mention numbers or buttons."""
         
         system_prompt = state_prompts.get(state, f"You are a {self.profession} assistant. Continue the conversation naturally.")
+        if self._language_instruction():
+            system_prompt += "\n\n" + self._language_instruction()
         
         # Build messages
         messages = [{"role": "system", "content": system_prompt}]
