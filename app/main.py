@@ -153,8 +153,10 @@ async def invalidate_whatsapp_sessions(
     Clear all WhatsApp sessions for a given Twilio number so the next message fetches fresh context
     (e.g. after switching which app 'uses this number'). Called by backend when setUsesTwilioNumber succeeds.
     """
-    if settings.invalidate_sessions_secret and x_invalidate_sessions_secret != settings.invalidate_sessions_secret:
-        raise HTTPException(status_code=401, detail="Invalid or missing secret")
+    # Only require the secret when AI has it set in .env. When unset, all requests are allowed (add secret in both .envs later for production).
+    if settings.invalidate_sessions_secret:
+        if x_invalidate_sessions_secret != settings.invalidate_sessions_secret:
+            raise HTTPException(status_code=401, detail="Invalid or missing secret")
     clean_phone = (body.twilio_phone or "").replace("whatsapp:", "").strip()
     if not clean_phone:
         raise HTTPException(status_code=400, detail="twilio_phone required")
