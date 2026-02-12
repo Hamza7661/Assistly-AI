@@ -6,11 +6,12 @@ import secrets
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from contextlib import asynccontextmanager
 
+from pydantic import BaseModel
 from .config import settings
 from .services.context_service import ContextService
 from .services.lead_service import LeadService
@@ -137,6 +138,37 @@ app.add_middleware(
 @app.get("/")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+class InvalidateSessionsBody(BaseModel):
+    twilio_phone: str
+
+
+@app.post("/api/v1/whatsapp/invalidate-sessions")
+async def invalidate_whatsapp_sessions(
+    body: InvalidateSessionsBody,
+    x_invalidate_sessions_secret: Optional[str] = Header(default=None, alias="X-Invalidate-Sessions-Secret"),
+) -> Dict[str, Any]:
+    """
+    Clear all WhatsApp sessions for a given Twilio number so the next message fetches fresh context
+    (e.g. after switching which app 'uses this number'). Called by backend when setUsesTwilioNumber succeeds.
+    """
+    if settings.invalidate_sessions_secret and x_invalidate_sessions_secret != settings.invalidate_sessions_secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing secret")
+    clean_phone = (body.twilio_phone or "").replace("whatsapp:", "").strip()
+    if not clean_phone:
+        raise HTTPException(status_code=400, detail="twilio_phone required")
+    removed = []
+    for session_id, session in list(whatsapp_sessions.items()):
+        session_phone = (session.get("twilio_phone") or "").replace("whatsapp:", "").strip()
+        if session_phone == clean_phone:
+            phone = session.get("phone")
+            if phone and phone_to_session.get(phone) == session_id:
+                del phone_to_session[phone]
+            del whatsapp_sessions[session_id]
+            removed.append(session_id)
+    logger.info("Invalidated WhatsApp sessions for twilio_phone=%s, removed %d session(s)", clean_phone, len(removed))
+    return {"status": "ok", "twilio_phone": clean_phone, "removed_sessions": len(removed)}
 
 
 def _maybe_parse_json(text: str) -> Optional[Dict]:
