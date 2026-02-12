@@ -183,7 +183,7 @@ class ContextService:
 
         lead_types: List[Dict[str, Any]] = []
         if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
-            # Already in desired shape; preserve relevantServicePlans for lead type → service filtering
+            # Already in desired shape; preserve relevantServicePlans and synonyms (per-app from DB)
             for idx, item in enumerate(lead_types_raw, start=1):
                 value = str(item.get("value") or item.get("id") or idx)
                 text = str(item.get("text") or value)
@@ -191,6 +191,12 @@ class ContextService:
                 # Include relevantServicePlans if present (for filtering services by lead type)
                 if isinstance(item.get("relevantServicePlans"), list) and item["relevantServicePlans"]:
                     entry["relevantServicePlans"] = [str(s).strip() for s in item["relevantServicePlans"] if s]
+                # Include synonyms if present (per lead type from integration – other languages / alternate phrases)
+                if isinstance(item.get("synonyms"), list) and item["synonyms"]:
+                    entry["synonyms"] = [str(s).strip() for s in item["synonyms"] if s and str(s).strip()]
+                # Include labels if present (per-language display labels for greeting options)
+                if isinstance(item.get("labels"), dict) and item["labels"]:
+                    entry["labels"] = {str(k).strip(): str(v).strip() for k, v in item["labels"].items() if v}
                 lead_types.append(entry)
         elif isinstance(lead_types_raw, list):
             # List of strings; map to generic objects

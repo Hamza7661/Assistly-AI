@@ -102,3 +102,16 @@ def get_language_name_for_prompt(code: str) -> Optional[str]:
         return None
     # Unknown codes default to None so we keep English behavior
     return _LANGUAGE_NAMES.get(key)
+
+
+def get_language_name(code: str) -> str:
+    """
+    Map language code to full name (e.g. 'ur' -> 'Urdu', 'en' -> 'English').
+    Used for translation targets; returns 'English' for en.
+    """
+    if not code:
+        return "English"
+    key = (code or "").lower().strip()
+    if key in ("en", "english"):
+        return "English"
+    return _LANGUAGE_NAMES.get(key) or key

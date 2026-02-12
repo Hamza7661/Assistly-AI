@@ -174,6 +174,16 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "fr": "J'ai trouvé votre e-mail mais je n'ai pas pu envoyer le code. Veuillez réessayer.",
         "de": "Ich habe Ihre E-Mail gefunden, konnte den Bestätigungscode aber nicht senden. Bitte versuchen Sie es erneut.",
     },
+    "please_reply_number": {
+        "en": "Please reply with the number of your choice.",
+        "ur": "براہ کرم اپنی پسند کا نمبر لکھیں۔",
+        "hi": "कृपया अपनी पसंद का नंबर लिखें।",
+        "ar": "يرجى الرد برقم خيارك.",
+        "es": "Por favor responde con el número de tu elección.",
+        "fr": "Veuillez répondre avec le numéro de votre choix.",
+        "de": "Bitte antworten Sie mit der Nummer Ihrer Wahl.",
+        "pa": "ਕਿਰਪਾ ਕਰਕੇ ਆਪਣੀ ਪਸੰਦ ਦਾ ਨੰਬਰ ਲਿਖੋ।",
+    },
     "found_phone_cant_send": {
         "en": "I found your phone number, but couldn't send the verification code. Please try again.",
         "es": "Encontré tu número, pero no pude enviar el código de verificación. Por favor intenta de nuevo.",
@@ -184,6 +194,31 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "de": "Ich habe Ihre Nummer gefunden, konnte den Bestätigungscode aber nicht senden. Bitte versuchen Sie es erneut.",
     },
 }
+
+
+# Fallback label translations when the app does not provide per-lead-type "labels" in the integration.
+# Key = lowercase value/text; value = { lang_code: translated label }.
+# Prefer DB labels (integration.leadTypeMessages[].labels) so any industry can define their own.
+LEAD_TYPE_LABELS: dict[str, dict[str, str]] = {
+    "order": {"en": "Order", "ur": "آرڈر", "hi": "ऑर्डर", "ar": "طلب", "es": "Pedido", "fr": "Commande", "de": "Bestellung", "pa": "ਆਰਡਰ"},
+    "menu": {"en": "Menu", "ur": "مینو", "hi": "मेन्यू", "ar": "القائمة", "es": "Menú", "fr": "Menu", "de": "Menü", "pa": "ਮੀਨੂ"},
+    "catering": {"en": "Catering", "ur": "کیٹرنگ", "hi": "कैटरिंग", "ar": "التموين", "es": "Catering", "fr": "Restauration", "de": "Catering", "pa": "ਕੈਟਰਿੰਗ"},
+    "reservation": {"en": "Reservation", "ur": "رزرویشن", "hi": "आरक्षण", "ar": "حجز", "es": "Reserva", "fr": "Réservation", "de": "Reservierung", "pa": "ਰਿਜ਼ਰਵੇਸ਼ਨ"},
+    "allergies": {"en": "Allergies / Halal", "ur": "الرجی / حلال", "hi": "एलर्जी / हलाल", "ar": "الحساسية / الحلال", "es": "Alergias / Halal", "fr": "Allergies / Halal", "de": "Allergien / Halal", "pa": "ਐਲਰਜੀ / ਹਲਾਲ"},
+    "halal": {"en": "Halal", "ur": "حلال", "hi": "हलाल", "ar": "حلال", "es": "Halal", "fr": "Halal", "de": "Halal", "pa": "ਹਲਾਲ"},
+    "info": {"en": "Info & Contact", "ur": "معلومات اور رابطہ", "hi": "जानकारी और संपर्क", "ar": "معلومات واتصال", "es": "Info y contacto", "fr": "Info et contact", "de": "Info & Kontakt", "pa": "ਜਾਣਕਾਰੀ ਅਤੇ ਸੰਪਰਕ"},
+    "contact": {"en": "Contact", "ur": "رابطہ", "hi": "संपर्क", "ar": "اتصال", "es": "Contacto", "fr": "Contact", "de": "Kontakt", "pa": "ਸੰਪਰਕ"},
+    "complaint": {"en": "Complaint", "ur": "شکایت", "hi": "शिकायत", "ar": "شكوى", "es": "Queja", "fr": "Réclamation", "de": "Beschwerde", "pa": "ਸ਼ਿਕਾਇਤ"},
+}
+
+
+def get_lead_type_label(text_or_value: str, lang_code: str) -> str:
+    """Return localized label from fallback map; used when lead type has no labels in DB. Returns original if no translation."""
+    if not text_or_value:
+        return ""
+    key = str(text_or_value).strip().lower()
+    table = LEAD_TYPE_LABELS.get(key, {})
+    return table.get((lang_code or "en").lower(), text_or_value)
 
 
 def get_string(key: str, lang_code: str, *args: Any) -> str:
