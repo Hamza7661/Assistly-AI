@@ -1054,7 +1054,11 @@ async def whatsapp_webhook(request: Request):
         session_id, is_new_session = get_or_create_session(user_phone)
         
         if is_new_session:
-            # First message from this user - fetch context and initialize
+            # First message from this user (or session expired) - fetch context and initialize
+            logger.info(
+                "WhatsApp: new session for twilio_phone=%s user_phone=%s, fetching context from backend",
+                twilio_phone, user_phone,
+            )
             try:
                 context = await context_service.fetch_user_context_by_twilio(twilio_phone)
             except Exception as exc:
@@ -1066,6 +1070,11 @@ async def whatsapp_webhook(request: Request):
             user_id = user_data.get("id")
             app_data = context.get("app", {})
             app_id = app_data.get("id") if app_data else None
+            app_name = (app_data.get("name") or "") if app_data else ""
+            logger.info(
+                "WhatsApp: context from backend for number %s -> app_id=%s app_name=%s (lead types will be for this app)",
+                twilio_phone, app_id, app_name,
+            )
             
             if not user_id:
                 logger.error(f"WhatsApp: No user_id found in context for Twilio number {twilio_phone}")
