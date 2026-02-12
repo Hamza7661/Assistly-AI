@@ -484,13 +484,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Build RAG vector store
     rag_service.build_vector_store(context)
     
-    # Send initial greeting (workflows are now handled after service plan selection)
-    initial_reply = await response_generator.generate_greeting(context, channel="web")
-    # Transition to lead type selection after greeting
+    # Don't send greeting on connect; send it on first user message so we can detect language and greet in that language
     flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
-    
-    conversation_history.append({"role": "assistant", "content": initial_reply})
-    await websocket.send_json({"type": "bot", "content": initial_reply})
 
     try:
         while True:
@@ -506,9 +501,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
 
-            # Add user message to history
-            conversation_history.append({"role": "user", "content": user_text})
-            
+            # First message: send greeting in detected language, then process the message
+            first_message_handled = False
+            if not conversation_history:
+                initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=user_text)
+                conversation_history.append({"role": "user", "content": user_text})
+                conversation_history.append({"role": "assistant", "content": initial_reply})
+                await websocket.send_json({"type": "bot", "content": initial_reply})
+                first_message_handled = True
+
+            # Add user message to history (already added if we just sent greeting)
+            if not first_message_handled:
+                conversation_history.append({"role": "user", "content": user_text})
+
             # Detect response language from current message so bot replies in same language
             lang_code = detect_language(str(user_text))
             response_generator.set_response_language(get_language_name_for_prompt(lang_code))
@@ -1109,8 +1114,12 @@ async def whatsapp_webhook(request: Request):
             # Build RAG vector store
             rag_service.build_vector_store(context)
             
-            # Generate initial greeting
-            initial_reply = await response_generator.generate_greeting(context, channel="whatsapp")
+            # First message from user (e.g. "السلام علیکم") – detect language and greet in that language
+            first_message = (message_data.get("body") or "").strip()
+            initial_reply = await response_generator.generate_greeting(
+                context, channel="whatsapp", first_message=first_message or None
+            )
+            whatsapp_sessions[session_id]["history"].append({"role": "user", "content": first_message or "(started)"})
             whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
             whatsapp_sessions[session_id]["flow_controller"] = flow_controller
             whatsapp_sessions[session_id]["response_generator"] = response_generator

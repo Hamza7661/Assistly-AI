@@ -456,6 +456,15 @@ Classify the intent:"""
                         logger.info(f"Matched lead type by number #{num}: {lead_type.get('text')} (value: {lead_type.get('value')})")
             if not lead_type:
                 lead_type = extractor.match_lead_type(user_message, lead_types_list)
+            # If no match (e.g. user wrote in Urdu/other language), translate to English and retry
+            if not lead_type and self.client and self.model and user_message.strip():
+                from ..utils.translation_utils import translate_to_english
+                try:
+                    translated = await translate_to_english(self.client, self.model, user_message)
+                    if translated and translated.strip().lower() != user_message.strip().lower():
+                        lead_type = extractor.match_lead_type(translated.strip(), lead_types_list)
+                except Exception as e:
+                    logger.debug("Translate-to-English for lead type match failed: %s", e)
             if lead_type:
                 logger.info(f"Matched lead type: {lead_type.get('text')} (value: {lead_type.get('value')})")
                 flow_controller.update_collected_data("leadType", lead_type.get("value"))
@@ -903,14 +912,19 @@ CRITICAL RULES:
                 return "Which service are you interested in?"
         else:
             # Format services as buttons for text channels (web and WhatsApp)
-            services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
-            
-            # For web and WhatsApp, always return service buttons immediately
-            # No need for LLM - just show the services directly
+            display_services = list(all_services) if all_services else []
+            if self.response_language and display_services and self.client and self.model:
+                from ..utils.translation_utils import translate_batch
+                try:
+                    display_services = await translate_batch(
+                        self.client, self.model, display_services, self.response_language
+                    )
+                except Exception as e:
+                    logger.warning("Service names translation failed: %s", e)
+            services_text = " ".join([f"<button>{s}</button>" for s in display_services if s])
             if services_text:
                 return f"Which service are you interested in? {services_text}"
-            else:
-                return "Which service are you interested in?"
+            return "Which service are you interested in?"
     
     async def _generate_data_collected_with_question_response(
         self,
@@ -1111,6 +1125,21 @@ If the context doesn't contain the answer, say "I don't have that information, b
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT show previous options - continue with phone collection.""",
         }
+
+        # For LEAD_TYPE_SELECTION (text channels): inject exact options from context so we never show a different list
+        lead_types = context.get("lead_types", [])
+        if state == ConversationState.LEAD_TYPE_SELECTION and self.channel != "voice" and lead_types:
+            numbered = "\n".join([f"{i}. {lt.get('text', '')}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
+            state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant.
+
+CRITICAL - SERVICE OPTIONS (use ONLY this list from context; never invent or substitute another list):
+{numbered}
+
+RULES:
+1. When the user asks for any option in their own language or words, they mean one of OUR options above. Always show the EXACT list above—do NOT replace it with a different list (e.g. do NOT show product categories, menu items, or other lists that are not these options).
+2. You MUST respond with EXACTLY the options above in this order (you may translate the labels to the user's language). Do NOT add, remove, or replace with other options.
+3. If user asks a question, answer briefly (1-2 sentences) using context, then show the EXACT list above and ask them to choose by number.
+4. DO NOT ask for date/time. Wait for lead type selection first."""
 
         if self.channel == "voice":
             lead_types = context.get("lead_types", [])
@@ -1321,26 +1350,66 @@ Make it professional and informative."""
         
         return f"{customer_name} requested {lead_type} for {service_type}."
     
-    async def generate_greeting(self, context: Dict[str, Any], channel: Optional[str] = None) -> str:
-        """Generate initial greeting"""
+    async def generate_greeting(
+        self,
+        context: Dict[str, Any],
+        channel: Optional[str] = None,
+        first_message: Optional[str] = None,
+    ) -> str:
+        """Generate initial greeting. If first_message is provided, detect its language and greet in that language with options in sync."""
         from ..utils.greeting_utils import get_greeting_with_fallback
-        
+        from ..utils.language_utils import detect_language, get_language_name_for_prompt, get_language_name
+        from ..utils.response_strings import get_string
+        from ..utils.translation_utils import translate_batch
+
         current_channel = (channel or self.channel or "web").lower()
-        
-        # Get greeting from integration settings with placeholder replacement
-        greeting = get_greeting_with_fallback(context)
-        
+        lang_code = "en"
+        if first_message and str(first_message).strip():
+            lang_code = detect_language(str(first_message))
+            self.set_response_language(get_language_name_for_prompt(lang_code))
+
+        # Get greeting in detected language (or English)
+        greeting = get_greeting_with_fallback(context, lang_code=lang_code if lang_code != "en" else None)
+        if not greeting:
+            greeting = get_greeting_with_fallback(context)
+
         lead_types = context.get("lead_types", [])
+        need_translation = lang_code and lang_code != "en"
+        translated_options: List[str] = []
+
+        if need_translation and lead_types:
+            # Prefer DB labels; for any without a label, collect text and translate in one batch
+            use_labels = all(
+                isinstance(lt, dict) and isinstance(lt.get("labels"), dict) and (lang_code or "") in (lt.get("labels") or {})
+                for lt in lead_types if isinstance(lt, dict)
+            )
+            if not use_labels:
+                to_translate = [str(lt.get("text", "") or lt.get("value", "")).strip() for lt in lead_types if isinstance(lt, dict)]
+                if to_translate:
+                    translated_options = await translate_batch(
+                        self.client, self.model, to_translate, get_language_name(lang_code)
+                    )
+
+        def option_text(lt: dict, index: int = 0) -> str:
+            text = lt.get("text", "") or lt.get("value", "")
+            if not need_translation:
+                return str(text)
+            labels = lt.get("labels") or {}
+            if isinstance(labels, dict) and labels.get(lang_code):
+                return labels[lang_code]
+            if translated_options and 0 <= index < len(translated_options):
+                return translated_options[index]
+            return str(text)
 
         if current_channel == "whatsapp":
-            # Numbered list for WhatsApp
-            options = "\n".join([f"{i}. {lt.get('text', '')}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
-            return f"{greeting}\n\n{options}\n\nPlease reply with the number of your choice."
+            options = "\n".join([f"{i}. {option_text(lt, i - 1)}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
+            reply_line = get_string("please_reply_number", lang_code) if lang_code else "Please reply with the number of your choice."
+            return f"{greeting}\n\n{options}\n\n{reply_line}"
         elif current_channel == "voice":
             option_names = []
-            for lt in lead_types:
+            for idx, lt in enumerate(lead_types):
                 if isinstance(lt, dict):
-                    option_names.append(self._normalize_lead_option_for_voice(lt.get("text", "")))
+                    option_names.append(self._normalize_lead_option_for_voice(option_text(lt, idx)))
                 else:
                     option_names.append(self._normalize_lead_option_for_voice(str(lt)))
             options_text = self._format_voice_list(option_names)
@@ -1348,7 +1417,6 @@ Make it professional and informative."""
                 return f"{greeting}\n\nWould you like {options_text}?"
             return greeting
         else:
-            # Buttons for web
-            buttons = " ".join([f"<button>{lt.get('text', '')}</button>" for lt in lead_types if isinstance(lt, dict)])
+            buttons = " ".join([f"<button>{option_text(lt, idx)}</button>" for idx, lt in enumerate(lead_types) if isinstance(lt, dict)])
             return f"{greeting} {buttons}"
 

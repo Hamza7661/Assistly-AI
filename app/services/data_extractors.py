@@ -110,14 +110,66 @@ class DataExtractor:
         
         return None
     
+    # Optional fallback synonyms per value – only used when the app's lead type has no synonyms from DB.
+    # Key = normalized value; use for any industry. Apps can override/expand via integration synonyms.
+    LEAD_TYPE_SYNONYMS_FALLBACK: Dict[str, List[str]] = {
+        "order": ["order", "آرڈر", "ordre", "orden", "bestellung", "ordine", "pedido"],
+        "menu": ["menu", "مينو", "مینو", "mönü", "menü", "menú", "मेन्यू", "mónu", "meniu"],
+        "catering": ["catering", "کیٹرنگ", "restauration"],
+        "reservation": ["reservation", "رزرویشن", "reserva", "réservation", "reservierung", "आरक्षण"],
+        "allergies": ["allergies", "halal", "الرجی", "حلال", "एलर्जी"],
+        "halal": ["halal", "حلال", "हलाल"],
+        "info": ["info", "contact", "معلومات", "رابطہ", "जानकारी", "संपर्क", "info & contact"],
+        "contact": ["contact", "رابطہ", "संपर्क", "contacto", "kontakt"],
+        "complaint": ["complaint", "شکایت", "शिकायत", "queja", "beschwerde", "réclamation"],
+        "appointment": ["appointment", "ملاقات", "termin", "rendez-vous", "cita", "appuntamento", "अपॉइंटमेंट"],
+        "callback": ["callback", "کال بیک", "rückruf", "rappel", "devolución de llamada", "कॉलबैक"],
+        "information": ["information", "info", "معلومات", "जानकारी", "información", "information request"],
+    }
+
     @staticmethod
     def match_lead_type(user_input: str, lead_types: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Match user input to a lead type - prioritizes exact matches"""
+        """Match user input to a lead type. Uses per-app synonyms from DB first; fallback map only for current lead types."""
         if not user_input or not lead_types:
             return None
-        
+
         user_input_lower = user_input.lower().strip()
-        
+        user_stripped = user_input.strip()
+
+        # Pass 0: synonyms from database (per-app integration) – any industry, any lead type
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            db_synonyms = lt.get("synonyms")
+            if not isinstance(db_synonyms, list):
+                continue
+            for syn in db_synonyms:
+                if not syn:
+                    continue
+                s = str(syn).strip()
+                if user_stripped == s or user_input_lower == s.lower():
+                    logger.info(f"Matched lead type by DB synonym: '{user_stripped}' -> {lt.get('value')} / {lt.get('text')}")
+                    return lt
+                if user_stripped and s and (user_stripped in s or s in user_stripped):
+                    logger.info(f"Matched lead type by DB synonym: '{user_stripped}' -> {lt.get('value')}")
+                    return lt
+
+        # Pass 1: fallback map only for this app's lead type values (no hardcoding for other industries)
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            value = str(lt.get("value", "")).lower().strip()
+            text = str(lt.get("text", "")).lower().strip()
+            fallback = DataExtractor.LEAD_TYPE_SYNONYMS_FALLBACK.get(value) or DataExtractor.LEAD_TYPE_SYNONYMS_FALLBACK.get(text) or []
+            for syn in fallback:
+                syn_lower = syn.lower().strip()
+                if user_stripped == syn or user_input_lower == syn_lower:
+                    logger.info(f"Matched lead type by fallback synonym: user input -> {lt.get('value')} / {lt.get('text')}")
+                    return lt
+                if user_stripped and syn and (user_stripped in syn or syn in user_stripped):
+                    logger.info(f"Matched lead type by fallback synonym: '{user_stripped}' -> {lt.get('value')}")
+                    return lt
+
         # Common words to ignore in keyword matching (too generic)
         common_words = {'i', 'would', 'like', 'to', 'a', 'an', 'the', 'my', 'me', 'for', 'with', 'is', 'are', 'am'}
         
