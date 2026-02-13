@@ -518,8 +518,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Build RAG vector store
     rag_service.build_vector_store(context)
     
-    # Don't send greeting on connect; send it on first user message so we can detect language and greet in that language
     flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+
+    # Send greeting (from DB) + lead types as buttons as soon as widget opens; no first user message required
+    initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
+    conversation_history.append({"role": "assistant", "content": initial_reply})
+    await websocket.send_json({"type": "bot", "content": initial_reply})
 
     try:
         while True:
@@ -535,18 +539,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
 
-            # First message: send greeting in detected language, then process the message
-            first_message_handled = False
-            if not conversation_history:
-                initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=user_text)
-                conversation_history.append({"role": "user", "content": user_text})
-                conversation_history.append({"role": "assistant", "content": initial_reply})
-                await websocket.send_json({"type": "bot", "content": initial_reply})
-                first_message_handled = True
-
-            # Add user message to history (already added if we just sent greeting)
-            if not first_message_handled:
-                conversation_history.append({"role": "user", "content": user_text})
+            # Add user message to history and process (e.g. lead type button click → services/workflows)
+            conversation_history.append({"role": "user", "content": user_text})
 
             # Detect response language from current message so bot replies in same language
             lang_code = detect_language(str(user_text))
