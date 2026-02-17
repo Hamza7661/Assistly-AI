@@ -168,9 +168,10 @@ async def invalidate_whatsapp_sessions(
     (e.g. after switching which app 'uses this number'). Called by backend when setUsesTwilioNumber succeeds.
     Also clears cached translations for affected apps.
     """
-    # Only require the secret when AI has it set in .env. When unset, all requests are allowed (add secret in both .envs later for production).
-    if settings.invalidate_sessions_secret:
-        if x_invalidate_sessions_secret != settings.invalidate_sessions_secret:
+    # Use same signing secret as third-party API authentication (TP_SIGN_SECRET)
+    # Only require the secret when AI has it set in .env. When unset, all requests are allowed.
+    if settings.tp_sign_secret:
+        if x_invalidate_sessions_secret != settings.tp_sign_secret:
             raise HTTPException(status_code=401, detail="Invalid or missing secret")
     clean_phone = (body.twilio_phone or "").replace("whatsapp:", "").strip()
     if not clean_phone:
