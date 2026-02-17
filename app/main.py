@@ -140,6 +140,20 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/v1/cache/stats")
+async def get_cache_stats() -> Dict[str, Any]:
+    """Get cache statistics for monitoring performance."""
+    from app.utils.cache_utils import get_cache_stats
+    return {
+        "status": "ok",
+        "cache": get_cache_stats(),
+        "sessions": {
+            "active_whatsapp": len(whatsapp_sessions),
+            "phone_mappings": len(phone_to_session)
+        }
+    }
+
+
 class InvalidateSessionsBody(BaseModel):
     twilio_phone: str
 
@@ -152,6 +166,7 @@ async def invalidate_whatsapp_sessions(
     """
     Clear all WhatsApp sessions for a given Twilio number so the next message fetches fresh context
     (e.g. after switching which app 'uses this number'). Called by backend when setUsesTwilioNumber succeeds.
+    Also clears cached translations for affected apps.
     """
     # Only require the secret when AI has it set in .env. When unset, all requests are allowed (add secret in both .envs later for production).
     if settings.invalidate_sessions_secret:
@@ -160,15 +175,31 @@ async def invalidate_whatsapp_sessions(
     clean_phone = (body.twilio_phone or "").replace("whatsapp:", "").strip()
     if not clean_phone:
         raise HTTPException(status_code=400, detail="twilio_phone required")
+    
     removed = []
+    app_ids_to_invalidate = set()
+    
     for session_id, session in list(whatsapp_sessions.items()):
         session_phone = (session.get("twilio_phone") or "").replace("whatsapp:", "").strip()
         if session_phone == clean_phone:
+            # Track app_id for cache invalidation
+            app_id = session.get("app_id")
+            if app_id:
+                app_ids_to_invalidate.add(str(app_id))
+            
             phone = session.get("phone")
             if phone and phone_to_session.get(phone) == session_id:
                 del phone_to_session[phone]
             del whatsapp_sessions[session_id]
             removed.append(session_id)
+    
+    # Invalidate cached translations and greetings for affected apps
+    if app_ids_to_invalidate:
+        from app.utils.cache_utils import invalidate_app_cache
+        for app_id in app_ids_to_invalidate:
+            invalidate_app_cache(app_id)
+        logger.info("Invalidated cache for %d app(s): %s", len(app_ids_to_invalidate), app_ids_to_invalidate)
+    
     logger.info("Invalidated WhatsApp sessions for twilio_phone=%s, removed %d session(s)", clean_phone, len(removed))
     return {"status": "ok", "twilio_phone": clean_phone, "removed_sessions": len(removed)}
 
@@ -1148,14 +1179,21 @@ async def whatsapp_webhook(request: Request):
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
             
-            # Build RAG vector store
-            rag_service.build_vector_store(context)
-            
             # First message from user (e.g. "السلام علیکم") – detect language and greet in that language
             first_message = (message_data.get("body") or "").strip()
+            
+            # Measure greeting generation time for performance monitoring
+            greeting_start = time.time()
             initial_reply = await response_generator.generate_greeting(
                 context, channel="whatsapp", first_message=first_message or None
             )
+            greeting_duration = time.time() - greeting_start
+            logger.info(f"WhatsApp: Generated greeting in {greeting_duration:.3f}s for {user_phone}")
+            
+            # Build RAG vector store in background (non-blocking) to improve response time
+            # The vector store will be ready for subsequent FAQ/knowledge queries
+            import asyncio
+            asyncio.create_task(asyncio.to_thread(rag_service.build_vector_store, context))
             whatsapp_sessions[session_id]["history"].append({"role": "user", "content": first_message or "(started)"})
             whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
             whatsapp_sessions[session_id]["flow_controller"] = flow_controller
