@@ -41,9 +41,9 @@ class ResponseGenerator:
         self.profession = profession or self.profession
 
     def set_channel(self, channel: str):
-        """Set current channel (web, whatsapp, voice)"""
+        """Set current channel (web, whatsapp, messenger, voice)"""
         normalized = (channel or "web").lower()
-        if normalized not in {"web", "whatsapp", "voice"}:
+        if normalized not in {"web", "whatsapp", "messenger", "voice"}:
             normalized = "web"
         logger.info(f"ResponseGenerator channel set to {normalized}")
         self.channel = normalized
@@ -1401,7 +1401,7 @@ Make it professional and informative."""
                 return translated_options[index]
             return str(text)
 
-        if current_channel == "whatsapp":
+        if current_channel in ("whatsapp", "messenger", "instagram"):
             options = "\n".join([f"{i}. {option_text(lt, i - 1)}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
             reply_line = get_string("please_reply_number", lang_code) if lang_code else "Please reply with the number of your choice."
             return f"{greeting}\n\n{options}\n\n{reply_line}"

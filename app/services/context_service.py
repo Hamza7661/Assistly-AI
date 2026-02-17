@@ -164,6 +164,37 @@ class ContextService:
         normalized = self._normalize_context(data)
         return normalized
 
+    async def fetch_context_by_social_sender(self, sender_id: str) -> Dict[str, Any]:
+        """Fetch app context by social sender (Messenger Facebook Page ID or Instagram Sender ID). Same endpoint for both."""
+        path_for_sign = f"/api/v1/apps/by-social-sender/{sender_id}/context"
+        encoded = quote(sender_id, safe="")
+        url = f"{self.base_url}/api/v1/apps/by-social-sender/{encoded}/context"
+
+        ts = str(generate_ts_millis())
+        nonce = generate_nonce()
+        sign = build_signature_with_param(
+            self.secret,
+            ts,
+            nonce,
+            method="GET",
+            path=path_for_sign,
+            param_name="socialSenderId",
+            param_value=sender_id,
+        )
+        headers = {
+            "x-tp-ts": ts,
+            "x-tp-nonce": nonce,
+            "x-tp-sign": sign,
+            "accept": "application/json",
+        }
+        logger.info("Sending context API request for social sender=%s", sender_id)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        normalized = self._normalize_context(data)
+        return normalized
+
     def _normalize_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # Many backends wrap payload inside a top-level 'data' key
         src = data.get("data", data) if isinstance(data, dict) else {}

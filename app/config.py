@@ -27,6 +27,10 @@ class Settings(BaseModel):
     twilio_auth_token: Optional[str] = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_whatsapp_from: Optional[str] = Field(default=None, alias="TWILIO_WHATSAPP_FROM")
     whatsapp_webhook_token: Optional[str] = Field(default=None, alias="WHATSAPP_WEBHOOK_TOKEN")
+    
+    # Meta (Facebook/Instagram) configuration
+    meta_verify_token: Optional[str] = Field(default="assistly_instagram_verify_token", alias="META_VERIFY_TOKEN")
+    meta_graph_api_version: str = Field(default="v21.0", alias="META_GRAPH_API_VERSION")
 
     # Deepgram voice agent
     deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")

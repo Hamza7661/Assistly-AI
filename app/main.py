@@ -18,6 +18,8 @@ from .services.lead_service import LeadService
 from .services.email_validation_service import EmailValidationService
 from .services.phone_validation_service import PhoneValidationService
 from .services.whatsapp_service import WhatsAppService
+from .services.twilio_messaging_service import TwilioMessagingService, CHANNEL_MESSENGER, CHANNEL_INSTAGRAM
+from .services.instagram_graph_service import InstagramGraphService
 from .services.voice_agent_service import VoiceAgentService
 from .services.rag_service import RAGService
 from .services.conversation_state import FlowController, ConversationState
@@ -39,6 +41,56 @@ whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Mapping: phone number -> current active session_id
 phone_to_session: Dict[str, str] = {}
+
+# Messenger: session_id -> session data; (page_id, user_id) -> session_id
+messenger_sessions: Dict[str, Dict[str, Any]] = {}
+messenger_key_to_session: Dict[str, str] = {}
+
+def get_or_create_messenger_session(page_id: str, user_id: str) -> Tuple[str, bool]:
+    """Get or create session for Messenger. Returns (session_id, is_new)."""
+    key = f"messenger_{page_id}_{user_id}"
+    current_time = time.time()
+    if key in messenger_key_to_session:
+        session_id = messenger_key_to_session[key]
+        if session_id in messenger_sessions:
+            session = messenger_sessions[session_id]
+            if current_time - session.get("last_activity", 0) > SESSION_TIMEOUT:
+                del messenger_sessions[session_id]
+                del messenger_key_to_session[key]
+            else:
+                session["last_activity"] = current_time
+                return session_id, False
+        else:
+            del messenger_key_to_session[key]
+    session_id = secrets.token_urlsafe(16)
+    messenger_key_to_session[key] = session_id
+    logger.info("Created new Messenger session %s for page=%s user=%s", session_id, page_id, user_id)
+    return session_id, True
+
+# Instagram: session_id -> session data; (sender_id, user_id) -> session_id
+instagram_sessions: Dict[str, Dict[str, Any]] = {}
+instagram_key_to_session: Dict[str, str] = {}
+
+def get_or_create_instagram_session(sender_id: str, user_id: str) -> Tuple[str, bool]:
+    """Get or create session for Instagram. Returns (session_id, is_new)."""
+    key = f"instagram_{sender_id}_{user_id}"
+    current_time = time.time()
+    if key in instagram_key_to_session:
+        session_id = instagram_key_to_session[key]
+        if session_id in instagram_sessions:
+            session = instagram_sessions[session_id]
+            if current_time - session.get("last_activity", 0) > SESSION_TIMEOUT:
+                del instagram_sessions[session_id]
+                del instagram_key_to_session[key]
+            else:
+                session["last_activity"] = current_time
+                return session_id, False
+        else:
+            del instagram_key_to_session[key]
+    session_id = secrets.token_urlsafe(16)
+    instagram_key_to_session[key] = session_id
+    logger.info("Created new Instagram session %s for sender=%s user=%s", session_id, sender_id, user_id)
+    return session_id, True
 
 # Session timeout from environment variable (default: 5 minutes)
 SESSION_TIMEOUT = settings.session_timeout_seconds
@@ -1832,4 +1884,365 @@ async def whatsapp_webhook_verification(request: Request):
     """Handle WhatsApp webhook verification (GET request)"""
     # Twilio may send GET requests for webhook verification
     return {"status": "ok", "message": "WhatsApp webhook endpoint is active"}
+
+
+# ----- Messenger / Instagram (same flow as WhatsApp, context by Facebook Page ID) -----
+
+
+@app.post("/webhook/messenger")
+async def messenger_webhook(request: Request):
+    """Handle incoming Facebook Messenger and Instagram messages via Twilio. Same conversation flow as WhatsApp."""
+    try:
+        form_data = await request.form()
+        msg_svc = TwilioMessagingService(settings.twilio_account_sid or "", settings.twilio_auth_token or "")
+        message_data = TwilioMessagingService.parse_webhook_data(dict(form_data))
+        channel = message_data.get("channel")
+        if channel not in (CHANNEL_MESSENGER, CHANNEL_INSTAGRAM):
+            return Response(content=msg_svc.create_twiml_response("Unsupported channel"), media_type="text/xml", status_code=400)
+        sender_id = message_data["to"]
+        user_id = message_data["from"]
+        body = (message_data.get("body") or "").strip()
+        if not sender_id or not user_id:
+            return Response(content=msg_svc.create_twiml_response("Missing sender info"), media_type="text/xml", status_code=400)
+        context_service = ContextService(settings)
+        lead_service = LeadService(settings)
+        rag_service = RAGService(settings)
+        email_validation_service = EmailValidationService(settings)
+        from openai import AsyncOpenAI
+        openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        phone_validation_service = PhoneValidationService(settings, openai_client=openai_client, gpt_model=settings.gpt_model)
+        # One context endpoint for both Messenger and Instagram (by-social-sender)
+        fetch_context_fn = context_service.fetch_context_by_social_sender
+        if channel == CHANNEL_MESSENGER:
+            get_session_fn = get_or_create_messenger_session
+            sessions_store = messenger_sessions
+            key_to_session = messenger_key_to_session
+            session_key_prefix = "messenger_"
+            channel_send = CHANNEL_MESSENGER
+            channel_name = "messenger"
+        else:
+            get_session_fn = get_or_create_instagram_session
+            sessions_store = instagram_sessions
+            key_to_session = instagram_key_to_session
+            session_key_prefix = "instagram_"
+            channel_send = CHANNEL_INSTAGRAM
+            channel_name = "instagram"
+        session_id, is_new = get_session_fn(sender_id, user_id)
+        if is_new:
+            try:
+                context = await fetch_context_fn(sender_id)
+            except Exception as exc:
+                logger.exception("%s: failed to fetch context for sender_id=%s: %s", channel_name.capitalize(), sender_id, exc)
+                await msg_svc.send_message(channel_send, user_id, sender_id, "Sorry, I'm having trouble. Please try again later.")
+                return Response(content=msg_svc.create_twiml_response(""), media_type="text/xml")
+            user_data = context.get("user", {})
+            app_data = context.get("app", {})
+            app_id = app_data.get("id") if app_data else None
+            owner_id = str(user_data.get("id") or "")
+            if not owner_id:
+                await msg_svc.send_message(channel_send, user_id, sender_id, "Sorry, I couldn't identify your account.")
+                return Response(content=msg_svc.create_twiml_response(""), media_type="text/xml")
+            current_time = time.time()
+            sessions_store[session_id] = {
+                "user_id": user_id,
+                "sender_id": sender_id,
+                "history": [],
+                "email_state": {"email": None, "otp_sent": False, "otp_verified": False, "customer_name": None},
+                "phone_state": {"phone": None, "otp_sent": False, "otp_verified": True},
+                "context": context,
+                "user_id_owner": owner_id,
+                "app_id": app_id,
+                "created_at": current_time,
+                "last_activity": current_time,
+                "flow_controller": None,
+                "response_generator": None,
+            }
+            flow_controller = FlowController(context)
+            flow_controller.set_whatsapp(True)
+            flow_controller.update_collected_data("leadPhoneNumber", "")
+            flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+            response_generator = ResponseGenerator(settings, rag_service)
+            response_generator.set_profession(str(context.get("profession") or "Business"))
+            response_generator.set_channel(channel_name)
+            rag_service.build_vector_store(context)
+            sessions_store[session_id]["flow_controller"] = flow_controller
+            sessions_store[session_id]["response_generator"] = response_generator
+            first_message = body or "(started)"
+            initial_reply = await response_generator.generate_greeting(context, channel=channel_name, first_message=first_message or None)
+            sessions_store[session_id]["history"] = [{"role": "user", "content": first_message}, {"role": "assistant", "content": initial_reply}]
+            key_to_session[f"{session_key_prefix}{sender_id}_{user_id}"] = session_id
+            cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
+            if buttons:
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                await msg_svc.send_message(channel_send, user_id, sender_id, full_message)
+            else:
+                await msg_svc.send_message(channel_send, user_id, sender_id, initial_reply)
+            return Response(content=msg_svc.create_twiml_response(""), media_type="text/xml")
+        session = sessions_store.get(session_id)
+        if not session:
+            session_id_new, _ = get_session_fn(sender_id, user_id)
+            session = sessions_store.get(session_id_new)
+            if not session:
+                await msg_svc.send_message(channel_send, user_id, sender_id, "Session expired. Please start again.")
+                return Response(content=msg_svc.create_twiml_response(""), media_type="text/xml")
+            session_id = session_id_new
+        session["last_activity"] = time.time()
+        conversation_history = session["history"]
+        context = session["context"]
+        flow_controller = session.get("flow_controller")
+        response_generator = session.get("response_generator")
+        if not flow_controller or not response_generator:
+            flow_controller = FlowController(context)
+            flow_controller.set_whatsapp(True)
+            response_generator = ResponseGenerator(settings, rag_service)
+            response_generator.set_profession(str(context.get("profession") or "Business"))
+            response_generator.set_channel(channel_name)
+            session["flow_controller"] = flow_controller
+            session["response_generator"] = response_generator
+        user_text = body or message_data.get("button_id") or message_data.get("list_id") or ""
+        conversation_history.append({"role": "user", "content": user_text})
+        lang_code = detect_language(user_text)
+        session["response_language_code"] = lang_code
+        response_generator.set_response_language(get_language_name_for_prompt(lang_code))
+        reply = await response_generator.generate_response(flow_controller, user_text, conversation_history, context)
+        parsed_json = _maybe_parse_json(reply)
+        if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
+            if app_id := session.get("app_id"):
+                parsed_json["appId"] = app_id
+            try:
+                ok, _ = await lead_service.create_public_lead(session["user_id_owner"], parsed_json)
+                final_msg = get_string("final_success", lang_code) if ok else get_string("final_fallback", lang_code)
+            except Exception:
+                final_msg = get_string("final_fallback", lang_code)
+            integration = context.get("integration") or {}
+            if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                review_url = integration["googleReviewUrl"].strip()
+                await msg_svc.send_message(channel_send, user_id, sender_id, get_string("review_prompt", lang_code, review_url))
+            await msg_svc.send_message(channel_send, user_id, sender_id, final_msg)
+            key = f"{session_key_prefix}{sender_id}_{user_id}"
+            if key in key_to_session and key_to_session[key] == session_id:
+                del key_to_session[key]
+            if session_id in sessions_store:
+                del sessions_store[session_id]
+            return Response(content=msg_svc.create_twiml_response(""), media_type="text/xml")
+        cleaned_reply, buttons = _extract_buttons_from_response(reply)
+        if buttons:
+            button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+            full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+            await msg_svc.send_message(channel_send, user_id, sender_id, full_message)
+        else:
+            await msg_svc.send_message(channel_send, user_id, sender_id, cleaned_reply)
+        conversation_history.append({"role": "assistant", "content": cleaned_reply})
+        session["history"] = conversation_history
+        return Response(content=msg_svc.create_twiml_response(""), media_type="text/xml")
+    except Exception as e:
+        logger.exception("Error processing Messenger/Instagram webhook: %s", str(e))
+        msg_svc = TwilioMessagingService(settings.twilio_account_sid or "", settings.twilio_auth_token or "")
+        return Response(content=msg_svc.create_twiml_response("Sorry, something went wrong. Please try again."), media_type="text/xml")
+
+
+@app.get("/webhook/instagram")
+async def instagram_webhook_verification(request: Request):
+    """Instagram webhook verification (GET) - required by Meta."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    
+    # Verify token (should match your configured verify token in Meta App Dashboard)
+    verify_token = settings.meta_verify_token or "assistly_instagram_verify_token"
+    
+    if mode == "subscribe" and token == verify_token:
+        logger.info("Instagram webhook verified successfully")
+        return Response(content=challenge, media_type="text/plain")
+    else:
+        logger.warning(f"Instagram webhook verification failed. mode={mode}, token={token}")
+        return Response(content="Forbidden", status_code=403)
+
+
+@app.post("/webhook/instagram")
+async def instagram_webhook(request: Request):
+    """Handle incoming Instagram messages via Meta Graph API (not Twilio). Same conversation flow as WhatsApp."""
+    try:
+        body = await request.json()
+        logger.info(f"Instagram webhook received: {json.dumps(body)[:200]}")
+        
+        # Parse the Meta webhook event
+        parsed = InstagramGraphService.parse_webhook_event(body)
+        if not parsed:
+            logger.warning("Could not parse Instagram webhook event")
+            return {"status": "ok"}
+        
+        sender_id = parsed["sender_id"]  # IGSID (Instagram-scoped sender ID)
+        recipient_id = parsed["recipient_id"]  # Instagram Business Account ID
+        message_text = parsed["message_text"]
+        
+        if not sender_id or not recipient_id or not message_text:
+            logger.warning("Missing required fields in Instagram webhook")
+            return {"status": "ok"}
+        
+        # Initialize services
+        context_service = ContextService(settings)
+        lead_service = LeadService(settings)
+        rag_service = RAGService(settings)
+        email_validation_service = EmailValidationService(settings)
+        from openai import AsyncOpenAI
+        openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        phone_validation_service = PhoneValidationService(settings, openai_client=openai_client, gpt_model=settings.gpt_model)
+        instagram_service = InstagramGraphService()
+        
+        # Get or create session for this Instagram user
+        session_id, is_new = get_or_create_instagram_session(recipient_id, sender_id)
+        
+        if is_new:
+            # Fetch app context by Instagram Business Account ID
+            try:
+                context = await context_service.fetch_context_by_social_sender(recipient_id)
+            except Exception as exc:
+                logger.exception(f"Instagram: failed to fetch context for business_account_id={recipient_id}: {exc}")
+                # Get access token from context if available, otherwise can't send error message
+                return {"status": "error", "message": "Failed to fetch context"}
+            
+            user_data = context.get("user", {})
+            app_data = context.get("app", {})
+            app_id = app_data.get("id") if app_data else None
+            owner_id = str(user_data.get("id") or "")
+            instagram_access_token = context.get("instagramAccessToken")
+            
+            if not owner_id:
+                logger.error(f"Instagram: no owner_id in context for business_account_id={recipient_id}")
+                return {"status": "error", "message": "No owner found"}
+            
+            if not instagram_access_token:
+                logger.error(f"Instagram: no access token in context for business_account_id={recipient_id}")
+                return {"status": "error", "message": "No Instagram access token configured"}
+            
+            current_time = time.time()
+            instagram_sessions[session_id] = {
+                "user_id": sender_id,  # IGSID
+                "recipient_id": recipient_id,  # IG Business Account ID
+                "history": [],
+                "email_state": {"email": None, "otp_sent": False, "otp_verified": False, "customer_name": None},
+                "phone_state": {"phone": None, "otp_sent": False, "otp_verified": True},
+                "context": context,
+                "user_id_owner": owner_id,
+                "app_id": app_id,
+                "created_at": current_time,
+                "last_activity": current_time,
+                "flow_controller": None,
+                "response_generator": None,
+                "instagram_access_token": instagram_access_token,
+            }
+            
+            # Initialize flow controller and response generator
+            flow_controller = FlowController(context)
+            flow_controller.set_whatsapp(True)
+            flow_controller.update_collected_data("leadPhoneNumber", "")
+            flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+            
+            response_generator = ResponseGenerator(settings, rag_service)
+            response_generator.set_profession(str(context.get("profession") or "Business"))
+            response_generator.set_channel("instagram")
+            rag_service.build_vector_store(context)
+            
+            instagram_sessions[session_id]["flow_controller"] = flow_controller
+            instagram_sessions[session_id]["response_generator"] = response_generator
+            
+            first_message = message_text or "(started)"
+            initial_reply = await response_generator.generate_greeting(context, channel="instagram", first_message=first_message or None)
+            instagram_sessions[session_id]["history"] = [
+                {"role": "user", "content": first_message},
+                {"role": "assistant", "content": initial_reply}
+            ]
+            
+            instagram_key_to_session[f"instagram_{recipient_id}_{sender_id}"] = session_id
+            
+            # Send reply via Meta Graph API
+            cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
+            if buttons:
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+            else:
+                await instagram_service.send_message(sender_id, initial_reply, instagram_access_token)
+            
+            return {"status": "ok"}
+        
+        # Existing session - process message
+        session = instagram_sessions.get(session_id)
+        if not session:
+            session_id_new, _ = get_or_create_instagram_session(recipient_id, sender_id)
+            session = instagram_sessions.get(session_id_new)
+            if not session:
+                logger.error(f"Instagram: session expired for sender={sender_id}")
+                return {"status": "ok"}
+            session_id = session_id_new
+        
+        session["last_activity"] = time.time()
+        conversation_history = session["history"]
+        context = session["context"]
+        email_state = session["email_state"]
+        phone_state = session["phone_state"]
+        flow_controller = session.get("flow_controller")
+        response_generator = session.get("response_generator")
+        owner_id = session["user_id_owner"]
+        app_id = session.get("app_id")
+        instagram_access_token = session.get("instagram_access_token")
+        
+        if not flow_controller or not response_generator:
+            logger.error("Instagram: flow_controller or response_generator not initialized")
+            return {"status": "error"}
+        
+        # Add user message to history
+        conversation_history.append({"role": "user", "content": message_text})
+        
+        # Process message through the same flow as other channels
+        try:
+            reply_text = await _process_user_message(
+                message_text,
+                conversation_history,
+                flow_controller,
+                response_generator,
+                email_state,
+                phone_state,
+                context,
+                email_validation_service,
+                phone_validation_service,
+                lead_service,
+                rag_service,
+                owner_id,
+                app_id,
+                channel="instagram"
+            )
+            
+            conversation_history.append({"role": "assistant", "content": reply_text})
+            
+            # Send reply via Meta Graph API
+            cleaned_reply, buttons = _extract_buttons_from_response(reply_text)
+            if buttons:
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+            else:
+                await instagram_service.send_message(sender_id, reply_text, instagram_access_token)
+            
+        except Exception as e:
+            logger.exception(f"Instagram: error processing message: {e}")
+            await instagram_service.send_message(
+                sender_id,
+                "Sorry, I encountered an error. Please try again.",
+                instagram_access_token
+            )
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.exception(f"Instagram webhook error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/webhook/messenger")
+async def messenger_webhook_verification(request: Request):
+    """Messenger webhook verification (GET)."""
+    return {"status": "ok", "message": "Messenger webhook endpoint is active"}
 
