@@ -915,9 +915,12 @@ CRITICAL RULES:
             display_services = list(all_services) if all_services else []
             if self.response_language and display_services and self.client and self.model:
                 from ..utils.translation_utils import translate_batch
+                # Extract app_id for caching translations per app
+                app_data = context.get("app", {})
+                app_id = str(app_data.get("id")) if app_data and app_data.get("id") else None
                 try:
                     display_services = await translate_batch(
-                        self.client, self.model, display_services, self.response_language
+                        self.client, self.model, display_services, self.response_language, app_id
                     )
                 except Exception as e:
                     logger.warning("Service names translation failed: %s", e)
@@ -1377,6 +1380,10 @@ Make it professional and informative."""
         need_translation = lang_code and lang_code != "en"
         translated_options: List[str] = []
 
+        # Extract app_id for caching translations per app
+        app_data = context.get("app", {})
+        app_id = str(app_data.get("id")) if app_data and app_data.get("id") else None
+
         if need_translation and lead_types:
             # Prefer DB labels; for any without a label, collect text and translate in one batch
             use_labels = all(
@@ -1386,8 +1393,9 @@ Make it professional and informative."""
             if not use_labels:
                 to_translate = [str(lt.get("text", "") or lt.get("value", "")).strip() for lt in lead_types if isinstance(lt, dict)]
                 if to_translate:
+                    # Pass app_id for caching translations per app
                     translated_options = await translate_batch(
-                        self.client, self.model, to_translate, get_language_name(lang_code)
+                        self.client, self.model, to_translate, get_language_name(lang_code), app_id
                     )
 
         def option_text(lt: dict, index: int = 0) -> str:
