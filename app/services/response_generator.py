@@ -471,20 +471,112 @@ Classify the intent:"""
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
                 
-                # Check if user asked a question along with lead type selection
-                if has_question:
-                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_data_collected_with_question_response(
-                        "lead type", lead_type.get("text"), rag_context, 
-                        "service selection", conversation_history, context,
-                        collected_lead_type=lead_type.get("value")
-                    )
+                # Check if there's only one service for this lead type - if so, auto-select it
+                treatment_plans = context.get("treatment_plans", [])
+                lead_types = context.get("lead_types", [])
+                filtered_services = self._filter_services_by_lead_type(treatment_plans, lead_types, lead_type.get("value"))
+                
+                if filtered_services is not None:
+                    all_services = filtered_services
                 else:
-                    # Explicitly include services (filtered by lead type when configured)
-                    return await self._generate_service_selection_response(
-                        conversation_history, context,
-                        collected_lead_type=lead_type.get("value")
-                    )
+                    all_services = []
+                    for plan in treatment_plans:
+                        if isinstance(plan, dict):
+                            plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                            if plan_name:
+                                all_services.append(plan_name)
+                        else:
+                            all_services.append(str(plan))
+                
+                # If only one service exists, auto-select it and skip service selection
+                if len(all_services) == 1:
+                    single_service = all_services[0]
+                    logger.info(f"Only one service available for lead type '{lead_type.get('value')}': '{single_service}' - auto-selecting")
+                    flow_controller.update_collected_data("serviceType", single_service)
+                    
+                    # Check for workflows
+                    if flow_controller.workflow_manager is None:
+                        flow_controller.workflow_manager = WorkflowManager(context)
+                    workflow_manager = flow_controller.workflow_manager
+                    
+                    workflow_started = False
+                    if workflow_manager.start_workflow_for_treatment_plan(single_service):
+                        # Start workflow questions
+                        flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+                        workflow_started = True
+                        logger.info(f"✓ Started workflow for auto-selected service '{single_service}' - transitioning to WORKFLOW_QUESTION state")
+                        current_question = workflow_manager.get_current_question()
+                        if current_question:
+                            question_text = current_question.get("question", "")
+                            logger.info(f"✓ First workflow question: '{question_text}'")
+                            # If user asked a question, answer it briefly then ask workflow question
+                            if has_question:
+                                try:
+                                    rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
+                                    if rag_context and self.client:
+                                        brief_system = f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."
+                                        if self._language_instruction():
+                                            brief_system += "\n\n" + self._language_instruction()
+                                        response = await self.client.chat.completions.create(
+                                            model=self.model,
+                                            messages=[
+                                                {"role": "system", "content": brief_system},
+                                                {"role": "user", "content": f"Context: {rag_context}\n\nQuestion: {user_message}"}
+                                            ],
+                                            max_tokens=100,
+                                            temperature=0.3
+                                        )
+                                        brief_answer = (response.choices[0].message.content or "").strip()
+                                        if brief_answer:
+                                            logger.info(f"✓ Answering question then asking workflow question")
+                                            return f"{brief_answer} Now, {question_text}"
+                                except Exception as e:
+                                    logger.warning(f"Failed to generate brief answer for question: {e}")
+                            logger.info(f"✓ Returning workflow question (no user question to answer first)")
+                            return question_text
+                        else:
+                            logger.warning(f"Workflow started but no questions found - continuing to name collection")
+                            workflow_manager.reset()
+                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    else:
+                        logger.info(f"No workflow found for auto-selected service '{single_service}' - continuing to name collection")
+                        workflow_manager.reset()
+                    
+                    # If workflow was NOT started, continue to name collection
+                    if not workflow_started:
+                        logger.info(f"No workflow started - transitioning to name collection")
+                        workflow_manager.reset()
+                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    
+                    logger.info(f"Transitioned to state: {flow_controller.state.value}")
+                    
+                    # Check if user asked a question (only if no workflow)
+                    if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+                        rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
+                        return await self._generate_data_collected_with_question_response(
+                            "service", single_service, rag_context,
+                            "name", conversation_history, context
+                        )
+                    elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+                        # Just acknowledge and move to name collection
+                        return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                else:
+                    # Multiple services - show selection as before
+                    logger.info(f"Multiple services available ({len(all_services)}) - showing service selection")
+                    # Check if user asked a question along with lead type selection
+                    if has_question:
+                        rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                        return await self._generate_data_collected_with_question_response(
+                            "lead type", lead_type.get("text"), rag_context, 
+                            "service selection", conversation_history, context,
+                            collected_lead_type=lead_type.get("value")
+                        )
+                    else:
+                        # Explicitly include services (filtered by lead type when configured)
+                        return await self._generate_service_selection_response(
+                            conversation_history, context,
+                            collected_lead_type=lead_type.get("value")
+                        )
             else:
                 logger.warning(f"No lead type matched for user input: '{user_message}'. Available lead types: {[lt.get('text') for lt in context.get('lead_types', [])]}")
                 # No match found - use AI to handle questions, but with strict prompt to only show lead types
