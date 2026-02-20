@@ -22,6 +22,8 @@ class ResponseGenerator:
         self.profession = "Business"  # Default fallback - will be overridden by app's industry
         self.channel: str = "web"
         self.response_language: Optional[str] = None  # e.g. "Spanish" for prompts; None/English = no instruction
+        # Backend API base for generating attachment download URLs
+        self.api_base_url: str = getattr(settings, "api_base_url", "").rstrip("/") + "/api/v1"
 
     def set_response_language(self, language_name: Optional[str]) -> None:
         """Set language for all user-facing replies (e.g. 'Spanish'). None or 'English' = keep default."""
@@ -357,7 +359,9 @@ Classify the intent:"""
         
         # Initialize or reuse workflow manager
         if flow_controller.workflow_manager is None:
-            flow_controller.workflow_manager = WorkflowManager(context)
+            wm_context = dict(context)
+            wm_context["api_base_url"] = self.api_base_url
+            flow_controller.workflow_manager = WorkflowManager(wm_context)
         workflow_manager = flow_controller.workflow_manager
         
         # Extract data from user message (only extract what we need based on state)
@@ -496,7 +500,9 @@ Classify the intent:"""
                     
                     # Check for workflows
                     if flow_controller.workflow_manager is None:
-                        flow_controller.workflow_manager = WorkflowManager(context)
+                        wm_context2 = dict(context)
+                        wm_context2["api_base_url"] = self.api_base_url
+                        flow_controller.workflow_manager = WorkflowManager(wm_context2)
                     workflow_manager = flow_controller.workflow_manager
                     
                     workflow_started = False
@@ -507,8 +513,8 @@ Classify the intent:"""
                         logger.info(f"✓ Started workflow for auto-selected service '{single_service}' - transitioning to WORKFLOW_QUESTION state")
                         current_question = workflow_manager.get_current_question()
                         if current_question:
-                            question_text = current_question.get("question", "")
-                            logger.info(f"✓ First workflow question: '{question_text}'")
+                            question_text = workflow_manager.format_question_with_options(current_question)
+                            logger.info(f"✓ First workflow question: '{current_question.get('question', '')}'")
                             # If user asked a question, answer it briefly then ask workflow question
                             if has_question:
                                 try:
@@ -529,7 +535,7 @@ Classify the intent:"""
                                         brief_answer = (response.choices[0].message.content or "").strip()
                                         if brief_answer:
                                             logger.info(f"✓ Answering question then asking workflow question")
-                                            return f"{brief_answer} Now, {question_text}"
+                                            return f"{brief_answer}\n\n{question_text}"
                                 except Exception as e:
                                     logger.warning(f"Failed to generate brief answer for question: {e}")
                             logger.info(f"✓ Returning workflow question (no user question to answer first)")
@@ -654,15 +660,13 @@ Classify the intent:"""
                         logger.info(f"✓ Started workflow for treatment plan '{matched_treatment_plan_name}' - transitioning to WORKFLOW_QUESTION state")
                         current_question = workflow_manager.get_current_question()
                         if current_question:
-                            question_text = current_question.get("question", "")
-                            logger.info(f"✓ First workflow question: '{question_text}'")
+                            question_text = workflow_manager.format_question_with_options(current_question)
+                            logger.info(f"✓ First workflow question: '{current_question.get('question', '')}'")
                             # If user asked a question, answer it briefly then ask workflow question
                             if has_question:
-                                # Get a brief answer to the question using RAG
                                 try:
                                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                                     if rag_context and self.client:
-                                        # Generate a brief answer (1-2 sentences)
                                         brief_system = f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."
                                         if self._language_instruction():
                                             brief_system += "\n\n" + self._language_instruction()
@@ -678,10 +682,9 @@ Classify the intent:"""
                                         brief_answer = (response.choices[0].message.content or "").strip()
                                         if brief_answer:
                                             logger.info(f"✓ Answering question then asking workflow question")
-                                            return f"{brief_answer} Now, {question_text}"
+                                            return f"{brief_answer}\n\n{question_text}"
                                 except Exception as e:
                                     logger.warning(f"Failed to generate brief answer for question: {e}")
-                                    # If answer generation fails, just ask workflow question
                             logger.info(f"✓ Returning workflow question (no user question to answer first)")
                             return question_text
                         else:
@@ -731,56 +734,44 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                # No RAG needed for standard name collection prompt
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             
             # Check if user is asking a question instead of answering the workflow question
             if has_question:
-                # User asked a question - answer it first, then re-ask the workflow question
                 logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
                 rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                current_question_text = current_question.get("question", "")
+                current_question_formatted = workflow_manager.format_question_with_options(current_question)
                 
-                # Generate answer to the question
                 if rag_context and self.client:
                     try:
                         answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
-                        # Return answer + re-ask workflow question
-                        return f"{answer} Now, {current_question_text}"
+                        return f"{answer}\n\n{current_question_formatted}"
                     except Exception as e:
                         logger.warning(f"Failed to generate answer for question: {e}")
-                        # Fallback: just re-ask workflow question
-                        return current_question_text
+                        return current_question_formatted
                 else:
-                    # No RAG context available, just re-ask workflow question
-                    return current_question_text
+                    return current_question_formatted
             
             # Not a question - treat as workflow answer
-            # Record answer and move to next question
             has_more = workflow_manager.record_answer(user_message)
             
             if has_more:
-                # More questions remain, ask next question
                 next_question = workflow_manager.get_current_question()
                 if next_question:
-                    return next_question.get("question", "")
+                    return workflow_manager.format_question_with_options(next_question)
                 else:
-                    # No more questions, complete workflow
                     workflow_answers = workflow_manager.get_workflow_answers()
                     flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                     workflow_manager.reset()
                     flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                    # No RAG needed for standard name collection prompt
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
-                # Last question answered, complete workflow
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                 workflow_manager.reset()
                 flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                # No RAG needed for standard name collection prompt
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
         
         if state == ConversationState.NAME_COLLECTION:
