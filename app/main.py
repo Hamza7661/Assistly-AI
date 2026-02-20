@@ -564,7 +564,53 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 parsed = json.loads(data)
                 user_text = parsed.get("content") or parsed.get("text") or data
             except json.JSONDecodeError:
+                parsed = {}
                 user_text = data
+
+            # ── Handle file_upload messages from the chat widget ──────────────
+            if isinstance(parsed, dict) and parsed.get("type") == "file_upload":
+                filename = parsed.get("filename", "file")
+                download_url = parsed.get("downloadUrl", "")
+                content_type = parsed.get("contentType", "")
+
+                # Acknowledge the file upload and encourage the workflow to continue
+                file_ack_msg = (
+                    f"📎 Thank you for uploading **{filename}**. "
+                    f"Our team will review it."
+                )
+                if download_url:
+                    file_ack_msg += (
+                        f'\n<file url="{download_url}" name="{filename}">View / Download {filename}</file>'
+                    )
+
+                # Record in conversation history
+                conversation_history.append({"role": "user", "content": f"[File uploaded: {filename}]"})
+                conversation_history.append({"role": "assistant", "content": file_ack_msg})
+
+                await websocket.send_json({"type": "bot", "content": file_ack_msg})
+
+                # If in workflow, record a placeholder answer so we advance to the next question
+                wm = flow_controller.workflow_manager
+                if wm and wm.is_active and not wm.is_workflow_complete():
+                    has_more = wm.record_answer(f"[File: {filename}]")
+                    if has_more:
+                        next_q = wm.get_current_question()
+                        if next_q:
+                            next_text = wm.format_question_with_options(next_q)
+                            conversation_history.append({"role": "assistant", "content": next_text})
+                            await websocket.send_json({"type": "bot", "content": next_text})
+                    else:
+                        # Workflow done – move state forward
+                        from app.services.conversation_state import ConversationState
+                        flow_controller.collected_data["workflowAnswers"] = wm.get_workflow_answers()
+                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        next_reply = await response_generator.generate_response(
+                            flow_controller, "[File uploaded]", conversation_history, context
+                        )
+                        conversation_history.append({"role": "assistant", "content": next_reply})
+                        await websocket.send_json({"type": "bot", "content": next_reply})
+                continue
+            # ─────────────────────────────────────────────────────────────────
 
             if not user_text or not str(user_text).strip():
                 continue
