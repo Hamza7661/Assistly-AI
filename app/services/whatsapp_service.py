@@ -20,16 +20,28 @@ def _sanitize_for_whatsapp(text: str) -> str:
         → Text  (buttons should already be rendered as numbered lists upstream,
                  but this handles any that leak through)
     """
-    # Replace <file ...> tags: extract url and name attributes, show as "📎 name\nurl"
+    # Replace <file ...> tags with a WhatsApp-friendly file card
+    # WhatsApp renders *text* as bold and _text_ as italic; URLs are auto-tappable
     def replace_file_tag(m: re.Match) -> str:
         attrs = m.group(1)
         url_match = re.search(r'url=["\']([^"\']+)["\']', attrs)
         name_match = re.search(r'name=["\']([^"\']+)["\']', attrs)
         url = url_match.group(1).strip() if url_match else ""
         name = name_match.group(1).strip() if name_match else "File"
+
+        # Pick an emoji based on file extension
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        icon = {
+            "pdf": "📄", "doc": "📝", "docx": "📝",
+            "xls": "📊", "xlsx": "📊", "csv": "📊",
+            "png": "🖼", "jpg": "🖼", "jpeg": "🖼",
+            "mp4": "🎥", "mp3": "🎵",
+            "zip": "🗜", "rar": "🗜",
+        }.get(ext, "📎")
+
         if url:
-            return f"📎 {name}\n{url}"
-        return f"📎 {name}"
+            return f"{icon} *{name}*\n_Tap to download:_\n{url}"
+        return f"{icon} *{name}*"
 
     text = re.sub(r"<file\s+([^>]*)>.*?</file>", replace_file_tag, text, flags=re.DOTALL | re.IGNORECASE)
 
