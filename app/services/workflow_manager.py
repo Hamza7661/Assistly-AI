@@ -18,6 +18,8 @@ class WorkflowManager:
         self._queue_index: int = 0
         self.workflow_answers: Dict[str, Any] = {}
         self.is_active: bool = False
+        # IDs of questions that are branch targets — excluded from sequential queue
+        self._linked_question_ids: set = set()
         # Base URL for attachment download links (set from config/context)
         self.api_base_url: str = context.get("api_base_url", "")
     
@@ -63,37 +65,55 @@ class WorkflowManager:
         questions = workflow.get("questions", [])
         if not questions:
             return False
-        
-        sorted_questions = sorted(
-            [q for q in questions if q.get("isActive", True)],
+
+        # Collect every question ID that is a branch target (nextQuestionId) across
+        # all options of all questions.  These "linked" questions must NOT appear in
+        # the default sequential queue — they are only inserted when explicitly branched to.
+        linked_question_ids: set = set()
+        for q in questions:
+            for opt in (q.get("options") or []):
+                nqid = opt.get("nextQuestionId")
+                if nqid:
+                    linked_question_ids.add(nqid)
+
+        logger.info(f"Workflow linked (branch-only) question IDs: {linked_question_ids}")
+
+        active_questions = [q for q in questions if q.get("isActive", True)]
+        # Only sequential questions go into the initial queue
+        sequential_questions = sorted(
+            [q for q in active_questions if q.get("_id") not in linked_question_ids],
             key=lambda q: q.get("order", 0)
         )
-        
-        if not sorted_questions:
+
+        if not sequential_questions:
             return False
-        
+
         self.current_workflow = workflow
+        self._linked_question_ids = linked_question_ids   # kept for reference
         self.current_question_index = 0
-        self._question_queue = sorted_questions
+        self._question_queue = sequential_questions
         self._queue_index = 0
         self.workflow_answers = {}
         self.is_active = True
         
         logger.info(
             f"Started workflow '{workflow_id}' for '{treatment_plan_name}' "
-            f"with {len(sorted_questions)} questions"
+            f"with {len(sequential_questions)} sequential + {len(linked_question_ids)} linked questions"
         )
         return True
     
     def _get_sorted_questions(self) -> List[Dict[str, Any]]:
-        """Return the ordered question list (either queue or sorted from workflow)"""
+        """Return the ordered question list (either the live queue or the sequential subset)."""
         if self._question_queue is not None:
             return self._question_queue
         if not self.current_workflow:
             return []
         questions = self.current_workflow.get("questions", [])
         return sorted(
-            [q for q in questions if q.get("isActive", True)],
+            [
+                q for q in questions
+                if q.get("isActive", True) and q.get("_id") not in self._linked_question_ids
+            ],
             key=lambda q: q.get("order", 0)
         )
     
@@ -323,3 +343,4 @@ class WorkflowManager:
         self._queue_index = 0
         self.workflow_answers = {}
         self.is_active = False
+        self._linked_question_ids = set()
