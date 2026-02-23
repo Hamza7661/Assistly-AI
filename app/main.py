@@ -613,6 +613,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             next_text = wm.format_question_with_options(next_q)
                             conversation_history.append({"role": "assistant", "content": next_text})
                             await websocket.send_json({"type": "bot", "content": next_text})
+                            # Signal the frontend to show the file upload button if the next question asks for a file
+                            if _bot_requests_file_upload(next_text):
+                                await websocket.send_json({"type": "enable_file_upload"})
                     else:
                         # Workflow done – move state forward
                         from app.services.conversation_state import ConversationState
