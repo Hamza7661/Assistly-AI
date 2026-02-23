@@ -617,8 +617,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             if _bot_requests_file_upload(next_text):
                                 await websocket.send_json({"type": "enable_file_upload"})
                     else:
-                        # Workflow done – move state forward
-                        from app.services.conversation_state import ConversationState
+                        # Workflow done – move state forward (ConversationState is imported at top of module)
                         flow_controller.collected_data["workflowAnswers"] = wm.get_workflow_answers()
                         flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                         next_reply = await response_generator.generate_response(
