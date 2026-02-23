@@ -1347,6 +1347,24 @@ async def whatsapp_webhook(request: Request):
                     logger.info(f"WhatsApp: User selected service plan #{number} -> '{service_name}'")
                 else:
                     logger.warning(f"WhatsApp: User selected invalid service number {number}, available: {len(all_options)}")
+            elif flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+                # Convert numbered response to the actual workflow option text
+                wm = flow_controller.workflow_manager
+                if wm and wm.is_active:
+                    current_q = wm.get_current_question()
+                    if current_q:
+                        opts = current_q.get("options", []) or []
+                        sorted_opts = sorted(opts, key=lambda o: o.get("order", 0))
+                        if 1 <= number <= len(sorted_opts):
+                            opt_text = sorted_opts[number - 1].get("text", "").strip()
+                            enhanced_user_text = opt_text
+                            logger.info(f"WhatsApp: Workflow option #{number} -> '{opt_text}'")
+                        else:
+                            logger.warning(f"WhatsApp: Workflow option #{number} out of range ({len(sorted_opts)} options)")
+                    else:
+                        logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but no current question found")
+                else:
+                    logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but workflow manager not active")
             else:
                 logger.info(f"WhatsApp: Number {number} - context unclear, treating as raw input")
         

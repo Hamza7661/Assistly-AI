@@ -1,5 +1,5 @@
 """Workflow manager to handle workflow questions in sequence with branching support"""
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import logging
 
 logger = logging.getLogger("assistly.workflow_manager")
@@ -189,28 +189,27 @@ class WorkflowManager:
         }
         
         # Determine next question for branching
-        next_question_id = self._resolve_next_question(answer, options)
+        next_question_id, end_after_branch = self._resolve_next_question(answer, options)
         
         if next_question_id:
             # Branching: find target question and add it next in the queue
-            logger.info(f"Branching to question '{next_question_id}' after answer '{answer}'")
+            logger.info(f"Branching to question '{next_question_id}' after answer '{answer}' (terminal={end_after_branch})")
             target_q = self._find_question_by_id(next_question_id)
             if target_q:
-                if self._question_queue is not None:
-                    # Insert target after current position
-                    insert_at = self._queue_index + 1
-                    # Remove if already in queue to avoid duplicates
-                    self._question_queue = [q for q in self._question_queue if q.get("_id") != next_question_id]
-                    self._question_queue.insert(insert_at, target_q)
-                    self._queue_index += 1
-                else:
-                    # Convert to queue-based tracking
-                    sorted_qs = self._get_sorted_questions()
-                    self._question_queue = sorted_qs[:]
-                    insert_at = self._queue_index + 1
-                    self._question_queue = [q for q in self._question_queue if q.get("_id") != next_question_id]
-                    self._question_queue.insert(insert_at, target_q)
-                    self._queue_index += 1
+                if self._question_queue is None:
+                    # Convert to queue-based tracking first
+                    self._question_queue = self._get_sorted_questions()[:]
+                
+                insert_at = self._queue_index + 1
+                # Remove if already in queue to avoid duplicates
+                self._question_queue = [q for q in self._question_queue if q.get("_id") != next_question_id]
+                self._question_queue.insert(insert_at, target_q)
+                self._queue_index += 1
+
+                if end_after_branch:
+                    # Truncate everything after the branched question so it is the last one shown
+                    self._question_queue = self._question_queue[:self._queue_index + 1]
+                    logger.info(f"Terminal branch: queue truncated to {len(self._question_queue)} questions")
             else:
                 self._advance_index()
         else:
@@ -218,7 +217,7 @@ class WorkflowManager:
         
         logger.info(
             f"Recorded answer for '{question_text}': '{answer}'. "
-            f"Queue index now {self._queue_index} of {len(self._get_sorted_questions())}"
+            f"Queue index now {self._queue_index} of {len(self._question_queue) if self._question_queue is not None else '?'}"
         )
         
         return self.get_current_question() is not None
@@ -230,27 +229,58 @@ class WorkflowManager:
         else:
             self.current_question_index += 1
     
-    def _resolve_next_question(self, answer: str, options: List[Dict[str, Any]]) -> Optional[str]:
+    def _resolve_next_question(self, answer: str, options: List[Dict[str, Any]]) -> tuple:
         """
-        Given the user's answer and the question's options, find the nextQuestionId to branch to.
-        Matches the selected option by text (case-insensitive).
+        Given the user's answer and the question's options, return (next_question_id, end_after_branch).
+
+        - next_question_id: the ID to branch to, or None
+        - end_after_branch: True if the queue should be truncated after the branch (terminal option)
+
+        Matches the selected option by numeric index (1-based) first, then by text (case-insensitive).
+        This handles both WhatsApp (numbered replies) and chatbot (button text / typed text) inputs.
         """
         if not options:
-            return None
-        
-        answer_lower = answer.strip().lower()
-        for opt in options:
-            opt_text = (opt.get("text") or "").strip()
-            if opt_text.lower() == answer_lower:
-                next_id = opt.get("nextQuestionId")
-                if opt.get("isTerminal"):
-                    # Terminal option – end the workflow
-                    logger.info(f"Option '{opt_text}' is terminal, ending workflow")
-                    self._end_workflow()
-                    return None
-                return next_id if next_id else None
-        
-        return None
+            return (None, False)
+
+        sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
+        answer_stripped = answer.strip()
+        answer_lower = answer_stripped.lower()
+
+        matched_opt = None
+
+        # Try numeric match first (e.g. user typed "4" → pick 4th option)
+        if answer_stripped.isdigit():
+            number = int(answer_stripped)
+            if 1 <= number <= len(sorted_opts):
+                matched_opt = sorted_opts[number - 1]
+                logger.info(f"Workflow: Numeric match #{number} -> option '{matched_opt.get('text')}'")
+
+        # Fall back to exact text match (case-insensitive)
+        if matched_opt is None:
+            for opt in sorted_opts:
+                opt_text = (opt.get("text") or "").strip()
+                if opt_text.lower() == answer_lower:
+                    matched_opt = opt
+                    break
+
+        if matched_opt is not None:
+            is_terminal = bool(matched_opt.get("isTerminal"))
+            next_id = matched_opt.get("nextQuestionId")
+
+            if is_terminal and not next_id:
+                # Terminal with no branch target — end the workflow immediately
+                logger.info(f"Option '{matched_opt.get('text')}' is terminal with no next question, ending workflow")
+                self._end_workflow()
+                return (None, False)
+
+            if is_terminal and next_id:
+                # Terminal with a branch target — show that question last, then end
+                logger.info(f"Option '{matched_opt.get('text')}' is terminal, will branch to '{next_id}' then end")
+                return (next_id, True)
+
+            return (next_id if next_id else None, False)
+
+        return (None, False)
     
     def _end_workflow(self):
         """Force workflow to end (terminal option selected)"""
