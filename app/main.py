@@ -486,6 +486,16 @@ def _convert_services_to_whatsapp_list(services: List[Any], service_plans: List[
     
     return sections
 
+def _bot_requests_file_upload(text: str) -> bool:
+    """Return True if the bot message is asking the user to upload a file/document."""
+    lower = text.lower()
+    request_verbs = ("upload", "send us", "please send", "attach", "provide", "share", "submit", "email us")
+    file_nouns = ("file", "document", "photo", "image", "picture", "form", "certificate", "id", "proof", "receipt", "invoice", "attachment")
+    has_verb = any(v in lower for v in request_verbs)
+    has_noun = any(n in lower for n in file_nouns)
+    return has_verb and has_noun
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -553,9 +563,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
 
     # Send greeting (from DB) + lead types as buttons as soon as widget opens; no first user message required
-    initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
-    conversation_history.append({"role": "assistant", "content": initial_reply})
-    await websocket.send_json({"type": "bot", "content": initial_reply})
+    try:
+        initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
+        conversation_history.append({"role": "assistant", "content": initial_reply})
+        await websocket.send_json({"type": "bot", "content": initial_reply})
+    except Exception as greeting_exc:
+        logger.exception("Failed to generate greeting: %s", greeting_exc)
+        await websocket.send_json({"type": "error", "content": "Failed to load greeting. Please try again."})
 
     try:
         while True:
@@ -963,6 +977,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Regular conversation response
             conversation_history.append({"role": "assistant", "content": reply})
             await websocket.send_json({"type": "bot", "content": reply})
+            # Signal the frontend to show the file upload button if the bot is requesting a file
+            if _bot_requests_file_upload(reply):
+                await websocket.send_json({"type": "enable_file_upload"})
             
             # State transitions are handled in response_generator
             # Only update if we're still in the same state (no transition happened)
@@ -974,6 +991,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for user_id=%s", user_id)
+    except Exception as loop_exc:
+        logger.exception("Unhandled error in WebSocket loop for user_id=%s: %s", user_id, loop_exc)
+        try:
+            await websocket.send_json({"type": "error", "content": "An unexpected error occurred. Please try again."})
+        except Exception:
+            pass
 
 
 @app.post("/webhook/voice-agent")
