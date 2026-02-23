@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional, Tuple
+import re
 import time
 import logging
 import json
@@ -6,6 +7,36 @@ from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 
 logger = logging.getLogger("assistly.whatsapp")
+
+
+def _sanitize_for_whatsapp(text: str) -> str:
+    """
+    Convert chatbot-specific HTML-like tags into plain WhatsApp-friendly text.
+
+    <file url="URL" name="FILENAME">LABEL</file>
+        → 📎 FILENAME\\nURL
+
+    <button>Text</button>
+        → Text  (buttons should already be rendered as numbered lists upstream,
+                 but this handles any that leak through)
+    """
+    # Replace <file ...> tags: extract url and name attributes, show as "📎 name\nurl"
+    def replace_file_tag(m: re.Match) -> str:
+        attrs = m.group(1)
+        url_match = re.search(r'url=["\']([^"\']+)["\']', attrs)
+        name_match = re.search(r'name=["\']([^"\']+)["\']', attrs)
+        url = url_match.group(1).strip() if url_match else ""
+        name = name_match.group(1).strip() if name_match else "File"
+        if url:
+            return f"📎 {name}\n{url}"
+        return f"📎 {name}"
+
+    text = re.sub(r"<file\s+([^>]*)>.*?</file>", replace_file_tag, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Strip any remaining <button> tags, keeping just the inner text
+    text = re.sub(r"<button[^>]*>(.*?)</button>", r"\1", text, flags=re.DOTALL | re.IGNORECASE)
+
+    return text.strip()
 
 
 class WhatsAppService:
@@ -31,6 +62,9 @@ class WhatsAppService:
             logger.warning("Twilio client not initialized - WhatsApp message not sent")
             return False, "WhatsApp service not configured"
         
+        # Strip chatbot UI tags (e.g. <file>, <button>) before sending to WhatsApp
+        message = _sanitize_for_whatsapp(message)
+
         try:
             whatsapp_to = f"whatsapp:{to_phone}"
             # Use provided from_phone or fallback to default (if configured)
