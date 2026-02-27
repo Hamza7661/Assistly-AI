@@ -29,7 +29,8 @@ class Settings(BaseModel):
     whatsapp_webhook_token: Optional[str] = Field(default=None, alias="WHATSAPP_WEBHOOK_TOKEN")
     
     # Meta (Facebook/Instagram) configuration
-    meta_verify_token: Optional[str] = Field(default="assistly_instagram_verify_token", alias="META_VERIFY_TOKEN")
+    meta_verify_token: Optional[str] = Field(default="assistly_verify_token", alias="META_VERIFY_TOKEN")
+    meta_app_secret: Optional[str] = Field(default=None, alias="META_APP_SECRET")
     meta_graph_api_version: str = Field(default="v21.0", alias="META_GRAPH_API_VERSION")
 
     # Deepgram voice agent
