@@ -18,6 +18,9 @@ from .services.lead_service import LeadService
 from .services.email_validation_service import EmailValidationService
 from .services.phone_validation_service import PhoneValidationService
 from .services.whatsapp_service import WhatsAppService
+from .services.twilio_messaging_service import TwilioMessagingService, CHANNEL_MESSENGER, CHANNEL_INSTAGRAM
+from .services.instagram_graph_service import InstagramGraphService
+from .services.messenger_graph_service import MessengerGraphService
 from .services.voice_agent_service import VoiceAgentService
 from .services.rag_service import RAGService
 from .services.conversation_state import FlowController, ConversationState
@@ -39,6 +42,56 @@ whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Mapping: phone number -> current active session_id
 phone_to_session: Dict[str, str] = {}
+
+# Messenger: session_id -> session data; (page_id, user_id) -> session_id
+messenger_sessions: Dict[str, Dict[str, Any]] = {}
+messenger_key_to_session: Dict[str, str] = {}
+
+def get_or_create_messenger_session(page_id: str, user_id: str) -> Tuple[str, bool]:
+    """Get or create session for Messenger. Returns (session_id, is_new)."""
+    key = f"messenger_{page_id}_{user_id}"
+    current_time = time.time()
+    if key in messenger_key_to_session:
+        session_id = messenger_key_to_session[key]
+        if session_id in messenger_sessions:
+            session = messenger_sessions[session_id]
+            if current_time - session.get("last_activity", 0) > SESSION_TIMEOUT:
+                del messenger_sessions[session_id]
+                del messenger_key_to_session[key]
+            else:
+                session["last_activity"] = current_time
+                return session_id, False
+        else:
+            del messenger_key_to_session[key]
+    session_id = secrets.token_urlsafe(16)
+    messenger_key_to_session[key] = session_id
+    logger.info("Created new Messenger session %s for page=%s user=%s", session_id, page_id, user_id)
+    return session_id, True
+
+# Instagram: session_id -> session data; (sender_id, user_id) -> session_id
+instagram_sessions: Dict[str, Dict[str, Any]] = {}
+instagram_key_to_session: Dict[str, str] = {}
+
+def get_or_create_instagram_session(sender_id: str, user_id: str) -> Tuple[str, bool]:
+    """Get or create session for Instagram. Returns (session_id, is_new)."""
+    key = f"instagram_{sender_id}_{user_id}"
+    current_time = time.time()
+    if key in instagram_key_to_session:
+        session_id = instagram_key_to_session[key]
+        if session_id in instagram_sessions:
+            session = instagram_sessions[session_id]
+            if current_time - session.get("last_activity", 0) > SESSION_TIMEOUT:
+                del instagram_sessions[session_id]
+                del instagram_key_to_session[key]
+            else:
+                session["last_activity"] = current_time
+                return session_id, False
+        else:
+            del instagram_key_to_session[key]
+    session_id = secrets.token_urlsafe(16)
+    instagram_key_to_session[key] = session_id
+    logger.info("Created new Instagram session %s for sender=%s user=%s", session_id, sender_id, user_id)
+    return session_id, True
 
 # Session timeout from environment variable (default: 5 minutes)
 SESSION_TIMEOUT = settings.session_timeout_seconds
@@ -1457,9 +1510,31 @@ async def whatsapp_webhook(request: Request):
                     logger.info(f"WhatsApp: Email OTP sent, returning early to prevent JSON generation")
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 else:
-                    logger.info(f"WhatsApp: No valid email found, letting state machine handle naturally")
-                    # Let state machine handle invalid/missing email naturally
-                    pass
+                    logger.info(f"WhatsApp: No valid email found in input; checking for stored email to retry")
+                    # No new email extracted – if a previous email was stored (OTP send
+                    # failed earlier), retry with the stored email instead of letting
+                    # the AI generate a misleading "order complete" message.
+                    stored_email = email_validation_state.get("email")
+                    if stored_email:
+                        logger.info(f"WhatsApp: Retrying OTP send with stored email={stored_email}")
+                        customer_name = email_validation_state.get(
+                            "customer_name",
+                            flow_controller.collected_data.get("leadName", "Customer"),
+                        )
+                        ok, _ = await email_validation_service.send_otp_email(user_id, stored_email, customer_name)
+                        if ok:
+                            email_validation_state["otp_sent"] = True
+                            flow_controller.otp_state["email_sent"] = True
+                            flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                        reply = (
+                            get_string("otp_sent_email", session.get("response_language_code", "en"), stored_email)
+                            if ok
+                            else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+                        )
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                        logger.info(f"WhatsApp: Stored email OTP retry handled, returning early")
+                        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Check if we're in email OTP verification mode
         if email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
@@ -1960,4 +2035,890 @@ async def whatsapp_webhook_verification(request: Request):
     """Handle WhatsApp webhook verification (GET request)"""
     # Twilio may send GET requests for webhook verification
     return {"status": "ok", "message": "WhatsApp webhook endpoint is active"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Facebook Messenger – Meta Graph API (mirrors Instagram implementation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.get("/webhook/messenger")
+async def messenger_webhook_verification(request: Request):
+    """
+    Meta webhook verification handshake (GET).
+    Meta sends hub.mode=subscribe, hub.verify_token, hub.challenge.
+    We must echo back hub.challenge as plain text with 200 OK.
+    """
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    verify_token = settings.meta_verify_token or "assistly_verify_token"
+
+    if mode == "subscribe" and token == verify_token:
+        logger.info("Messenger webhook verified successfully")
+        return Response(content=challenge, media_type="text/plain")
+
+    logger.warning(
+        "Messenger webhook verification failed: mode=%s, token_match=%s",
+        mode,
+        token == verify_token,
+    )
+    return Response(content="Forbidden", status_code=403)
+
+
+@app.post("/webhook/messenger")
+async def messenger_webhook(request: Request):
+    """
+    Handle incoming Facebook Messenger messages via Meta Graph API.
+    Same conversation flow as WhatsApp and Instagram – no Twilio involved.
+    """
+    try:
+        raw_body = await request.body()
+
+        # ── Optional: verify Meta signature ──────────────────────────────────
+        app_secret = getattr(settings, "meta_app_secret", None)
+        if app_secret:
+            sig_header = request.headers.get("x-hub-signature-256", "")
+            if not MessengerGraphService.verify_signature(raw_body, sig_header, app_secret):
+                logger.warning("Messenger webhook: signature verification failed")
+                return Response(content="Forbidden", status_code=403)
+
+        body = json.loads(raw_body)
+        logger.info("Messenger webhook received: %s", json.dumps(body)[:200])
+
+        # ── Parse event ────────────────────────────────────────────────────────
+        parsed = MessengerGraphService.parse_webhook_event(body)
+        if not parsed:
+            # Non-message events (delivery, read, echo…) – always 200 OK
+            return {"status": "ok"}
+
+        sender_id = parsed["sender_id"]       # PSID  (the user)
+        recipient_id = parsed["recipient_id"]  # Facebook Page ID
+        message_text = parsed["message_text"]
+
+        if not sender_id or not recipient_id or not message_text:
+            logger.warning("Messenger webhook: missing required fields after parsing")
+            return {"status": "ok"}
+
+        # ── Services ────────────────────────────────────────────────────────────
+        context_service = ContextService(settings)
+        lead_service = LeadService(settings)
+        rag_service = RAGService(settings)
+        email_validation_service = EmailValidationService(settings)
+        from openai import AsyncOpenAI
+        openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        phone_validation_service = PhoneValidationService(
+            settings, openai_client=openai_client, gpt_model=settings.gpt_model
+        )
+        messenger_service = MessengerGraphService()
+
+        # ── Session ──────────────────────────────────────────────────────────────
+        # recipient_id = Page ID  →  used as the "account" key for context lookup
+        # sender_id    = PSID     →  used as the "user" key within that page
+        session_id, is_new = get_or_create_messenger_session(recipient_id, sender_id)
+
+        # ── NEW SESSION ──────────────────────────────────────────────────────────
+        if is_new:
+            try:
+                context = await context_service.fetch_context_by_social_sender(recipient_id)
+            except Exception as exc:
+                logger.exception(
+                    "Messenger: failed to fetch context for page_id=%s: %s", recipient_id, exc
+                )
+                return {"status": "error", "message": "Failed to fetch context"}
+
+            user_data = context.get("user", {})
+            app_data = context.get("app", {})
+            app_id = app_data.get("id") if app_data else None
+            owner_id = str(user_data.get("id") or "")
+            page_access_token = context.get("messengerAccessToken")
+
+            if not owner_id:
+                logger.error(
+                    "Messenger: no owner_id in context for page_id=%s", recipient_id
+                )
+                return {"status": "error", "message": "No owner found"}
+
+            if not page_access_token:
+                logger.error(
+                    "Messenger: no page access token in context for page_id=%s", recipient_id
+                )
+                return {"status": "error", "message": "No Messenger page access token configured"}
+
+            current_time = time.time()
+            messenger_sessions[session_id] = {
+                "user_id": sender_id,          # PSID
+                "recipient_id": recipient_id,  # Facebook Page ID
+                "history": [],
+                "email_state": {
+                    "email": None,
+                    "otp_sent": False,
+                    "otp_verified": False,
+                    "customer_name": None,
+                },
+                "phone_state": {"phone": None, "otp_sent": False, "otp_verified": True},
+                "context": context,
+                "user_id_owner": owner_id,
+                "app_id": app_id,
+                "created_at": current_time,
+                "last_activity": current_time,
+                "flow_controller": None,
+                "response_generator": None,
+                "page_access_token": page_access_token,
+            }
+
+            flow_controller = FlowController(context)
+            flow_controller.set_whatsapp(True)
+            flow_controller.update_collected_data("leadPhoneNumber", "")
+            flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+
+            response_generator = ResponseGenerator(settings, rag_service)
+            response_generator.set_profession(str(context.get("profession") or "Business"))
+            response_generator.set_channel("messenger")
+            rag_service.build_vector_store(context)
+
+            messenger_sessions[session_id]["flow_controller"] = flow_controller
+            messenger_sessions[session_id]["response_generator"] = response_generator
+
+            first_message = message_text or "(started)"
+            initial_reply = await response_generator.generate_greeting(
+                context, channel="messenger", first_message=first_message or None
+            )
+            messenger_sessions[session_id]["history"] = [
+                {"role": "user", "content": first_message},
+                {"role": "assistant", "content": initial_reply},
+            ]
+            messenger_key_to_session[f"messenger_{recipient_id}_{sender_id}"] = session_id
+
+            cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
+            if buttons:
+                btn_text = "\n\n" + "\n".join(
+                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
+                )
+                await messenger_service.send_message(
+                    sender_id,
+                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
+                    page_access_token,
+                )
+            else:
+                await messenger_service.send_message(sender_id, initial_reply, page_access_token)
+
+            return {"status": "ok"}
+
+        # ── EXISTING SESSION ──────────────────────────────────────────────────────
+        session = messenger_sessions.get(session_id)
+        if not session:
+            session_id_new, _ = get_or_create_messenger_session(recipient_id, sender_id)
+            session = messenger_sessions.get(session_id_new)
+            if not session:
+                logger.error("Messenger: session expired for PSID=%s", sender_id)
+                return {"status": "ok"}
+            session_id = session_id_new
+
+        session["last_activity"] = time.time()
+        conversation_history = session["history"]
+        context = session["context"]
+        flow_controller = session.get("flow_controller")
+        response_generator = session.get("response_generator")
+        owner_id = session["user_id_owner"]
+        app_id = session.get("app_id")
+        page_access_token = session.get("page_access_token")
+        email_validation_state = session["email_state"]
+        phone_validation_state = session["phone_state"]
+
+        if not flow_controller or not response_generator:
+            logger.error("Messenger: flow_controller or response_generator missing in session")
+            return {"status": "error"}
+
+        # Add user message to history
+        conversation_history.append({"role": "user", "content": message_text})
+
+        # Detect language and configure response generator
+        lang_code = detect_language(message_text)
+        session["response_language_code"] = lang_code
+        response_generator.set_response_language(get_language_name_for_prompt(lang_code))
+
+        try:
+            # ── PRE-CHECK: detect email when last bot message asked for it ────────
+            validate_email = context.get("integration", {}).get("validateEmail", True)
+            logger.info(
+                "Messenger: email validation check – validate_email=%s otp_sent=%s history_len=%d",
+                validate_email, email_validation_state["otp_sent"], len(conversation_history),
+            )
+
+            if validate_email and not email_validation_state["otp_sent"] and len(conversation_history) > 1:
+                last_bot = next(
+                    (m for m in reversed(conversation_history) if m["role"] == "assistant"), None
+                )
+                if last_bot and "email" in last_bot["content"].lower():
+                    logger.info("Messenger: detected email collection phase, input=%s", message_text)
+                    extractor = DataExtractor()
+                    email = extractor.extract_email(message_text)
+                    if email and _is_valid_email(email):
+                        customer_name = flow_controller.collected_data.get("leadName", "Customer")
+                        if customer_name == "Customer":
+                            for msg in reversed(conversation_history):
+                                if msg.get("role") == "user":
+                                    name = extractor.extract_name(
+                                        msg.get("content", ""), context.get("lead_types", [])
+                                    )
+                                    if name:
+                                        customer_name = name
+                                        break
+                        email_validation_state["email"] = email
+                        email_validation_state["customer_name"] = customer_name
+                        flow_controller.collected_data["leadEmail"] = email
+                        ok, _ = await email_validation_service.send_otp_email(
+                            owner_id, email, customer_name
+                        )
+                        if ok:
+                            email_validation_state["otp_sent"] = True
+                            flow_controller.otp_state["email_sent"] = True
+                            flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                        reply = (
+                            get_string("otp_sent_email", lang_code, email)
+                            if ok
+                            else get_string("otp_send_fail_email", lang_code)
+                        )
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
+                        return {"status": "ok"}
+                    else:
+                        # No new email extracted – if a previous email was stored (OTP send
+                        # failed earlier), retry with the stored email instead of letting
+                        # the AI generate a misleading "order complete" message.
+                        stored_email = email_validation_state.get("email")
+                        if stored_email:
+                            logger.info(
+                                "Messenger: no new email in input; retrying stored email=%s",
+                                stored_email,
+                            )
+                            customer_name = email_validation_state.get(
+                                "customer_name",
+                                flow_controller.collected_data.get("leadName", "Customer"),
+                            )
+                            ok, _ = await email_validation_service.send_otp_email(
+                                owner_id, stored_email, customer_name
+                            )
+                            if ok:
+                                email_validation_state["otp_sent"] = True
+                                flow_controller.otp_state["email_sent"] = True
+                                flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                            reply = (
+                                get_string("otp_sent_email", lang_code, stored_email)
+                                if ok
+                                else get_string("otp_send_fail_email", lang_code)
+                            )
+                            conversation_history.append({"role": "assistant", "content": reply})
+                            session["history"] = conversation_history
+                            await messenger_service.send_message(sender_id, reply, page_access_token)
+                            return {"status": "ok"}
+
+            # ── OTP VERIFICATION LOOP ─────────────────────────────────────────────
+            if email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
+                logger.info("Messenger: in OTP verification mode, input=%s", message_text)
+                temp_reply = await response_generator.generate_response(
+                    flow_controller, message_text, conversation_history, context
+                )
+                retry_type, extracted_value = _detect_retry_request(temp_reply)
+
+                if retry_type == "resend_otp" and email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
+                    customer_name = email_validation_state.get(
+                        "customer_name", flow_controller.collected_data.get("leadName", "Customer")
+                    )
+                    ok, _ = await email_validation_service.send_otp_email(
+                        owner_id, email_validation_state["email"], customer_name
+                    )
+                    reply = (
+                        get_string("otp_resend", lang_code, email_validation_state["email"])
+                        if ok
+                        else get_string("otp_resend_fail_email", lang_code)
+                    )
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+                elif retry_type == "change_email":
+                    email_validation_state.update({"otp_sent": False, "otp_verified": False, "email": None})
+                    flow_controller.otp_state.update({"email_sent": False, "email_verified": False})
+                    if extracted_value:
+                        email = extracted_value
+                        email_validation_state["email"] = email
+                        email_validation_state["customer_name"] = flow_controller.collected_data.get("leadName", "Customer")
+                        flow_controller.collected_data["leadEmail"] = email
+                        ok, _ = await email_validation_service.send_otp_email(
+                            owner_id, email, email_validation_state["customer_name"]
+                        )
+                        if ok:
+                            email_validation_state["otp_sent"] = True
+                            flow_controller.otp_state["email_sent"] = True
+                            flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                        reply = (
+                            get_string("perfect_otp_sent_email", lang_code, email)
+                            if ok
+                            else get_string("found_email_cant_send", lang_code)
+                        )
+                    else:
+                        reply = get_string("no_problem_email", lang_code)
+                        flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+                else:
+                    otp_code = _extract_otp_from_text(message_text)
+                    if otp_code:
+                        ok, _ = await email_validation_service.verify_otp(
+                            owner_id, email_validation_state["email"], otp_code
+                        )
+                        if ok:
+                            email_validation_state["otp_verified"] = True
+                            flow_controller.otp_state["email_verified"] = True
+                            flow_controller.transition_to(flow_controller.get_next_state())
+                            reply = await response_generator.generate_response(
+                                flow_controller, "Email verified", conversation_history, context
+                            )
+                        else:
+                            reply = temp_reply
+
+                        # Check if the post-OTP reply is a lead JSON
+                        parsed_json = _maybe_parse_json(reply)
+                        if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
+                            email_valid = _validate_email_verification(email_validation_state) if validate_email else True
+                            if email_valid:
+                                if app_id:
+                                    parsed_json["appId"] = app_id
+                                try:
+                                    ok_lead, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                                    final_msg = (
+                                        get_string("final_success", lang_code)
+                                        if ok_lead
+                                        else get_string("final_fallback", lang_code)
+                                    )
+                                except Exception:
+                                    final_msg = get_string("final_fallback", lang_code)
+                                integration = context.get("integration") or {}
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                    await messenger_service.send_message(
+                                        sender_id,
+                                        get_string("review_prompt", lang_code, integration["googleReviewUrl"].strip()),
+                                        page_access_token,
+                                    )
+                                await messenger_service.send_message(sender_id, final_msg, page_access_token)
+                                key = f"messenger_{recipient_id}_{sender_id}"
+                                messenger_key_to_session.pop(key, None)
+                                messenger_sessions.pop(session_id, None)
+                                return {"status": "ok"}
+
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
+                        return {"status": "ok"}
+                    else:
+                        # Not an OTP – use the AI's natural response
+                        reply = temp_reply
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
+                        return {"status": "ok"}
+
+            # ── Generate response via state machine ───────────────────────────────
+            reply = await response_generator.generate_response(
+                flow_controller, message_text, conversation_history, context
+            )
+
+            # ── SEND_EMAIL / SEND_PHONE signal interceptors ───────────────────────
+            if "|||SEND_EMAIL:" in reply:
+                parts = reply.split("|||SEND_EMAIL:", 1)
+                answer, email = parts[0].strip(), parts[1].strip()
+                conversation_history.append({"role": "assistant", "content": answer})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, answer, page_access_token)
+                flow_controller.collected_data["leadEmail"] = email
+                flow_controller.otp_state["email_sent"] = True
+                flow_controller.transition_to(ConversationState.EMAIL_OTP_SENT)
+                customer_name = flow_controller.collected_data.get("leadName", "Customer")
+                ok, _ = await email_validation_service.send_otp_email(owner_id, email, customer_name)
+                if ok:
+                    flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                    email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
+                reply = (
+                    get_string("otp_sent_email", lang_code, email)
+                    if ok
+                    else get_string("otp_send_fail_email", lang_code)
+                )
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+
+            elif reply.startswith("SEND_EMAIL:"):
+                email = reply.split(":", 1)[1].strip()
+                flow_controller.collected_data["leadEmail"] = email
+                flow_controller.otp_state["email_sent"] = True
+                flow_controller.transition_to(ConversationState.EMAIL_OTP_SENT)
+                customer_name = flow_controller.collected_data.get("leadName", "Customer")
+                logger.info("Messenger: sending OTP email to %s", email)
+                ok, _ = await email_validation_service.send_otp_email(owner_id, email, customer_name)
+                if ok:
+                    flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                    email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
+                reply = (
+                    get_string("otp_sent_email", lang_code, email)
+                    if ok
+                    else get_string("otp_send_fail_email", lang_code)
+                )
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+
+            elif "|||SEND_PHONE:" in reply:
+                parts = reply.split("|||SEND_PHONE:", 1)
+                answer, phone = parts[0].strip(), parts[1].strip()
+                from app.utils.phone_utils import format_phone_number_with_gpt
+                phone = await format_phone_number_with_gpt(phone, openai_client, settings.gpt_model)
+                conversation_history.append({"role": "assistant", "content": answer})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, answer, page_access_token)
+                flow_controller.collected_data["leadPhoneNumber"] = phone
+                flow_controller.otp_state["phone_sent"] = True
+                flow_controller.transition_to(ConversationState.PHONE_OTP_SENT)
+                ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone)
+                if ok:
+                    flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
+                    phone_validation_state.update({"otp_sent": True, "phone": phone})
+                reply = (
+                    get_string("otp_sent_phone", lang_code, phone)
+                    if ok
+                    else get_string("otp_send_fail_phone", lang_code)
+                )
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+
+            elif reply.startswith("SEND_PHONE:"):
+                phone = reply.split(":", 1)[1].strip()
+                from app.utils.phone_utils import format_phone_number_with_gpt
+                phone = await format_phone_number_with_gpt(phone, openai_client, settings.gpt_model)
+                flow_controller.collected_data["leadPhoneNumber"] = phone
+                flow_controller.otp_state["phone_sent"] = True
+                flow_controller.transition_to(ConversationState.PHONE_OTP_SENT)
+                ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone)
+                if ok:
+                    flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
+                    phone_validation_state.update({"otp_sent": True, "phone": phone})
+                reply = (
+                    get_string("otp_sent_phone", lang_code, phone)
+                    if ok
+                    else get_string("otp_send_fail_phone", lang_code)
+                )
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+
+            # ── Lead JSON generation ───────────────────────────────────────────────
+            parsed_json = _maybe_parse_json(reply)
+            if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
+                # Verify email OTP is done before finalising lead
+                email_valid = _validate_email_verification(email_validation_state) if validate_email else True
+                if email_valid:
+                    if app_id:
+                        parsed_json["appId"] = app_id
+                    try:
+                        ok, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                        final_msg = (
+                            get_string("final_success", lang_code)
+                            if ok
+                            else get_string("final_fallback", lang_code)
+                        )
+                    except Exception:
+                        final_msg = get_string("final_fallback", lang_code)
+
+                    integration = context.get("integration") or {}
+                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                        review_url = integration["googleReviewUrl"].strip()
+                        await messenger_service.send_message(
+                            sender_id,
+                            get_string("review_prompt", lang_code, review_url),
+                            page_access_token,
+                        )
+                    await messenger_service.send_message(sender_id, final_msg, page_access_token)
+                    key = f"messenger_{recipient_id}_{sender_id}"
+                    messenger_key_to_session.pop(key, None)
+                    messenger_sessions.pop(session_id, None)
+                    return {"status": "ok"}
+
+            # ── Retry detection ───────────────────────────────────────────────────
+            retry_type, extracted_value = _detect_retry_request(reply)
+            if retry_type:
+                if retry_type == "resend_otp" and email_validation_state["otp_sent"] and not email_validation_state["otp_verified"]:
+                    customer_name = email_validation_state.get(
+                        "customer_name", flow_controller.collected_data.get("leadName", "Customer")
+                    )
+                    ok, _ = await email_validation_service.send_otp_email(
+                        owner_id, email_validation_state["email"], customer_name
+                    )
+                    reply = (
+                        get_string("otp_resend", lang_code, email_validation_state["email"])
+                        if ok
+                        else get_string("otp_resend_fail_email", lang_code)
+                    )
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+                elif retry_type == "resend_otp" and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
+                    ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone_validation_state["phone"])
+                    reply = (
+                        get_string("otp_resend", lang_code, phone_validation_state["phone"])
+                        if ok
+                        else get_string("otp_resend_fail_phone", lang_code)
+                    )
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+                elif retry_type == "change_email":
+                    email_validation_state.update({"otp_sent": False, "otp_verified": False, "email": None})
+                    flow_controller.otp_state.update({"email_sent": False, "email_verified": False})
+                    if extracted_value:
+                        email = extracted_value
+                        email_validation_state["email"] = email
+                        email_validation_state["customer_name"] = flow_controller.collected_data.get("leadName", "Customer")
+                        flow_controller.collected_data["leadEmail"] = email
+                        ok, _ = await email_validation_service.send_otp_email(
+                            owner_id, email, email_validation_state["customer_name"]
+                        )
+                        if ok:
+                            email_validation_state["otp_sent"] = True
+                            flow_controller.otp_state["email_sent"] = True
+                            flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                        reply = (
+                            get_string("perfect_otp_sent_email", lang_code, email)
+                            if ok
+                            else get_string("found_email_cant_send", lang_code)
+                        )
+                    else:
+                        reply = get_string("no_problem_email", lang_code)
+                        flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+                elif retry_type == "change_phone":
+                    phone_validation_state.update({"otp_sent": False, "otp_verified": False, "phone": None})
+                    flow_controller.otp_state.update({"phone_sent": False, "phone_verified": False})
+                    if extracted_value:
+                        from app.utils.phone_utils import format_phone_number_with_gpt
+                        phone = await format_phone_number_with_gpt(extracted_value, openai_client, settings.gpt_model)
+                        phone_validation_state["phone"] = phone
+                        flow_controller.collected_data["leadPhoneNumber"] = phone
+                        ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone)
+                        if ok:
+                            phone_validation_state["otp_sent"] = True
+                            flow_controller.otp_state["phone_sent"] = True
+                            flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
+                        reply = (
+                            get_string("perfect_otp_sent_phone", lang_code, phone)
+                            if ok
+                            else get_string("found_phone_cant_send", lang_code)
+                        )
+                    else:
+                        reply = get_string("no_problem_phone", lang_code)
+                        flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+                elif retry_type == "send_email" and extracted_value:
+                    if not validate_email:
+                        # Email validation disabled – store email and let AI continue naturally
+                        email = extracted_value
+                        email_validation_state["email"] = email
+                        flow_controller.collected_data["leadEmail"] = email
+                        conversation_history.append({"role": "user", "content": "Email provided"})
+                        reply = await response_generator.generate_response(
+                            flow_controller, "Email provided", conversation_history, context
+                        )
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
+                        return {"status": "ok"}
+                    # Email validation enabled
+                    email = extracted_value
+                    email_validation_state["email"] = email
+                    email_validation_state["customer_name"] = flow_controller.collected_data.get("leadName", "Customer")
+                    if email_validation_state["customer_name"] == "Customer":
+                        extractor = DataExtractor()
+                        for msg in reversed(conversation_history):
+                            if msg.get("role") == "user":
+                                name = extractor.extract_name(
+                                    msg.get("content", ""), context.get("lead_types", [])
+                                )
+                                if name:
+                                    email_validation_state["customer_name"] = name
+                                    flow_controller.collected_data["leadName"] = name
+                                    break
+                    flow_controller.collected_data["leadEmail"] = email
+                    ok, _ = await email_validation_service.send_otp_email(
+                        owner_id, email, email_validation_state["customer_name"]
+                    )
+                    if ok:
+                        email_validation_state["otp_sent"] = True
+                        flow_controller.otp_state["email_sent"] = True
+                        flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+                    reply = (
+                        get_string("otp_sent_email", lang_code, email)
+                        if ok
+                        else get_string("otp_send_fail_email", lang_code)
+                    )
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+
+            # ── Regular reply ─────────────────────────────────────────────────────
+            conversation_history.append({"role": "assistant", "content": reply})
+            session["history"] = conversation_history
+
+            cleaned_reply, buttons = _extract_buttons_from_response(reply)
+            if buttons:
+                btn_text = "\n\n" + "\n".join(
+                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
+                )
+                await messenger_service.send_message(
+                    sender_id,
+                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
+                    page_access_token,
+                )
+            else:
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+
+        except Exception as exc:
+            logger.exception("Messenger: error processing message: %s", exc)
+            try:
+                await messenger_service.send_message(
+                    sender_id,
+                    "Sorry, I encountered an error. Please try again.",
+                    page_access_token,
+                )
+            except Exception:
+                pass
+
+        return {"status": "ok"}
+
+    except Exception as exc:
+        logger.exception("Messenger webhook error: %s", exc)
+        return {"status": "error", "message": str(exc)}
+
+
+@app.get("/webhook/instagram")
+async def instagram_webhook_verification(request: Request):
+    """Instagram webhook verification (GET) - required by Meta."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    
+    # Verify token (should match your configured verify token in Meta App Dashboard)
+    verify_token = settings.meta_verify_token or "assistly_instagram_verify_token"
+    
+    if mode == "subscribe" and token == verify_token:
+        logger.info("Instagram webhook verified successfully")
+        return Response(content=challenge, media_type="text/plain")
+    else:
+        logger.warning(f"Instagram webhook verification failed. mode={mode}, token={token}")
+        return Response(content="Forbidden", status_code=403)
+
+
+@app.post("/webhook/instagram")
+async def instagram_webhook(request: Request):
+    """Handle incoming Instagram messages via Meta Graph API (not Twilio). Same conversation flow as WhatsApp."""
+    try:
+        body = await request.json()
+        logger.info(f"Instagram webhook received: {json.dumps(body)[:200]}")
+        
+        # Parse the Meta webhook event
+        parsed = InstagramGraphService.parse_webhook_event(body)
+        if not parsed:
+            logger.warning("Could not parse Instagram webhook event")
+            return {"status": "ok"}
+        
+        sender_id = parsed["sender_id"]  # IGSID (Instagram-scoped sender ID)
+        recipient_id = parsed["recipient_id"]  # Instagram Business Account ID
+        message_text = parsed["message_text"]
+        
+        if not sender_id or not recipient_id or not message_text:
+            logger.warning("Missing required fields in Instagram webhook")
+            return {"status": "ok"}
+        
+        # Initialize services
+        context_service = ContextService(settings)
+        lead_service = LeadService(settings)
+        rag_service = RAGService(settings)
+        email_validation_service = EmailValidationService(settings)
+        from openai import AsyncOpenAI
+        openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        phone_validation_service = PhoneValidationService(settings, openai_client=openai_client, gpt_model=settings.gpt_model)
+        instagram_service = InstagramGraphService()
+        
+        # Get or create session for this Instagram user
+        session_id, is_new = get_or_create_instagram_session(recipient_id, sender_id)
+        
+        if is_new:
+            # Fetch app context by Instagram Business Account ID
+            try:
+                context = await context_service.fetch_context_by_social_sender(recipient_id)
+            except Exception as exc:
+                logger.exception(f"Instagram: failed to fetch context for business_account_id={recipient_id}: {exc}")
+                # Get access token from context if available, otherwise can't send error message
+                return {"status": "error", "message": "Failed to fetch context"}
+            
+            user_data = context.get("user", {})
+            app_data = context.get("app", {})
+            app_id = app_data.get("id") if app_data else None
+            owner_id = str(user_data.get("id") or "")
+            instagram_access_token = context.get("instagramAccessToken")
+            
+            if not owner_id:
+                logger.error(f"Instagram: no owner_id in context for business_account_id={recipient_id}")
+                return {"status": "error", "message": "No owner found"}
+            
+            if not instagram_access_token:
+                logger.error(f"Instagram: no access token in context for business_account_id={recipient_id}")
+                return {"status": "error", "message": "No Instagram access token configured"}
+            
+            current_time = time.time()
+            instagram_sessions[session_id] = {
+                "user_id": sender_id,  # IGSID
+                "recipient_id": recipient_id,  # IG Business Account ID
+                "history": [],
+                "email_state": {"email": None, "otp_sent": False, "otp_verified": False, "customer_name": None},
+                "phone_state": {"phone": None, "otp_sent": False, "otp_verified": True},
+                "context": context,
+                "user_id_owner": owner_id,
+                "app_id": app_id,
+                "created_at": current_time,
+                "last_activity": current_time,
+                "flow_controller": None,
+                "response_generator": None,
+                "instagram_access_token": instagram_access_token,
+            }
+            
+            # Initialize flow controller and response generator
+            flow_controller = FlowController(context)
+            flow_controller.set_whatsapp(True)
+            flow_controller.update_collected_data("leadPhoneNumber", "")
+            flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+            
+            response_generator = ResponseGenerator(settings, rag_service)
+            response_generator.set_profession(str(context.get("profession") or "Business"))
+            response_generator.set_channel("instagram")
+            rag_service.build_vector_store(context)
+            
+            instagram_sessions[session_id]["flow_controller"] = flow_controller
+            instagram_sessions[session_id]["response_generator"] = response_generator
+            
+            first_message = message_text or "(started)"
+            initial_reply = await response_generator.generate_greeting(context, channel="instagram", first_message=first_message or None)
+            instagram_sessions[session_id]["history"] = [
+                {"role": "user", "content": first_message},
+                {"role": "assistant", "content": initial_reply}
+            ]
+            
+            instagram_key_to_session[f"instagram_{recipient_id}_{sender_id}"] = session_id
+            
+            # Send reply via Meta Graph API
+            cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
+            if buttons:
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+            else:
+                await instagram_service.send_message(sender_id, initial_reply, instagram_access_token)
+            
+            return {"status": "ok"}
+        
+        # Existing session - process message
+        session = instagram_sessions.get(session_id)
+        if not session:
+            session_id_new, _ = get_or_create_instagram_session(recipient_id, sender_id)
+            session = instagram_sessions.get(session_id_new)
+            if not session:
+                logger.error(f"Instagram: session expired for sender={sender_id}")
+                return {"status": "ok"}
+            session_id = session_id_new
+        
+        session["last_activity"] = time.time()
+        conversation_history = session["history"]
+        context = session["context"]
+        email_state = session["email_state"]
+        phone_state = session["phone_state"]
+        flow_controller = session.get("flow_controller")
+        response_generator = session.get("response_generator")
+        owner_id = session["user_id_owner"]
+        app_id = session.get("app_id")
+        instagram_access_token = session.get("instagram_access_token")
+        
+        if not flow_controller or not response_generator:
+            logger.error("Instagram: flow_controller or response_generator not initialized")
+            return {"status": "error"}
+        
+        # Add user message to history
+        conversation_history.append({"role": "user", "content": message_text})
+        
+        # Process message through the same flow as other channels
+        try:
+            reply_text = await _process_user_message(
+                message_text,
+                conversation_history,
+                flow_controller,
+                response_generator,
+                email_state,
+                phone_state,
+                context,
+                email_validation_service,
+                phone_validation_service,
+                lead_service,
+                rag_service,
+                owner_id,
+                app_id,
+                channel="instagram"
+            )
+            
+            conversation_history.append({"role": "assistant", "content": reply_text})
+            
+            # Send reply via Meta Graph API
+            cleaned_reply, buttons = _extract_buttons_from_response(reply_text)
+            if buttons:
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+            else:
+                await instagram_service.send_message(sender_id, reply_text, instagram_access_token)
+            
+        except Exception as e:
+            logger.exception(f"Instagram: error processing message: {e}")
+            await instagram_service.send_message(
+                sender_id,
+                "Sorry, I encountered an error. Please try again.",
+                instagram_access_token
+            )
+        
+        return {"status": "ok"}
+        
+    except Exception as e:
+        logger.exception(f"Instagram webhook error: {e}")
+        return {"status": "error", "message": str(e)}
+
 
