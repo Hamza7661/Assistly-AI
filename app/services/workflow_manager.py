@@ -47,19 +47,30 @@ class WorkflowManager:
         if not attached_workflows:
             return False
         
-        workflow_id = attached_workflows[0].get("workflowId")
-        if not workflow_id:
+        workflow_id_raw = attached_workflows[0].get("workflowId")
+        if not workflow_id_raw:
             return False
         
+        def _normalize_id(oid):
+            if oid is None:
+                return None
+            if isinstance(oid, str):
+                return oid
+            if isinstance(oid, dict):
+                return oid.get("$oid") or oid.get("oid") or str(oid)
+            return str(oid)
+        
+        workflow_id = _normalize_id(workflow_id_raw)
         workflows = self.context.get("workflows", [])
         workflow = None
         for wf in workflows:
-            if wf.get("_id") == workflow_id:
+            wf_id = _normalize_id(wf.get("_id"))
+            if wf_id and workflow_id and wf_id == workflow_id:
                 workflow = wf
                 break
         
         if not workflow:
-            logger.warning(f"✗ Workflow '{workflow_id}' not found in context.")
+            logger.warning(f"✗ Workflow '{workflow_id}' not found in context (checked {len(workflows)} workflows).")
             return False
         
         questions = workflow.get("questions", [])
@@ -74,14 +85,14 @@ class WorkflowManager:
             for opt in (q.get("options") or []):
                 nqid = opt.get("nextQuestionId")
                 if nqid:
-                    linked_question_ids.add(nqid)
+                    linked_question_ids.add(_normalize_id(nqid))
 
         logger.info(f"Workflow linked (branch-only) question IDs: {linked_question_ids}")
 
         active_questions = [q for q in questions if q.get("isActive", True)]
-        # Only sequential questions go into the initial queue
+        # Only sequential questions go into the initial queue (exclude branch targets)
         sequential_questions = sorted(
-            [q for q in active_questions if q.get("_id") not in linked_question_ids],
+            [q for q in active_questions if _normalize_id(q.get("_id")) not in linked_question_ids],
             key=lambda q: q.get("order", 0)
         )
 
