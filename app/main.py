@@ -4,7 +4,7 @@ import re
 import time
 import secrets
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +36,47 @@ from twilio.twiml.voice_response import VoiceResponse
 logger = logging.getLogger("assistly")
 logging.basicConfig(level=logging.INFO)
 
+
+class MessengerSession(TypedDict, total=False):
+    """Typed structure for in-memory Messenger sessions."""
+
+    user_id: str  # PSID – conversation partner
+    recipient_id: str  # Page ID
+    history: List[Dict[str, str]]
+    email_state: Dict[str, Any]
+    phone_state: Dict[str, Any]
+    context: Dict[str, Any]
+    user_id_owner: str
+    app_id: Optional[str]
+    created_at: float
+    last_activity: float
+    flow_controller: Optional[FlowController]
+    response_generator: Optional[ResponseGenerator]
+    page_access_token: str
+    response_language_code: str
+    response_language: str
+
+
+class InstagramSession(TypedDict, total=False):
+    """Typed structure for in-memory Instagram sessions."""
+
+    user_id: str  # IGSID – conversation partner
+    recipient_id: str  # IG Business Account ID
+    history: List[Dict[str, str]]
+    email_state: Dict[str, Any]
+    phone_state: Dict[str, Any]
+    context: Dict[str, Any]
+    user_id_owner: str
+    app_id: Optional[str]
+    created_at: float
+    last_activity: float
+    flow_controller: Optional[FlowController]
+    response_generator: Optional[ResponseGenerator]
+    instagram_access_token: str
+    response_language_code: str
+    response_language: str
+
+
 # In-memory storage for WhatsApp conversations (session-based)
 # Key: session_id, Value: {phone, history, email_state, phone_state, context, user_id, created_at, last_activity}
 whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
@@ -44,7 +85,7 @@ whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
 phone_to_session: Dict[str, str] = {}
 
 # Messenger: session_id -> session data; (page_id, user_id) -> session_id
-messenger_sessions: Dict[str, Dict[str, Any]] = {}
+messenger_sessions: Dict[str, MessengerSession] = {}
 messenger_key_to_session: Dict[str, str] = {}
 
 def get_or_create_messenger_session(page_id: str, user_id: str) -> Tuple[str, bool]:
@@ -69,7 +110,7 @@ def get_or_create_messenger_session(page_id: str, user_id: str) -> Tuple[str, bo
     return session_id, True
 
 # Instagram: session_id -> session data; (sender_id, user_id) -> session_id
-instagram_sessions: Dict[str, Dict[str, Any]] = {}
+instagram_sessions: Dict[str, InstagramSession] = {}
 instagram_key_to_session: Dict[str, str] = {}
 
 def get_or_create_instagram_session(sender_id: str, user_id: str) -> Tuple[str, bool]:
