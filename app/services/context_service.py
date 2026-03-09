@@ -123,6 +123,75 @@ class ContextService:
 
         return normalized
 
+    async def fetch_context_by_social_sender(self, social_sender_id: str) -> Dict[str, Any]:
+        """Fetch app context by Facebook Page ID or Instagram Business Account ID."""
+        path = f"/api/v1/apps/by-social-sender/{social_sender_id}/context"
+        url = f"{self.base_url}{path}"
+
+        ts = str(generate_ts_millis())
+        nonce = generate_nonce()
+        sign = build_signature_with_param(
+            self.secret,
+            ts,
+            nonce,
+            method="GET",
+            path=path,
+            param_name="socialSenderId",
+            param_value=social_sender_id,
+        )
+
+        headers = {
+            "x-tp-ts": ts,
+            "x-tp-nonce": nonce,
+            "x-tp-sign": sign,
+            "accept": "application/json",
+        }
+
+        start_time = time.time()
+        logger.info(
+            "Sending context API request at %s for social_sender_id=%s",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
+            social_sender_id,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.get(url, headers=headers)
+
+            logger.info(
+                "Context API response status: %s for social_sender_id=%s",
+                resp.status_code,
+                social_sender_id,
+            )
+            try:
+                logger.info("Context API response body: %s", resp.text)
+            except Exception:
+                logger.info("Could not read response body")
+
+            resp.raise_for_status()
+            data = resp.json()
+
+        end_time = time.time()
+        duration = end_time - start_time
+        logger.info(
+            "Received context API response at %s (took %.3fs) for social_sender_id=%s",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time)),
+            duration,
+            social_sender_id,
+        )
+
+        try:
+            logger.info("Context API response for social_sender_id=%s: %s", social_sender_id, json.dumps(data))
+        except Exception:
+            logger.info("Context API response for social_sender_id=%s (non-serializable)", social_sender_id)
+
+        normalized = self._normalize_context(data)
+        try:
+            logger.info("Normalized context for social_sender_id=%s: %s", social_sender_id, json.dumps(normalized))
+        except Exception:
+            logger.info("Normalized context for social_sender_id=%s (non-serializable)", social_sender_id)
+
+        return normalized
+
     async def fetch_context_by_app(self, app_id: str) -> Dict[str, Any]:
         """Fetch context by app ID (app-wise embedding; same user can have multiple apps)."""
         path = f"/api/v1/users/public/apps/{quote(app_id, safe='')}/context"
@@ -139,7 +208,7 @@ class ContextService:
             param_name="appId",
             param_value=app_id,
         )
-
+        
         headers = {
             "x-tp-ts": ts,
             "x-tp-nonce": nonce,
@@ -163,7 +232,7 @@ class ContextService:
 
         normalized = self._normalize_context(data)
         return normalized
-
+    
     def _normalize_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
         # Many backends wrap payload inside a top-level 'data' key
         src = data.get("data", data) if isinstance(data, dict) else {}
@@ -286,6 +355,25 @@ class ContextService:
             "Workflow",
         ], [])
 
+        # ── Platform access tokens (needed for Graph API channels) ──────────
+        messenger_access_token = first_present(
+            [
+                "messengerAccessToken",
+                "messenger_access_token",
+                "facebookPageAccessToken",
+                "pageAccessToken",
+            ],
+            None,
+        )
+
+        instagram_access_token = first_present(
+            [
+                "instagramAccessToken",
+                "instagram_access_token",
+            ],
+            None,
+        )
+
         return {
             "lead_types": lead_types,
             "treatment_plans": treatment_plans,
@@ -296,4 +384,6 @@ class ContextService:
             "user": user_data,  # Preserve user data
             "app": app_data,  # Preserve app data for multi-app support
             "workflows": workflows,  # Preserve workflows for workflow questions
+            "messengerAccessToken": messenger_access_token,  # Facebook Page Access Token
+            "instagramAccessToken": instagram_access_token,  # Instagram Access Token
         }
