@@ -259,7 +259,7 @@ class ContextService:
             lead_types_from_integration = integration_obj.get("leadTypeMessages") or integration_obj.get("lead_type_messages")
             # Log for debugging
             if lead_types_from_integration:
-                logger.info(f"✓ Found leadTypeMessages in integration: {len(lead_types_from_integration)} items")
+                logger.info(f"Found leadTypeMessages in integration: {len(lead_types_from_integration)} items")
                 # Check if emojis are present
                 emoji_count = sum(1 for lt in lead_types_from_integration if isinstance(lt, dict) and lt.get("emoji"))
                 logger.info(f"Lead types with emojis: {emoji_count}/{len(lead_types_from_integration)}")
@@ -268,15 +268,15 @@ class ContextService:
                     logger.info(f"First leadTypeMessage structure: {list(lead_types_from_integration[0].keys())}")
                     logger.info(f"First leadTypeMessage emoji value: {lead_types_from_integration[0].get('emoji')}")
             else:
-                logger.warning(f"✗ leadTypeMessages not found in integration object. Available keys: {list(integration_obj.keys())}")
+                logger.warning(f"leadTypeMessages not found in integration object. Available keys: {list(integration_obj.keys())}")
         else:
-            logger.warning(f"✗ Integration object is not a dict, type: {type(integration_obj)}")
+            logger.warning(f"Integration object is not a dict, type: {type(integration_obj)}")
         
         # Prioritize leadTypeMessages from integration object (has emojis)
         # Only fall back to root-level keys if integration doesn't have leadTypeMessages
         if lead_types_from_integration:
             lead_types_raw = lead_types_from_integration
-            logger.info(f"✓ Using leadTypeMessages from integration object: {len(lead_types_raw)} items")
+            logger.info(f"Using leadTypeMessages from integration object: {len(lead_types_raw)} items")
         else:
             # Fall back to root-level keys (may not have emojis)
             lead_types_raw = first_present([
@@ -287,9 +287,9 @@ class ContextService:
                 "leadTypeMessages",  # Also check root level
             ], [])
             if lead_types_raw:
-                logger.warning(f"⚠ Using lead_types from root level (may not have emojis): {len(lead_types_raw)} items")
+                logger.warning(f"Using lead_types from root level (may not have emojis): {len(lead_types_raw)} items")
             else:
-                logger.warning("⚠ No lead types found anywhere!")
+                logger.warning("No lead types found anywhere!")
         
         # Log what we found
         if lead_types_raw:
@@ -313,9 +313,9 @@ class ContextService:
                 emoji_value = item.get("emoji")
                 if emoji_value is not None and str(emoji_value).strip():
                     entry["emoji"] = str(emoji_value).strip()
-                    logger.info(f"✓ Added emoji '{entry['emoji']}' to lead type '{entry['text']}' (id={entry['id']})")
+                    logger.info(f"Added emoji '{entry['emoji']}' to lead type '{entry['text']}' (id={entry['id']})")
                 else:
-                    logger.warning(f"✗ No emoji found for lead type '{entry['text']}' (id={entry['id']}), emoji_value={emoji_value}")
+                    logger.warning(f"No emoji found for lead type '{entry['text']}' (id={entry['id']}), emoji_value={emoji_value}")
                 # Include relevantServicePlans if present (for filtering services by lead type)
                 if isinstance(item.get("relevantServicePlans"), list) and item["relevantServicePlans"]:
                     entry["relevantServicePlans"] = [str(s).strip() for s in item["relevantServicePlans"] if s]
