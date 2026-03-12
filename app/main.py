@@ -234,6 +234,20 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/v1/cache/stats")
+async def get_cache_stats() -> Dict[str, Any]:
+    """Get cache statistics for monitoring performance."""
+    from app.utils.cache_utils import get_cache_stats
+    return {
+        "status": "ok",
+        "cache": get_cache_stats(),
+        "sessions": {
+            "active_whatsapp": len(whatsapp_sessions),
+            "phone_mappings": len(phone_to_session)
+        }
+    }
+
+
 class InvalidateSessionsBody(BaseModel):
     twilio_phone: str
 
@@ -246,23 +260,41 @@ async def invalidate_whatsapp_sessions(
     """
     Clear all WhatsApp sessions for a given Twilio number so the next message fetches fresh context
     (e.g. after switching which app 'uses this number'). Called by backend when setUsesTwilioNumber succeeds.
+    Also clears cached translations for affected apps.
     """
-    # Only require the secret when AI has it set in .env. When unset, all requests are allowed (add secret in both .envs later for production).
-    if settings.invalidate_sessions_secret:
-        if x_invalidate_sessions_secret != settings.invalidate_sessions_secret:
+    # Use same signing secret as third-party API authentication (TP_SIGN_SECRET)
+    # Only require the secret when AI has it set in .env. When unset, all requests are allowed.
+    if settings.tp_sign_secret:
+        if x_invalidate_sessions_secret != settings.tp_sign_secret:
             raise HTTPException(status_code=401, detail="Invalid or missing secret")
     clean_phone = (body.twilio_phone or "").replace("whatsapp:", "").strip()
     if not clean_phone:
         raise HTTPException(status_code=400, detail="twilio_phone required")
+    
     removed = []
+    app_ids_to_invalidate = set()
+    
     for session_id, session in list(whatsapp_sessions.items()):
         session_phone = (session.get("twilio_phone") or "").replace("whatsapp:", "").strip()
         if session_phone == clean_phone:
+            # Track app_id for cache invalidation
+            app_id = session.get("app_id")
+            if app_id:
+                app_ids_to_invalidate.add(str(app_id))
+            
             phone = session.get("phone")
             if phone and phone_to_session.get(phone) == session_id:
                 del phone_to_session[phone]
             del whatsapp_sessions[session_id]
             removed.append(session_id)
+    
+    # Invalidate cached translations and greetings for affected apps
+    if app_ids_to_invalidate:
+        from app.utils.cache_utils import invalidate_app_cache
+        for app_id in app_ids_to_invalidate:
+            invalidate_app_cache(app_id)
+        logger.info("Invalidated cache for %d app(s): %s", len(app_ids_to_invalidate), app_ids_to_invalidate)
+    
     logger.info("Invalidated WhatsApp sessions for twilio_phone=%s, removed %d session(s)", clean_phone, len(removed))
     return {"status": "ok", "twilio_phone": clean_phone, "removed_sessions": len(removed)}
 
@@ -548,6 +580,16 @@ def _convert_services_to_whatsapp_list(services: List[Any], service_plans: List[
     
     return sections
 
+def _bot_requests_file_upload(text: str) -> bool:
+    """Return True if the bot message is asking the user to upload a file/document."""
+    lower = text.lower()
+    request_verbs = ("upload", "send us", "please send", "attach", "provide", "share", "submit", "email us")
+    file_nouns = ("file", "document", "photo", "image", "picture", "form", "certificate", "id", "proof", "receipt", "invoice", "attachment")
+    has_verb = any(v in lower for v in request_verbs)
+    has_noun = any(n in lower for n in file_nouns)
+    return has_verb and has_noun
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -615,9 +657,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
 
     # Send greeting (from DB) + lead types as buttons as soon as widget opens; no first user message required
-    initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
-    conversation_history.append({"role": "assistant", "content": initial_reply})
-    await websocket.send_json({"type": "bot", "content": initial_reply})
+    try:
+        initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
+        conversation_history.append({"role": "assistant", "content": initial_reply})
+        await websocket.send_json({"type": "bot", "content": initial_reply})
+    except Exception as greeting_exc:
+        logger.exception("Failed to generate greeting: %s", greeting_exc)
+        await websocket.send_json({"type": "error", "content": "Failed to load greeting. Please try again."})
 
     try:
         while True:
@@ -626,7 +672,55 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 parsed = json.loads(data)
                 user_text = parsed.get("content") or parsed.get("text") or data
             except json.JSONDecodeError:
+                parsed = {}
                 user_text = data
+
+            # ── Handle file_upload messages from the chat widget ──────────────
+            if isinstance(parsed, dict) and parsed.get("type") == "file_upload":
+                filename = parsed.get("filename", "file")
+                download_url = parsed.get("downloadUrl", "")
+                content_type = parsed.get("contentType", "")
+
+                # Acknowledge the file upload and encourage the workflow to continue
+                file_ack_msg = (
+                    f"📎 Thank you for uploading **{filename}**. "
+                    f"Our team will review it."
+                )
+                if download_url:
+                    file_ack_msg += (
+                        f'\n<file url="{download_url}" name="{filename}">View / Download {filename}</file>'
+                    )
+
+                # Record in conversation history
+                conversation_history.append({"role": "user", "content": f"[File uploaded: {filename}]"})
+                conversation_history.append({"role": "assistant", "content": file_ack_msg})
+
+                await websocket.send_json({"type": "bot", "content": file_ack_msg})
+
+                # If in workflow, record a placeholder answer so we advance to the next question
+                wm = flow_controller.workflow_manager
+                if wm and wm.is_active and not wm.is_workflow_complete():
+                    has_more = wm.record_answer(f"[File: {filename}]")
+                    if has_more:
+                        next_q = wm.get_current_question()
+                        if next_q:
+                            next_text = wm.format_question_with_options(next_q)
+                            conversation_history.append({"role": "assistant", "content": next_text})
+                            await websocket.send_json({"type": "bot", "content": next_text})
+                            # Signal the frontend to show the file upload button if the next question asks for a file
+                            if _bot_requests_file_upload(next_text):
+                                await websocket.send_json({"type": "enable_file_upload"})
+                    else:
+                        # Workflow done – move state forward (ConversationState is imported at top of module)
+                        flow_controller.collected_data["workflowAnswers"] = wm.get_workflow_answers()
+                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        next_reply = await response_generator.generate_response(
+                            flow_controller, "[File uploaded]", conversation_history, context
+                        )
+                        conversation_history.append({"role": "assistant", "content": next_reply})
+                        await websocket.send_json({"type": "bot", "content": next_reply})
+                continue
+            # ─────────────────────────────────────────────────────────────────
 
             if not user_text or not str(user_text).strip():
                 continue
@@ -979,6 +1073,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # Regular conversation response
             conversation_history.append({"role": "assistant", "content": reply})
             await websocket.send_json({"type": "bot", "content": reply})
+            # Signal the frontend to show the file upload button if the bot is requesting a file
+            if _bot_requests_file_upload(reply):
+                await websocket.send_json({"type": "enable_file_upload"})
             
             # State transitions are handled in response_generator
             # Only update if we're still in the same state (no transition happened)
@@ -990,6 +1087,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected for user_id=%s", user_id)
+    except Exception as loop_exc:
+        logger.exception("Unhandled error in WebSocket loop for user_id=%s: %s", user_id, loop_exc)
+        try:
+            await websocket.send_json({"type": "error", "content": "An unexpected error occurred. Please try again."})
+        except Exception:
+            pass
 
 
 @app.post("/webhook/voice-agent")
@@ -1242,14 +1345,21 @@ async def whatsapp_webhook(request: Request):
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
             
-            # Build RAG vector store
-            rag_service.build_vector_store(context)
-            
             # First message from user (e.g. "السلام علیکم") – detect language and greet in that language
             first_message = (message_data.get("body") or "").strip()
+            
+            # Measure greeting generation time for performance monitoring
+            greeting_start = time.time()
             initial_reply = await response_generator.generate_greeting(
                 context, channel="whatsapp", first_message=first_message or None
             )
+            greeting_duration = time.time() - greeting_start
+            logger.info(f"WhatsApp: Generated greeting in {greeting_duration:.3f}s for {user_phone}")
+            
+            # Build RAG vector store in background (non-blocking) to improve response time
+            # The vector store will be ready for subsequent FAQ/knowledge queries
+            import asyncio
+            asyncio.create_task(asyncio.to_thread(rag_service.build_vector_store, context))
             whatsapp_sessions[session_id]["history"].append({"role": "user", "content": first_message or "(started)"})
             whatsapp_sessions[session_id]["history"].append({"role": "assistant", "content": initial_reply})
             whatsapp_sessions[session_id]["flow_controller"] = flow_controller
@@ -1356,6 +1466,24 @@ async def whatsapp_webhook(request: Request):
                     logger.info(f"WhatsApp: User selected service plan #{number} -> '{service_name}'")
                 else:
                     logger.warning(f"WhatsApp: User selected invalid service number {number}, available: {len(all_options)}")
+            elif flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+                # Convert numbered response to the actual workflow option text
+                wm = flow_controller.workflow_manager
+                if wm and wm.is_active:
+                    current_q = wm.get_current_question()
+                    if current_q:
+                        opts = current_q.get("options", []) or []
+                        sorted_opts = sorted(opts, key=lambda o: o.get("order", 0))
+                        if 1 <= number <= len(sorted_opts):
+                            opt_text = sorted_opts[number - 1].get("text", "").strip()
+                            enhanced_user_text = opt_text
+                            logger.info(f"WhatsApp: Workflow option #{number} -> '{opt_text}'")
+                        else:
+                            logger.warning(f"WhatsApp: Workflow option #{number} out of range ({len(sorted_opts)} options)")
+                    else:
+                        logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but no current question found")
+                else:
+                    logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but workflow manager not active")
             else:
                 logger.info(f"WhatsApp: Number {number} - context unclear, treating as raw input")
         

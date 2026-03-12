@@ -22,6 +22,8 @@ class ResponseGenerator:
         self.profession = "Business"  # Default fallback - will be overridden by app's industry
         self.channel: str = "web"
         self.response_language: Optional[str] = None  # e.g. "Spanish" for prompts; None/English = no instruction
+        # Backend API base for generating attachment download URLs
+        self.api_base_url: str = getattr(settings, "api_base_url", "").rstrip("/") + "/api/v1"
 
     def set_response_language(self, language_name: Optional[str]) -> None:
         """Set language for all user-facing replies (e.g. 'Spanish'). None or 'English' = keep default."""
@@ -357,7 +359,9 @@ Classify the intent:"""
         
         # Initialize or reuse workflow manager
         if flow_controller.workflow_manager is None:
-            flow_controller.workflow_manager = WorkflowManager(context)
+            wm_context = dict(context)
+            wm_context["api_base_url"] = self.api_base_url
+            flow_controller.workflow_manager = WorkflowManager(wm_context)
         workflow_manager = flow_controller.workflow_manager
         
         # Extract data from user message (only extract what we need based on state)
@@ -471,20 +475,114 @@ Classify the intent:"""
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
                 
-                # Check if user asked a question along with lead type selection
-                if has_question:
-                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_data_collected_with_question_response(
-                        "lead type", lead_type.get("text"), rag_context, 
-                        "service selection", conversation_history, context,
-                        collected_lead_type=lead_type.get("value")
-                    )
+                # Check if there's only one service for this lead type - if so, auto-select it
+                treatment_plans = context.get("treatment_plans", [])
+                lead_types = context.get("lead_types", [])
+                filtered_services = self._filter_services_by_lead_type(treatment_plans, lead_types, lead_type.get("value"))
+                
+                if filtered_services is not None:
+                    all_services = filtered_services
                 else:
-                    # Explicitly include services (filtered by lead type when configured)
-                    return await self._generate_service_selection_response(
-                        conversation_history, context,
-                        collected_lead_type=lead_type.get("value")
-                    )
+                    all_services = []
+                    for plan in treatment_plans:
+                        if isinstance(plan, dict):
+                            plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                            if plan_name:
+                                all_services.append(plan_name)
+                        else:
+                            all_services.append(str(plan))
+                
+                # If only one service exists, auto-select it and skip service selection
+                if len(all_services) == 1:
+                    single_service = all_services[0]
+                    logger.info(f"Only one service available for lead type '{lead_type.get('value')}': '{single_service}' - auto-selecting")
+                    flow_controller.update_collected_data("serviceType", single_service)
+                    
+                    # Check for workflows
+                    if flow_controller.workflow_manager is None:
+                        wm_context2 = dict(context)
+                        wm_context2["api_base_url"] = self.api_base_url
+                        flow_controller.workflow_manager = WorkflowManager(wm_context2)
+                    workflow_manager = flow_controller.workflow_manager
+                    
+                    workflow_started = False
+                    if workflow_manager.start_workflow_for_treatment_plan(single_service):
+                        # Start workflow questions
+                        flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+                        workflow_started = True
+                        logger.info(f"✓ Started workflow for auto-selected service '{single_service}' - transitioning to WORKFLOW_QUESTION state")
+                        current_question = workflow_manager.get_current_question()
+                        if current_question:
+                            question_text = workflow_manager.format_question_with_options(current_question)
+                            logger.info(f"✓ First workflow question: '{current_question.get('question', '')}'")
+                            # If user asked a question, answer it briefly then ask workflow question
+                            if has_question:
+                                try:
+                                    rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
+                                    if rag_context and self.client:
+                                        brief_system = f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."
+                                        if self._language_instruction():
+                                            brief_system += "\n\n" + self._language_instruction()
+                                        response = await self.client.chat.completions.create(
+                                            model=self.model,
+                                            messages=[
+                                                {"role": "system", "content": brief_system},
+                                                {"role": "user", "content": f"Context: {rag_context}\n\nQuestion: {user_message}"}
+                                            ],
+                                            max_tokens=100,
+                                            temperature=0.3
+                                        )
+                                        brief_answer = (response.choices[0].message.content or "").strip()
+                                        if brief_answer:
+                                            logger.info(f"✓ Answering question then asking workflow question")
+                                            return f"{brief_answer}\n\n{question_text}"
+                                except Exception as e:
+                                    logger.warning(f"Failed to generate brief answer for question: {e}")
+                            logger.info(f"✓ Returning workflow question (no user question to answer first)")
+                            return question_text
+                        else:
+                            logger.warning(f"Workflow started but no questions found - continuing to name collection")
+                            workflow_manager.reset()
+                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    else:
+                        logger.info(f"No workflow found for auto-selected service '{single_service}' - continuing to name collection")
+                        workflow_manager.reset()
+                    
+                    # If workflow was NOT started, continue to name collection
+                    if not workflow_started:
+                        logger.info(f"No workflow started - transitioning to name collection")
+                        workflow_manager.reset()
+                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    
+                    logger.info(f"Transitioned to state: {flow_controller.state.value}")
+                    
+                    # Check if user asked a question (only if no workflow)
+                    if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+                        rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
+                        return await self._generate_data_collected_with_question_response(
+                            "service", single_service, rag_context,
+                            "name", conversation_history, context
+                        )
+                    elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+                        # Just acknowledge and move to name collection
+                        return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                else:
+                    # Multiple services - show selection as before
+                    logger.info(f"Multiple services available ({len(all_services)}) - showing service selection")
+                    # Check if user asked a question along with lead type selection
+                    if has_question:
+                        rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                        return await self._generate_data_collected_with_question_response(
+                            "lead type", lead_type.get("text"), rag_context, 
+                            "service selection", conversation_history, context,
+                            collected_lead_type=lead_type.get("value")
+                        )
+                    else:
+                        # Explicitly include services (filtered by lead type when configured)
+                        return await self._generate_service_selection_response(
+                            conversation_history, context,
+                            collected_lead_type=lead_type.get("value")
+                        )
             else:
                 logger.warning(f"No lead type matched for user input: '{user_message}'. Available lead types: {[lt.get('text') for lt in context.get('lead_types', [])]}")
                 # No match found - use AI to handle questions, but with strict prompt to only show lead types
@@ -562,15 +660,13 @@ Classify the intent:"""
                         logger.info(f"✓ Started workflow for treatment plan '{matched_treatment_plan_name}' - transitioning to WORKFLOW_QUESTION state")
                         current_question = workflow_manager.get_current_question()
                         if current_question:
-                            question_text = current_question.get("question", "") or ""
-                            logger.info(f"✓ First workflow question: '{question_text}'")
+                            question_text = workflow_manager.format_question_with_options(current_question) or ""
+                            logger.info(f"✓ First workflow question: '{current_question.get('question', '')}'")
                             # If user asked a question, answer it briefly then ask workflow question
                             if has_question:
-                                # Get a brief answer to the question using RAG
                                 try:
                                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                                     if rag_context and self.client:
-                                        # Generate a brief answer (1-2 sentences)
                                         brief_system = f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences."
                                         if self._language_instruction():
                                             brief_system += "\n\n" + self._language_instruction()
@@ -586,10 +682,9 @@ Classify the intent:"""
                                         brief_answer = (response.choices[0].message.content or "").strip()
                                         if brief_answer:
                                             logger.info(f"✓ Answering question then asking workflow question")
-                                            return f"{brief_answer} Now, {question_text}"
+                                            return f"{brief_answer}\n\n{question_text}"
                                 except Exception as e:
                                     logger.warning(f"Failed to generate brief answer for question: {e}")
-                                    # If answer generation fails, just ask workflow question
                             logger.info(f"✓ Returning workflow question (no user question to answer first)")
                             return question_text
                         else:
@@ -639,55 +734,43 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                # No RAG needed for standard name collection prompt
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             
             # Check if user is asking a question instead of answering the workflow question
             if has_question:
-                # User asked a question - answer it first, then re-ask the workflow question
                 logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
                 rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                current_question_text = current_question.get("question", "") or ""
-                # Generate answer to the question
+                current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
                 if rag_context and self.client:
                     try:
                         answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
-                        # Return answer + re-ask workflow question
-                        return f"{answer} Now, {current_question_text}"
+                        return f"{answer}\n\n{current_question_formatted}"
                     except Exception as e:
                         logger.warning(f"Failed to generate answer for question: {e}")
-                        # Fallback: just re-ask workflow question
-                        return current_question_text
+                        return current_question_formatted
                 else:
-                    # No RAG context available, just re-ask workflow question
-                    return current_question_text
+                    return current_question_formatted
             
             # Not a question - treat as workflow answer
-            # Record answer and move to next question
             has_more = workflow_manager.record_answer(user_message)
             
             if has_more:
-                # More questions remain, ask next question
                 next_question = workflow_manager.get_current_question()
                 if next_question:
-                    return next_question.get("question", "") or ""
+                    return workflow_manager.format_question_with_options(next_question) or ""
                 else:
-                    # No more questions, complete workflow
                     workflow_answers = workflow_manager.get_workflow_answers()
                     flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                     workflow_manager.reset()
                     flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                    # No RAG needed for standard name collection prompt
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
-                # Last question answered, complete workflow
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                 workflow_manager.reset()
                 flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                # No RAG needed for standard name collection prompt
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
         
         if state == ConversationState.NAME_COLLECTION:
@@ -914,9 +997,12 @@ CRITICAL RULES:
             display_services = list(all_services) if all_services else []
             if self.response_language and display_services and self.client and self.model:
                 from ..utils.translation_utils import translate_batch
+                # Extract app_id for caching translations per app
+                app_data = context.get("app", {})
+                app_id = str(app_data.get("id")) if app_data and app_data.get("id") else None
                 try:
                     display_services = await translate_batch(
-                        self.client, self.model, display_services, self.response_language
+                        self.client, self.model, display_services, self.response_language, app_id
                     )
                 except Exception as e:
                     logger.warning("Service names translation failed: %s", e)
@@ -1462,6 +1548,10 @@ Make it professional and informative."""
         need_translation = lang_code and lang_code != "en"
         translated_options: List[str] = []
 
+        # Extract app_id for caching translations per app
+        app_data = context.get("app", {})
+        app_id = str(app_data.get("id")) if app_data and app_data.get("id") else None
+
         if need_translation and lead_types:
             # Prefer DB labels; for any without a label, collect text and translate in one batch
             use_labels = all(
@@ -1471,8 +1561,9 @@ Make it professional and informative."""
             if not use_labels:
                 to_translate = [str(lt.get("text", "") or lt.get("value", "")).strip() for lt in lead_types if isinstance(lt, dict)]
                 if to_translate:
+                    # Pass app_id for caching translations per app
                     translated_options = await translate_batch(
-                        self.client, self.model, to_translate, get_language_name(lang_code)
+                        self.client, self.model, to_translate, get_language_name(lang_code), app_id
                     )
 
         def option_text(lt: dict, index: int = 0) -> str:

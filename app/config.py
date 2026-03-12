@@ -18,9 +18,7 @@ class Settings(BaseModel):
     
     # Session configuration
     session_timeout_seconds: int = Field(default=300, alias="SESSION_TIMEOUT_SECONDS")  # 5 minutes default
-    # Secret for backend to call invalidate-whatsapp-sessions (optional; if set, header X-Invalidate-Sessions-Secret must match).
-    # Leave unset for now; add INVALIDATE_SESSIONS_SECRET to .env later (and same value as ASSISTLY_INVALIDATE_SESSIONS_SECRET in backend).
-    invalidate_sessions_secret: Optional[str] = Field(default=None, alias="INVALIDATE_SESSIONS_SECRET")
+    # Note: Session invalidation endpoint uses tp_sign_secret for authentication (same as other third-party API calls)
     
     # Twilio WhatsApp configuration
     twilio_account_sid: Optional[str] = Field(default=None, alias="TWILIO_ACCOUNT_SID")
