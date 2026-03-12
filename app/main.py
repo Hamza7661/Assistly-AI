@@ -37,15 +37,32 @@ logger = logging.getLogger("assistly")
 logging.basicConfig(level=logging.INFO)
 
 
+# ─── TypedDicts for Messenger and Instagram sessions ────────────────────────
+
+class EmailValidationState(TypedDict, total=False):
+    """Email OTP validation state within a session."""
+    email: Optional[str]
+    otp_sent: bool
+    otp_verified: bool
+    customer_name: Optional[str]
+
+
+class PhoneValidationState(TypedDict, total=False):
+    """Phone OTP validation state within a session."""
+    phone: Optional[str]
+    otp_sent: bool
+    otp_verified: bool
+
+
 class MessengerSession(TypedDict, total=False):
     """Typed structure for in-memory Messenger sessions."""
 
     user_id: str  # PSID – conversation partner
     recipient_id: str  # Page ID
     history: List[Dict[str, str]]
-    email_state: Dict[str, Any]
-    phone_state: Dict[str, Any]
-    context: Dict[str, Any]
+    email_state: EmailValidationState
+    phone_state: PhoneValidationState
+    context: Dict[str, object]
     user_id_owner: str
     app_id: Optional[str]
     created_at: float
@@ -63,9 +80,9 @@ class InstagramSession(TypedDict, total=False):
     user_id: str  # IGSID – conversation partner
     recipient_id: str  # IG Business Account ID
     history: List[Dict[str, str]]
-    email_state: Dict[str, Any]
-    phone_state: Dict[str, Any]
-    context: Dict[str, Any]
+    email_state: EmailValidationState
+    phone_state: PhoneValidationState
+    context: Dict[str, object]
     user_id_owner: str
     app_id: Optional[str]
     created_at: float
@@ -78,7 +95,6 @@ class InstagramSession(TypedDict, total=False):
 
 
 # In-memory storage for WhatsApp conversations (session-based)
-# Key: session_id, Value: {phone, history, email_state, phone_state, context, user_id, created_at, last_activity}
 whatsapp_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Mapping: phone number -> current active session_id
