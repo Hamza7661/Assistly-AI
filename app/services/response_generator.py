@@ -562,7 +562,7 @@ Classify the intent:"""
                         logger.info(f"✓ Started workflow for treatment plan '{matched_treatment_plan_name}' - transitioning to WORKFLOW_QUESTION state")
                         current_question = workflow_manager.get_current_question()
                         if current_question:
-                            question_text = current_question.get("question", "")
+                            question_text = current_question.get("question", "") or ""
                             logger.info(f"✓ First workflow question: '{question_text}'")
                             # If user asked a question, answer it briefly then ask workflow question
                             if has_question:
@@ -647,8 +647,7 @@ Classify the intent:"""
                 # User asked a question - answer it first, then re-ask the workflow question
                 logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
                 rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                current_question_text = current_question.get("question", "")
-                
+                current_question_text = current_question.get("question", "") or ""
                 # Generate answer to the question
                 if rag_context and self.client:
                     try:
@@ -671,7 +670,7 @@ Classify the intent:"""
                 # More questions remain, ask next question
                 next_question = workflow_manager.get_current_question()
                 if next_question:
-                    return next_question.get("question", "")
+                    return next_question.get("question", "") or ""
                 else:
                     # No more questions, complete workflow
                     workflow_answers = workflow_manager.get_workflow_answers()
@@ -1129,7 +1128,13 @@ If the context doesn't contain the answer, say "I don't have that information, b
         # For LEAD_TYPE_SELECTION (text channels): inject exact options from context so we never show a different list
         lead_types = context.get("lead_types", [])
         if state == ConversationState.LEAD_TYPE_SELECTION and self.channel != "voice" and lead_types:
-            numbered = "\n".join([f"{i}. {lt.get('text', '')}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
+            def format_lead_option(lt: dict, index: int) -> str:
+                text = lt.get('text', '')
+                emoji = lt.get('emoji', '').strip() if lt.get('emoji') else ''
+                if emoji:
+                    return f"{index}. {emoji} {text}"
+                return f"{index}. {text}"
+            numbered = "\n".join([format_lead_option(lt, i) for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
             state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant.
 
 CRITICAL - SERVICE OPTIONS (use ONLY this list from context; never invent or substitute another list):
@@ -1137,8 +1142,8 @@ CRITICAL - SERVICE OPTIONS (use ONLY this list from context; never invent or sub
 
 RULES:
 1. When the user asks for any option in their own language or words, they mean one of OUR options above. Always show the EXACT list above—do NOT replace it with a different list (e.g. do NOT show product categories, menu items, or other lists that are not these options).
-2. You MUST respond with EXACTLY the options above in this order (you may translate the labels to the user's language). Do NOT add, remove, or replace with other options.
-3. If user asks a question, answer briefly (1-2 sentences) using context, then show the EXACT list above and ask them to choose by number.
+2. You MUST respond with EXACTLY the options above in this order INCLUDING the emojis (you may translate the labels to the user's language but keep the emojis). Do NOT add, remove, or replace with other options.
+3. If user asks a question, answer briefly (1-2 sentences) using context, then show the EXACT list above (with emojis) and ask them to choose by number.
 4. DO NOT ask for date/time. Wait for lead type selection first."""
 
         if self.channel == "voice":
@@ -1193,6 +1198,86 @@ RULES:
  - If the user asks a question, answer briefly then ask for their email address.
  - Ask for the email in a friendly, conversational way.
  - Do NOT mention numbers or buttons."""
+        
+        # For WhatsApp/Messenger/Instagram in LEAD_TYPE_SELECTION: format lead types directly with emojis
+        # (like generate_greeting) instead of relying on LLM to preserve emojis
+        if state == ConversationState.LEAD_TYPE_SELECTION and self.channel in ("whatsapp", "messenger", "instagram"):
+            lead_types = context.get("lead_types", [])
+            if lead_types:
+                from ..utils.language_utils import detect_language, get_language_name_for_prompt, get_language_name
+                from ..utils.response_strings import get_string
+                from ..utils.translation_utils import translate_batch
+                
+                # Detect language from conversation history
+                lang_code = "en"
+                if conversation_history:
+                    last_user_msg = next((msg.get("content", "") for msg in reversed(conversation_history) if msg.get("role") == "user"), None)
+                    if last_user_msg:
+                        lang_code = detect_language(last_user_msg)
+                
+                need_translation = lang_code and lang_code != "en"
+                translated_options: List[str] = []
+                
+                if need_translation and lead_types:
+                    use_labels = all(
+                        isinstance(lt, dict) and isinstance(lt.get("labels"), dict) and (lang_code or "") in (lt.get("labels") or {})
+                        for lt in lead_types if isinstance(lt, dict)
+                    )
+                    if not use_labels:
+                        to_translate = [str(lt.get("text", "") or lt.get("value", "")).strip() for lt in lead_types if isinstance(lt, dict)]
+                        if to_translate and self.client and self.model:
+                            translated_options = await translate_batch(
+                                self.client, self.model, to_translate, get_language_name(lang_code)
+                            )
+                
+                def option_text(lt: dict, index: int = 0) -> str:
+                    text = lt.get("text", "") or lt.get("value", "")
+                    emoji = lt.get("emoji", "").strip() if lt.get("emoji") else ""
+                    
+                    display_text = str(text)
+                    if need_translation:
+                        labels = lt.get("labels") or {}
+                        if isinstance(labels, dict) and labels.get(lang_code):
+                            display_text = labels[lang_code]
+                        elif translated_options and 0 <= index < len(translated_options):
+                            display_text = translated_options[index]
+                    
+                    if emoji:
+                        return f"{emoji} {display_text}"
+                    return display_text
+                
+                # Format options with emojis
+                options = "\n".join([f"{i}. {option_text(lt, i - 1)}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
+                reply_line = get_string("please_reply_number", lang_code) if lang_code else "Please reply with the number of your choice."
+                
+                # If there's RAG context (user asked a question), generate answer first, then show options
+                if rag_context and self.client:
+                    try:
+                        answer_system = f"You are a {self.profession} assistant. Answer the question briefly in 1-2 sentences using the provided context."
+                        if self._language_instruction():
+                            answer_system += "\n\n" + self._language_instruction()
+                        
+                        recent_history = conversation_history[-5:] if len(conversation_history) > 5 else conversation_history
+                        answer_messages = [
+                            {"role": "system", "content": answer_system},
+                            {"role": "system", "content": f"Context: {rag_context}"}
+                        ]
+                        answer_messages.extend(recent_history)
+                        
+                        answer_response = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=answer_messages,
+                            max_tokens=100,
+                            temperature=0.3
+                        )
+                        answer = (answer_response.choices[0].message.content or "").strip()
+                        if answer:
+                            return f"{answer}\n\n{options}\n\n{reply_line}"
+                    except Exception as e:
+                        logger.warning(f"Failed to generate answer for question in LEAD_TYPE_SELECTION: {e}")
+                
+                # No question or answer generation failed - just show options
+                return f"{options}\n\n{reply_line}"
         
         system_prompt = state_prompts.get(state, f"You are a {self.profession} assistant. Continue the conversation naturally.")
         if self._language_instruction():
@@ -1392,18 +1477,32 @@ Make it professional and informative."""
 
         def option_text(lt: dict, index: int = 0) -> str:
             text = lt.get("text", "") or lt.get("value", "")
-            if not need_translation:
-                return str(text)
-            labels = lt.get("labels") or {}
-            if isinstance(labels, dict) and labels.get(lang_code):
-                return labels[lang_code]
-            if translated_options and 0 <= index < len(translated_options):
-                return translated_options[index]
-            return str(text)
+            emoji = lt.get("emoji", "").strip() if lt.get("emoji") else ""
+            
+            # Get translated text if needed
+            display_text = str(text)
+            if need_translation:
+                labels = lt.get("labels") or {}
+                if isinstance(labels, dict) and labels.get(lang_code):
+                    display_text = labels[lang_code]
+                elif translated_options and 0 <= index < len(translated_options):
+                    display_text = translated_options[index]
+            
+            # Prepend emoji to text if present
+            if emoji:
+                return f"{emoji} {display_text}"
+            return display_text
 
         if current_channel in ("whatsapp", "messenger", "instagram"):
+            # Log lead types for debugging
+            logger.info(f"generate_greeting: Processing {len(lead_types)} lead types for channel {current_channel}")
+            for idx, lt in enumerate(lead_types[:3]):  # Log first 3
+                if isinstance(lt, dict):
+                    logger.info(f"  Lead type {idx+1}: text='{lt.get('text')}', emoji='{lt.get('emoji', 'NONE')}'")
+            
             options = "\n".join([f"{i}. {option_text(lt, i - 1)}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
             reply_line = get_string("please_reply_number", lang_code) if lang_code else "Please reply with the number of your choice."
+            logger.info(f"Generated options string (first 100 chars): {options[:100]}")
             return f"{greeting}\n\n{options}\n\n{reply_line}"
         elif current_channel == "voice":
             option_names = []
