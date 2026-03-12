@@ -92,7 +92,7 @@ class InstagramGraphService:
                 raise
 
     # ------------------------------------------------------------------
-    # Security (same as Messenger - Meta uses X-Hub-Signature-256)
+    # Security (Meta uses X-Hub-Signature-256)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -124,7 +124,7 @@ class InstagramGraphService:
             return False
 
     # ------------------------------------------------------------------
-    # Webhook parsing (mirrors Messenger: text, postback, quick_reply, skip echo/read/delivery)
+    # Webhook parsing (text, postback, quick_reply, skip echo/read/delivery)
     # ------------------------------------------------------------------
 
     @staticmethod
