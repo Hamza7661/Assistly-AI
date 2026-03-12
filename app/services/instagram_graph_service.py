@@ -1,15 +1,36 @@
 """
 Instagram Graph API Messaging Service
-Handles sending messages via Meta's Instagram Messaging API (Graph API).
-Docs: https://developers.facebook.com/docs/messenger-platform/instagram
+Handles sending messages and parsing webhook events via Meta's Instagram Messaging API (Graph API).
+Docs: https://developers.facebook.com/docs/messenger-platform/instagram/features/webhook
 """
 
+import hashlib
+import hmac
 import os
 import logging
 import httpx
-from typing import Dict, Any, Optional
+from typing import Dict, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class InstagramSendMessageResponse(TypedDict, total=False):
+    """Response from Meta Graph API when sending a message."""
+    recipient_id: str
+    message_id: str
+
+
+class _InstagramWebhookParsedEventBase(TypedDict):
+    """Required fields for parsed Instagram webhook event."""
+    sender_id: str
+    recipient_id: str
+    message_text: str
+
+
+class InstagramWebhookParsedEvent(_InstagramWebhookParsedEventBase, total=False):
+    """Parsed Instagram webhook event. message_id and timestamp are optional."""
+    message_id: Optional[str]
+    timestamp: Optional[int]
 
 # Graph API configuration
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v21.0")
@@ -28,7 +49,7 @@ class InstagramGraphService:
         recipient_id: str,
         message_text: str,
         access_token: str
-    ) -> Dict[str, Any]:
+    ) -> InstagramSendMessageResponse:
         """
         Send a text message to an Instagram user via Graph API.
         
@@ -88,9 +109,45 @@ class InstagramGraphService:
             except Exception as e:
                 logger.error(f"Failed to send Instagram message: {str(e)}")
                 raise
-    
+
+    # ------------------------------------------------------------------
+    # Security (Meta uses X-Hub-Signature-256)
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def parse_webhook_event(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def verify_signature(
+        payload_body: bytes,
+        signature_header: str,
+        app_secret: str,
+    ) -> bool:
+        """
+        Verify the X-Hub-Signature-256 header that Meta attaches to webhook POSTs.
+        Returns True if the payload is genuine.
+        """
+        if not signature_header or not app_secret:
+            logger.warning("Instagram: missing signature header or app secret for verification")
+            return False
+        try:
+            algo, _, digest = signature_header.partition("=")
+            if algo != "sha256" or not digest:
+                logger.warning("Instagram: unexpected signature format: %s", signature_header)
+                return False
+            expected = hmac.new(
+                app_secret.encode("utf-8"),
+                payload_body,
+                hashlib.sha256,
+            ).hexdigest()
+            return hmac.compare_digest(expected, digest.lower())
+        except Exception as exc:
+            logger.error("Instagram: signature verification error: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Webhook parsing (text, postback, quick_reply, skip echo/read/delivery)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_webhook_event(body: Dict[str, object]) -> Optional[InstagramWebhookParsedEvent]:
         """
         Parse incoming Instagram webhook event from Meta.
         
@@ -125,51 +182,92 @@ class InstagramGraphService:
         """
         try:
             if body.get("object") != "instagram":
-                logger.warning(f"Received non-Instagram webhook: {body.get('object')}")
+                logger.warning("Instagram: received non-instagram webhook (object=%s)", body.get("object"))
                 return None
-            
+
             entries = body.get("entry", [])
             if not entries:
-                logger.warning("No entries in Instagram webhook")
+                logger.warning("Instagram: no entries in webhook payload")
                 return None
-            
-            # Process first entry's first messaging event
+
             entry = entries[0]
             messaging_events = entry.get("messaging", [])
-            
             if not messaging_events:
-                logger.debug("No messaging events in entry")
+                logger.debug("Instagram: no messaging events (may be read/delivery)")
                 return None
-            
+
             event = messaging_events[0]
-            
-            # Extract message details
-            sender = event.get("sender", {})
-            recipient = event.get("recipient", {})
-            message = event.get("message", {})
-            
-            sender_id = sender.get("id")
-            recipient_id = recipient.get("id")  # This is the Instagram Business Account ID
-            message_text = message.get("text", "").strip()
-            message_id = message.get("mid")
+            sender_id = event.get("sender", {}).get("id")
+            recipient_id = event.get("recipient", {}).get("id")
             timestamp = event.get("timestamp")
-            
-            if not sender_id or not message_text:
-                logger.debug("Missing sender ID or message text")
+
+            # Skip read receipts (messaging_seen)
+            if "read" in event:
+                logger.debug("Instagram: skipping read receipt")
                 return None
-            
+
+            # Handle postback (Icebreaker, Generic Template buttons)
+            postback = event.get("postback", {})
+            if postback:
+                message_text = (
+                    postback.get("title") or postback.get("payload") or ""
+                ).strip()
+                message_id = postback.get("mid")
+                if sender_id and message_text:
+                    logger.info(
+                        "Instagram: postback from %s to %s: '%s'",
+                        sender_id, recipient_id, message_text[:60] + ("..." if len(message_text) > 60 else ""),
+                    )
+                    return {
+                        "sender_id": sender_id,
+                        "recipient_id": recipient_id,
+                        "message_text": message_text,
+                        "message_id": message_id,
+                        "timestamp": timestamp,
+                    }
+                return None
+
+            # Handle message (text, quick_reply, etc.)
+            message = event.get("message", {})
+            if message.get("is_echo"):
+                logger.debug("Instagram: skipping echo message")
+                return None
+            if message.get("is_deleted") or message.get("is_unsupported"):
+                logger.debug("Instagram: skipping deleted/unsupported message")
+                return None
+
+            message_id = message.get("mid")
+
+            # 1. Plain text
+            message_text = message.get("text", "").strip()
+
+            # 2. Quick reply payload
+            if not message_text:
+                qr = message.get("quick_reply", {})
+                message_text = qr.get("payload", "").strip()
+
+            if not sender_id:
+                logger.debug("Instagram: missing sender IGSID in event")
+                return None
+            if not message_text:
+                logger.debug("Instagram: empty message text (attachment/sticker not supported)")
+                return None
+
             logger.info(
-                f"Parsed Instagram message from {sender_id} to {recipient_id}: '{message_text[:50]}...'"
+                "Instagram: message from IGSID=%s → IG=%s: '%s'",
+                sender_id,
+                recipient_id,
+                message_text[:60] + ("..." if len(message_text) > 60 else ""),
             )
-            
+
             return {
-                "sender_id": sender_id,  # IGSID (Instagram-scoped sender ID)
-                "recipient_id": recipient_id,  # Instagram Business Account ID
+                "sender_id": sender_id,
+                "recipient_id": recipient_id,
                 "message_text": message_text,
                 "message_id": message_id,
-                "timestamp": timestamp
+                "timestamp": timestamp,
             }
-            
-        except Exception as e:
-            logger.error(f"Error parsing Instagram webhook: {str(e)}", exc_info=True)
+
+        except Exception as exc:
+            logger.error("Instagram: error parsing webhook payload: %s", exc, exc_info=True)
             return None

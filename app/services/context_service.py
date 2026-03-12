@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict, Union
 import time
 from urllib.parse import quote
 
@@ -9,6 +9,17 @@ import json
 from ..utils.signing import build_signature, build_signature_with_param, generate_nonce, generate_ts_millis
 
 logger = logging.getLogger("assistly.context")
+
+
+class LeadTypeEntry(TypedDict, total=False):
+    """Typed structure for a normalized lead type option. id, value, text are required; others optional."""
+    id: Union[int, str]
+    value: str
+    text: str
+    emoji: str
+    relevantServicePlans: List[str]
+    synonyms: List[str]
+    labels: Dict[str, str]
 
 
 class ContextService:
@@ -243,20 +254,79 @@ class ContextService:
                     return src[key]
             return default
 
-        lead_types_raw = first_present([
-            "lead_types",
-            "leadTypes",
-            "leadtypes",
-            "lead_types_options",
-        ], [])
+        # Check for leadTypeMessages in integration object first (backend returns it there)
+        # Extract integration early to check for leadTypeMessages inside it
+        integration_obj = first_present([
+            "integration",
+            "Integration",
+            "assistant",
+            "Assistant",
+        ], {})
+        
+        # Try to get leadTypeMessages from integration object
+        lead_types_from_integration = None
+        if isinstance(integration_obj, dict):
+            logger.info(f"Integration object keys: {list(integration_obj.keys())}")
+            lead_types_from_integration = integration_obj.get("leadTypeMessages") or integration_obj.get("lead_type_messages")
+            # Log for debugging
+            if lead_types_from_integration:
+                logger.info(f"Found leadTypeMessages in integration: {len(lead_types_from_integration)} items")
+                # Check if emojis are present
+                emoji_count = sum(1 for lt in lead_types_from_integration if isinstance(lt, dict) and lt.get("emoji"))
+                logger.info(f"Lead types with emojis: {emoji_count}/{len(lead_types_from_integration)}")
+                # Log first item structure for debugging
+                if lead_types_from_integration and isinstance(lead_types_from_integration[0], dict):
+                    logger.info(f"First leadTypeMessage structure: {list(lead_types_from_integration[0].keys())}")
+                    logger.info(f"First leadTypeMessage emoji value: {lead_types_from_integration[0].get('emoji')}")
+            else:
+                logger.warning(f"leadTypeMessages not found in integration object. Available keys: {list(integration_obj.keys())}")
+        else:
+            logger.warning(f"Integration object is not a dict, type: {type(integration_obj)}")
+        
+        # Prioritize leadTypeMessages from integration object (has emojis)
+        # Only fall back to root-level keys if integration doesn't have leadTypeMessages
+        if lead_types_from_integration:
+            lead_types_raw = lead_types_from_integration
+            logger.info(f"Using leadTypeMessages from integration object: {len(lead_types_raw)} items")
+        else:
+            # Fall back to root-level keys (may not have emojis)
+            lead_types_raw = first_present([
+                "lead_types",
+                "leadTypes",
+                "leadtypes",
+                "lead_types_options",
+                "leadTypeMessages",  # Also check root level
+            ], [])
+            if lead_types_raw:
+                logger.warning(f"Using lead_types from root level (may not have emojis): {len(lead_types_raw)} items")
+            else:
+                logger.warning("No lead types found anywhere!")
+        
+        # Log what we found
+        if lead_types_raw:
+            logger.info(f"Using lead_types_raw with {len(lead_types_raw)} items")
+            if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
+                emoji_count = sum(1 for lt in lead_types_raw if isinstance(lt, dict) and lt.get("emoji"))
+                logger.info(f"Lead types with emojis in raw data: {emoji_count}/{len(lead_types_raw)}")
+                # Log first item for debugging
+                if lead_types_raw[0]:
+                    logger.info(f"First lead_type structure: {list(lead_types_raw[0].keys())}")
+                    logger.info(f"First lead_type emoji value: {lead_types_raw[0].get('emoji')}")
 
-        lead_types: List[Dict[str, Any]] = []
+        lead_types: List[LeadTypeEntry] = []
         if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
-            # Already in desired shape; preserve relevantServicePlans and synonyms (per-app from DB)
+            # Already in desired shape; preserve relevantServicePlans, synonyms, and emoji (per-app from DB)
             for idx, item in enumerate(lead_types_raw, start=1):
                 value = str(item.get("value") or item.get("id") or idx)
                 text = str(item.get("text") or value)
-                entry: Dict[str, Any] = {"id": item.get("id") or idx, "value": value, "text": text}
+                entry: LeadTypeEntry = {"id": item.get("id") or idx, "value": value, "text": text}
+                # Include emoji if present (for displaying emoji alongside lead type text)
+                emoji_value = item.get("emoji")
+                if emoji_value is not None and str(emoji_value).strip():
+                    entry["emoji"] = str(emoji_value).strip()
+                    logger.info(f"Added emoji '{entry['emoji']}' to lead type '{entry['text']}' (id={entry['id']})")
+                else:
+                    logger.warning(f"No emoji found for lead type '{entry['text']}' (id={entry['id']}), emoji_value={emoji_value}")
                 # Include relevantServicePlans if present (for filtering services by lead type)
                 if isinstance(item.get("relevantServicePlans"), list) and item["relevantServicePlans"]:
                     entry["relevantServicePlans"] = [str(s).strip() for s in item["relevantServicePlans"] if s]
@@ -316,12 +386,8 @@ class ContextService:
             )
 
         # Extract integration data (assistantName, greeting, etc.)
-        integration = first_present([
-            "integration",
-            "Integration",
-            "assistant",
-            "Assistant",
-        ], {})
+        # Use the integration we already extracted earlier
+        integration = integration_obj
 
         # Extract country code
         country = first_present([
