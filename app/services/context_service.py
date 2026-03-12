@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict, Union
 import time
 from urllib.parse import quote
 
@@ -9,6 +9,17 @@ import json
 from ..utils.signing import build_signature, build_signature_with_param, generate_nonce, generate_ts_millis
 
 logger = logging.getLogger("assistly.context")
+
+
+class LeadTypeEntry(TypedDict, total=False):
+    """Typed structure for a normalized lead type option. id, value, text are required; others optional."""
+    id: Union[int, str]
+    value: str
+    text: str
+    emoji: str
+    relevantServicePlans: List[str]
+    synonyms: List[str]
+    labels: Dict[str, str]
 
 
 class ContextService:
@@ -302,13 +313,13 @@ class ContextService:
                     logger.info(f"First lead_type structure: {list(lead_types_raw[0].keys())}")
                     logger.info(f"First lead_type emoji value: {lead_types_raw[0].get('emoji')}")
 
-        lead_types: List[Dict[str, Any]] = []
+        lead_types: List[LeadTypeEntry] = []
         if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
             # Already in desired shape; preserve relevantServicePlans, synonyms, and emoji (per-app from DB)
             for idx, item in enumerate(lead_types_raw, start=1):
                 value = str(item.get("value") or item.get("id") or idx)
                 text = str(item.get("text") or value)
-                entry: Dict[str, Any] = {"id": item.get("id") or idx, "value": value, "text": text}
+                entry: LeadTypeEntry = {"id": item.get("id") or idx, "value": value, "text": text}
                 # Include emoji if present (for displaying emoji alongside lead type text)
                 emoji_value = item.get("emoji")
                 if emoji_value is not None and str(emoji_value).strip():

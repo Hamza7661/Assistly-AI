@@ -9,9 +9,28 @@ import hmac
 import os
 import logging
 import httpx
-from typing import Dict, Any, Optional
+from typing import Dict, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class InstagramSendMessageResponse(TypedDict, total=False):
+    """Response from Meta Graph API when sending a message."""
+    recipient_id: str
+    message_id: str
+
+
+class _InstagramWebhookParsedEventBase(TypedDict):
+    """Required fields for parsed Instagram webhook event."""
+    sender_id: str
+    recipient_id: str
+    message_text: str
+
+
+class InstagramWebhookParsedEvent(_InstagramWebhookParsedEventBase, total=False):
+    """Parsed Instagram webhook event. message_id and timestamp are optional."""
+    message_id: Optional[str]
+    timestamp: Optional[int]
 
 # Graph API configuration
 GRAPH_API_VERSION = os.getenv("META_GRAPH_API_VERSION", "v21.0")
@@ -30,7 +49,7 @@ class InstagramGraphService:
         recipient_id: str,
         message_text: str,
         access_token: str
-    ) -> Dict[str, Any]:
+    ) -> InstagramSendMessageResponse:
         """
         Send a text message to an Instagram user via Graph API.
         
@@ -128,7 +147,7 @@ class InstagramGraphService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def parse_webhook_event(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def parse_webhook_event(body: Dict[str, object]) -> Optional[InstagramWebhookParsedEvent]:
         """
         Parse incoming Instagram webhook event from Meta.
         
