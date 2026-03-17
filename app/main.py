@@ -23,6 +23,7 @@ from .services.instagram_graph_service import InstagramGraphService
 from .services.messenger_graph_service import MessengerGraphService
 from .services.voice_agent_service import VoiceAgentService
 from .services.rag_service import RAGService
+from .services.calendar_service import CalendarService
 from .services.conversation_state import FlowController, ConversationState
 from .services.response_generator import ResponseGenerator
 from .services.data_extractors import DataExtractor
@@ -355,6 +356,60 @@ def _is_valid_email(email: str) -> bool:
     
     return True
 
+
+def _is_availability_intent(text: str) -> bool:
+    """Detect if user is asking for calendar availability or wants to add/book an appointment."""
+    if not text or not isinstance(text, str):
+        return False
+    t = text.strip().lower()
+    if len(t) > 200:  # Long messages are likely not a simple availability question
+        return False
+    availability_phrases = [
+        # "When are you free?" style
+        "when are you free",
+        "when are we free",
+        "are you free",
+        "what times are available",
+        "what slots are available",
+        "available times",
+        "available slots",
+        "when can i book",
+        "when can we meet",
+        "do you have availability",
+        "show me your availability",
+        "your availability",
+        "free slots",
+        "free times",
+        "open slots",
+        "book a slot",
+        "available this week",
+        "available tomorrow",
+        "free this week",
+        # "Add / book / schedule appointment" and lead-type style
+        "add an appointment",
+        "add appointment",
+        "schedule an appointment",
+        "book an appointment",
+        "make an appointment",
+        "i'd like to schedule",
+        "i would like to schedule",
+        "want to schedule",
+        "want to book",
+        "schedule a meeting",
+        "book a meeting",
+        "set up a meeting",
+        "set up an appointment",
+        # Lead type options that are about scheduling (e.g. "1 - I would like to schedule a checkup (leadType: ...)")
+        "schedule a routine",
+        "schedule a property",
+        "schedule a consultation",
+        "schedule a viewing",
+        "schedule a service",
+        "schedule a checkup",
+    ]
+    return any(p in t for p in availability_phrases)
+
+
 def _extract_otp_from_text(text: str) -> str:
     """Extract 6-digit OTP code from user text."""
     import re
@@ -666,7 +721,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     
     extractor = DataExtractor()
     conversation_history: List[Dict[str, str]] = []
-    
+    # Calendar flow state (persists across messages in this WebSocket session)
+    calendar_flow: Optional[str] = None
+    calendar_days: List[Dict[str, Any]] = []
+    calendar_slots: List[Dict[str, Any]] = []
+    calendar_free_slots: List[Dict[str, Any]] = []
+    calendar_selected_day: Optional[str] = None
+
     # Build RAG vector store
     rag_service.build_vector_store(context)
     
@@ -742,6 +803,146 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
+
+            integration = context.get("integration") or {}
+            app_id_for_calendar = app_id  # from query params when widget is opened with ?app_id=...
+
+            # ── Calendar flow: same as WhatsApp – show days/slots from connected calendar, allow booking ──
+            if calendar_flow and app_id_for_calendar and str(user_text).strip():
+                from datetime import datetime
+                raw_lower = str(user_text).strip().lower()
+                if raw_lower in ("cancel", "back", "exit"):
+                    calendar_flow = None
+                    calendar_days = []
+                    calendar_slots = []
+                    calendar_free_slots = []
+                    calendar_selected_day = None
+                    reply = "Cancelled. How can I help?"
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                try:
+                    num = int(str(user_text).strip())
+                    if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                        slot = calendar_slots[num - 1]
+                        start_iso = slot.get("start", "")
+                        end_iso = slot.get("end", "")
+                        title = "Appointment"
+                        calendar_service = CalendarService(settings)
+                        book_result = await calendar_service.book_appointment(
+                            app_id_for_calendar, start_iso, end_iso, title
+                        )
+                        calendar_flow = None
+                        calendar_days = []
+                        calendar_slots = []
+                        calendar_free_slots = []
+                        calendar_selected_day = None
+                        if book_result.get("success"):
+                            try:
+                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                                reply = f"Booked for {dt.strftime('%H:%M')}. You'll receive a confirmation."
+                            except Exception:
+                                reply = "Appointment booked. You'll receive a confirmation."
+                        else:
+                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await websocket.send_json({"type": "bot", "content": reply})
+                        continue
+                    if calendar_flow == "days" and 1 <= num <= len(calendar_days):
+                        day_info = calendar_days[num - 1]
+                        selected_date = day_info.get("date", "")
+                        slots_for_day = [
+                            s for s in calendar_free_slots
+                            if (s.get("start") or "")[:10] == selected_date
+                        ]
+                        calendar_flow = "slots"
+                        calendar_slots = slots_for_day
+                        calendar_selected_day = selected_date
+                        lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        for i, s in enumerate(slots_for_day[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                try:
+                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                    lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                except Exception:
+                                    lines.append(f"{i}. {start}–{end}")
+                        lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await websocket.send_json({"type": "bot", "content": reply})
+                        continue
+                except ValueError:
+                    pass
+
+            # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
+            if app_id_for_calendar and _is_availability_intent(str(user_text)):
+                from datetime import datetime, timedelta
+                now = datetime.utcnow()
+                from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+                to_dt = now + timedelta(days=7)
+                to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+                slot_minutes = integration.get("calendarSlotMinutes", 30)
+                if slot_minutes not in (15, 30, 60):
+                    slot_minutes = 30
+                try:
+                    calendar_service = CalendarService(settings)
+                    result = await calendar_service.get_availability(
+                        app_id_for_calendar, from_date, to_date, slot_minutes=slot_minutes
+                    )
+                    if result.get("error"):
+                        reply = "I couldn't fetch availability right now. Please try again later."
+                    else:
+                        free_slots = result.get("freeSlots") or []
+                        if not free_slots:
+                            if not result.get("calendarConnected"):
+                                reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
+                            else:
+                                reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+                        else:
+                            by_date: Dict[str, List[Dict[str, Any]]] = {}
+                            for slot in free_slots:
+                                start = slot.get("start") or ""
+                                date_key = start[:10] if len(start) >= 10 else ""
+                                if date_key:
+                                    by_date.setdefault(date_key, []).append(slot)
+                            days_order = sorted(by_date.keys())
+                            calendar_days_list = []
+                            for d in days_order:
+                                try:
+                                    dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                except Exception:
+                                    calendar_days_list.append({"date": d, "label": d})
+                            calendar_flow = "days"
+                            calendar_days = calendar_days_list
+                            calendar_free_slots = free_slots
+                            calendar_slots = []
+                            calendar_selected_day = None
+                            max_days = 14
+                            show_days = calendar_days_list[:max_days]
+                            lines = ["Pick a day (reply with the number):"]
+                            for i, day in enumerate(show_days, 1):
+                                lines.append(f"{i}. {day['label']}")
+                            lines.append("Then I'll show you available times for that day.")
+                            reply = "\n".join(lines)
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                except Exception as cal_exc:
+                    logger.exception("WebSocket: Calendar availability error: %s", cal_exc)
+                    reply = "I couldn't fetch availability right now. Please try again later."
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+            # ─────────────────────────────────────────────────────────────────
 
             # Add user message to history and process (e.g. lead type button click → services/workflows)
             conversation_history.append({"role": "user", "content": user_text})
@@ -1502,6 +1703,147 @@ async def whatsapp_webhook(request: Request):
                     logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but workflow manager not active")
             else:
                 logger.info(f"WhatsApp: Number {number} - context unclear, treating as raw input")
+        
+        integration = context.get("integration") or {}
+        calendar_flow = session.get("calendar_flow")
+        calendar_slots = session.get("calendar_slots") or []
+        calendar_days = session.get("calendar_days") or []
+
+        # Calendar flow: user already in day/slot selection; handle numeric reply or cancel
+        if calendar_flow and app_id and user_text.strip():
+            from datetime import datetime
+            raw_lower = user_text.strip().lower()
+            if raw_lower in ("cancel", "back", "exit"):
+                session["calendar_flow"] = None
+                session["calendar_days"] = None
+                session["calendar_slots"] = None
+                session["calendar_free_slots"] = None
+                session["calendar_selected_day"] = None
+                reply = "Cancelled. How can I help?"
+                conversation_history.append({"role": "user", "content": user_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            try:
+                num = int(user_text.strip())
+                if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                    slot = calendar_slots[num - 1]
+                    start_iso = slot.get("start", "")
+                    end_iso = slot.get("end", "")
+                    title = "Appointment"
+                    calendar_service = CalendarService(settings)
+                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
+                    session["calendar_flow"] = None
+                    session["calendar_days"] = None
+                    session["calendar_slots"] = None
+                    session["calendar_free_slots"] = None
+                    session["calendar_selected_day"] = None
+                    if book_result.get("success"):
+                        try:
+                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                            time_str = dt.strftime("%H:%M")
+                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
+                        except Exception:
+                            reply = "Appointment booked. Reply with anything to continue."
+                    else:
+                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                if calendar_flow == "days" and 1 <= num <= len(calendar_days):
+                    day_info = calendar_days[num - 1]
+                    selected_date = day_info.get("date", "")
+                    free_slots_all = session.get("calendar_free_slots") or []
+                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    session["calendar_flow"] = "slots"
+                    session["calendar_slots"] = slots_for_day
+                    session["calendar_selected_day"] = selected_date
+                    lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    for i, s in enumerate(slots_for_day[:15], 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if start and end:
+                            try:
+                                dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                            except Exception:
+                                lines.append(f"{i}. {start}–{end}")
+                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                    reply = "\n".join(lines)
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            except ValueError:
+                pass
+
+        # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
+        if app_id and _is_availability_intent(enhanced_user_text):
+            from datetime import datetime, timedelta
+            now = datetime.utcnow()
+            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+            to_dt = now + timedelta(days=7)
+            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            slot_minutes = integration.get("calendarSlotMinutes", 30)
+            if slot_minutes not in (15, 30, 60):
+                slot_minutes = 30
+            try:
+                calendar_service = CalendarService(settings)
+                result = await calendar_service.get_availability(app_id, from_date, to_date, slot_minutes=slot_minutes)
+                if result.get("error"):
+                    reply = "I couldn't fetch availability right now. Please try again later."
+                else:
+                    free_slots = result.get("freeSlots") or []
+                    if not free_slots:
+                        if not result.get("calendarConnected"):
+                            reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
+                        else:
+                            reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+                    else:
+                        by_date: Dict[str, List[Dict[str, Any]]] = {}
+                        for slot in free_slots:
+                            start = slot.get("start") or ""
+                            date_key = start[:10] if len(start) >= 10 else ""
+                            if date_key:
+                                by_date.setdefault(date_key, []).append(slot)
+                        days_order = sorted(by_date.keys())
+                        calendar_days_list = []
+                        for d in days_order:
+                            try:
+                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                            except Exception:
+                                calendar_days_list.append({"date": d, "label": d})
+                        session["calendar_flow"] = "days"
+                        session["calendar_days"] = calendar_days_list
+                        session["calendar_free_slots"] = free_slots
+                        session["calendar_slots"] = None
+                        session["calendar_selected_day"] = None
+                        max_days = 14
+                        show_days = calendar_days_list[:max_days]
+                        lines = ["Pick a day (reply with the number):"]
+                        for i, day in enumerate(show_days, 1):
+                            lines.append(f"{i}. {day['label']}")
+                        lines.append("Then I'll show you available times for that day.")
+                        reply = "\n".join(lines)
+                conversation_history.append({"role": "user", "content": enhanced_user_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            except Exception as cal_exc:
+                logger.exception("WhatsApp: Calendar availability error: %s", cal_exc)
+                reply = "I couldn't fetch availability right now. Please try again later."
+                conversation_history.append({"role": "user", "content": enhanced_user_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Process the message using production-grade state machine
         
@@ -2288,6 +2630,147 @@ async def messenger_webhook(request: Request):
             logger.error("Messenger: flow_controller or response_generator missing in session")
             return {"status": "error"}
 
+        integration = context.get("integration") or {}
+        calendar_flow = session.get("calendar_flow")
+        calendar_slots = session.get("calendar_slots") or []
+        calendar_days = session.get("calendar_days") or []
+
+        # Calendar flow: same as WhatsApp – day/slot selection or cancel
+        if calendar_flow and app_id and message_text.strip():
+            from datetime import datetime
+            raw_lower = message_text.strip().lower()
+            if raw_lower in ("cancel", "back", "exit"):
+                session["calendar_flow"] = None
+                session["calendar_days"] = None
+                session["calendar_slots"] = None
+                session["calendar_free_slots"] = None
+                session["calendar_selected_day"] = None
+                reply = "Cancelled. How can I help?"
+                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+            try:
+                num = int(message_text.strip())
+                if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                    slot = calendar_slots[num - 1]
+                    start_iso = slot.get("start", "")
+                    end_iso = slot.get("end", "")
+                    title = "Appointment"
+                    calendar_service = CalendarService(settings)
+                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
+                    session["calendar_flow"] = None
+                    session["calendar_days"] = None
+                    session["calendar_slots"] = None
+                    session["calendar_free_slots"] = None
+                    session["calendar_selected_day"] = None
+                    if book_result.get("success"):
+                        try:
+                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                            time_str = dt.strftime("%H:%M")
+                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
+                        except Exception:
+                            reply = "Appointment booked. Reply with anything to continue."
+                    else:
+                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    conversation_history.append({"role": "user", "content": message_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+                if calendar_flow == "days" and 1 <= num <= len(calendar_days):
+                    day_info = calendar_days[num - 1]
+                    selected_date = day_info.get("date", "")
+                    free_slots_all = session.get("calendar_free_slots") or []
+                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    session["calendar_flow"] = "slots"
+                    session["calendar_slots"] = slots_for_day
+                    session["calendar_selected_day"] = selected_date
+                    lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    for i, s in enumerate(slots_for_day[:15], 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if start and end:
+                            try:
+                                dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                            except Exception:
+                                lines.append(f"{i}. {start}–{end}")
+                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                    reply = "\n".join(lines)
+                    conversation_history.append({"role": "user", "content": message_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    return {"status": "ok"}
+            except ValueError:
+                pass
+
+        # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
+        if app_id and _is_availability_intent(message_text):
+            from datetime import datetime, timedelta
+            now = datetime.utcnow()
+            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+            to_dt = now + timedelta(days=7)
+            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            slot_minutes = integration.get("calendarSlotMinutes", 30)
+            if slot_minutes not in (15, 30, 60):
+                slot_minutes = 30
+            try:
+                calendar_service = CalendarService(settings)
+                result = await calendar_service.get_availability(app_id, from_date, to_date, slot_minutes=slot_minutes)
+                if result.get("error"):
+                    reply = "I couldn't fetch availability right now. Please try again later."
+                else:
+                    free_slots = result.get("freeSlots") or []
+                    if not free_slots:
+                        if not result.get("calendarConnected"):
+                            reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
+                        else:
+                            reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+                    else:
+                        by_date: Dict[str, List[Dict[str, Any]]] = {}
+                        for slot in free_slots:
+                            start = slot.get("start") or ""
+                            date_key = start[:10] if len(start) >= 10 else ""
+                            if date_key:
+                                by_date.setdefault(date_key, []).append(slot)
+                        days_order = sorted(by_date.keys())
+                        calendar_days_list = []
+                        for d in days_order:
+                            try:
+                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                            except Exception:
+                                calendar_days_list.append({"date": d, "label": d})
+                        session["calendar_flow"] = "days"
+                        session["calendar_days"] = calendar_days_list
+                        session["calendar_free_slots"] = free_slots
+                        session["calendar_slots"] = None
+                        session["calendar_selected_day"] = None
+                        max_days = 14
+                        show_days = calendar_days_list[:max_days]
+                        lines = ["Pick a day (reply with the number):"]
+                        for i, day in enumerate(show_days, 1):
+                            lines.append(f"{i}. {day['label']}")
+                        lines.append("Then I'll show you available times for that day.")
+                        reply = "\n".join(lines)
+                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+            except Exception as cal_exc:
+                logger.exception("Messenger: Calendar availability error: %s", cal_exc)
+                reply = "I couldn't fetch availability right now. Please try again later."
+                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, reply, page_access_token)
+                return {"status": "ok"}
+
         # Add user message to history
         conversation_history.append({"role": "user", "content": message_text})
 
@@ -2952,6 +3435,147 @@ async def instagram_webhook(request: Request):
             logger.error("Instagram: flow_controller or response_generator not initialized")
             return {"status": "error"}
 
+        integration = context.get("integration") or {}
+        calendar_flow = session.get("calendar_flow")
+        calendar_slots = session.get("calendar_slots") or []
+        calendar_days = session.get("calendar_days") or []
+
+        # Calendar flow: same as WhatsApp/Messenger – day/slot selection or cancel
+        if calendar_flow and app_id and message_text.strip():
+            from datetime import datetime
+            raw_lower = message_text.strip().lower()
+            if raw_lower in ("cancel", "back", "exit"):
+                session["calendar_flow"] = None
+                session["calendar_days"] = None
+                session["calendar_slots"] = None
+                session["calendar_free_slots"] = None
+                session["calendar_selected_day"] = None
+                reply = "Cancelled. How can I help?"
+                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                return {"status": "ok"}
+            try:
+                num = int(message_text.strip())
+                if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                    slot = calendar_slots[num - 1]
+                    start_iso = slot.get("start", "")
+                    end_iso = slot.get("end", "")
+                    title = "Appointment"
+                    calendar_service = CalendarService(settings)
+                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
+                    session["calendar_flow"] = None
+                    session["calendar_days"] = None
+                    session["calendar_slots"] = None
+                    session["calendar_free_slots"] = None
+                    session["calendar_selected_day"] = None
+                    if book_result.get("success"):
+                        try:
+                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                            time_str = dt.strftime("%H:%M")
+                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
+                        except Exception:
+                            reply = "Appointment booked. Reply with anything to continue."
+                    else:
+                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    conversation_history.append({"role": "user", "content": message_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                    return {"status": "ok"}
+                if calendar_flow == "days" and 1 <= num <= len(calendar_days):
+                    day_info = calendar_days[num - 1]
+                    selected_date = day_info.get("date", "")
+                    free_slots_all = session.get("calendar_free_slots") or []
+                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    session["calendar_flow"] = "slots"
+                    session["calendar_slots"] = slots_for_day
+                    session["calendar_selected_day"] = selected_date
+                    lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    for i, s in enumerate(slots_for_day[:15], 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if start and end:
+                            try:
+                                dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                            except Exception:
+                                lines.append(f"{i}. {start}–{end}")
+                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                    reply = "\n".join(lines)
+                    conversation_history.append({"role": "user", "content": message_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    session["history"] = conversation_history
+                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                    return {"status": "ok"}
+            except ValueError:
+                pass
+
+        # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
+        if app_id and _is_availability_intent(message_text):
+            from datetime import datetime, timedelta
+            now = datetime.utcnow()
+            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+            to_dt = now + timedelta(days=7)
+            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            slot_minutes = integration.get("calendarSlotMinutes", 30)
+            if slot_minutes not in (15, 30, 60):
+                slot_minutes = 30
+            try:
+                calendar_service = CalendarService(settings)
+                result = await calendar_service.get_availability(app_id, from_date, to_date, slot_minutes=slot_minutes)
+                if result.get("error"):
+                    reply = "I couldn't fetch availability right now. Please try again later."
+                else:
+                    free_slots = result.get("freeSlots") or []
+                    if not free_slots:
+                        if not result.get("calendarConnected"):
+                            reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
+                        else:
+                            reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+                    else:
+                        by_date: Dict[str, List[Dict[str, Any]]] = {}
+                        for slot in free_slots:
+                            start = slot.get("start") or ""
+                            date_key = start[:10] if len(start) >= 10 else ""
+                            if date_key:
+                                by_date.setdefault(date_key, []).append(slot)
+                        days_order = sorted(by_date.keys())
+                        calendar_days_list = []
+                        for d in days_order:
+                            try:
+                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                            except Exception:
+                                calendar_days_list.append({"date": d, "label": d})
+                        session["calendar_flow"] = "days"
+                        session["calendar_days"] = calendar_days_list
+                        session["calendar_free_slots"] = free_slots
+                        session["calendar_slots"] = None
+                        session["calendar_selected_day"] = None
+                        max_days = 14
+                        show_days = calendar_days_list[:max_days]
+                        lines = ["Pick a day (reply with the number):"]
+                        for i, day in enumerate(show_days, 1):
+                            lines.append(f"{i}. {day['label']}")
+                        lines.append("Then I'll show you available times for that day.")
+                        reply = "\n".join(lines)
+                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                return {"status": "ok"}
+            except Exception as cal_exc:
+                logger.exception("Instagram: Calendar availability error: %s", cal_exc)
+                reply = "I couldn't fetch availability right now. Please try again later."
+                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                session["history"] = conversation_history
+                await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                return {"status": "ok"}
+        
         # Add user message to history
         conversation_history.append({"role": "user", "content": message_text})
 
