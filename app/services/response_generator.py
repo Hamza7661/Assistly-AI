@@ -934,6 +934,8 @@ Classify the intent:"""
         if not self.client:
             return "Which service are you interested in?"
         
+        conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
+        
         treatment_plans = context.get("treatment_plans", [])
         lead_types = context.get("lead_types", [])
         
@@ -994,6 +996,9 @@ CRITICAL RULES:
                 return "Which service are you interested in?"
         else:
             # Format services as buttons for text channels (web and WhatsApp)
+            if conversation_style:
+                return "What kind of service are you looking for today?"
+
             display_services = list(all_services) if all_services else []
             if self.response_language and display_services and self.client and self.model:
                 from ..utils.translation_utils import translate_batch
@@ -1022,6 +1027,7 @@ CRITICAL RULES:
         collected_lead_type: Optional[str] = None
     ) -> str:
         """Generate response when data is collected AND user asked a question"""
+        conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
         def _get_service_list(ctx: Dict[str, Any], lead_type_val: Optional[str] = None) -> List[str]:
             """Helper to get filtered or all services"""
             treatment_plans = ctx.get("treatment_plans", [])
@@ -1042,6 +1048,8 @@ CRITICAL RULES:
         if not self.client:
             if next_step == "service selection":
                 if self.channel != "voice":
+                    if conversation_style:
+                        return "What kind of service are you looking for today?"
                     all_services = _get_service_list(context, collected_lead_type)
                     services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
                     if services_text:
@@ -1057,7 +1065,7 @@ CRITICAL RULES:
         
         # Map next step to question
         next_questions = {
-            "service selection": "Which service are you interested in?",
+            "service selection": "What kind of service are you looking for today?" if conversation_style else "Which service are you interested in?",
             "name": "What's your name?",
             "email": "What's your email address?",
             "phone": "What's your phone number?"
@@ -1076,6 +1084,8 @@ CRITICAL RULES:
 7. Move forward to the next step: {next_step}
 
 Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. {next_question}"""
+        if conversation_style and self.channel != "voice":
+            system_prompt += "\n\nDo NOT output <button> tags or numbered lists. Continue the conversation naturally."
         if self._language_instruction():
             system_prompt += "\n\n" + self._language_instruction()
         
@@ -1102,7 +1112,7 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
                 answer += f" {next_question}"
             
             # For web and WhatsApp, if next step is service selection, add service buttons (filtered)
-            if next_step == "service selection" and self.channel != "voice":
+            if next_step == "service selection" and self.channel != "voice" and not conversation_style:
                 all_services = _get_service_list(context, collected_lead_type)
                 services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
                 if services_text and services_text not in answer:
@@ -1114,7 +1124,7 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
             fallback = f"Great! I've noted your {data_type}: {data_value}. {next_question}"
             
             # For web and WhatsApp, if next step is service selection, add service buttons (filtered)
-            if next_step == "service selection" and self.channel != "voice":
+            if next_step == "service selection" and self.channel != "voice" and not conversation_style:
                 all_services = _get_service_list(context, collected_lead_type)
                 services_text = " ".join([f"<button>{s}</button>" for s in all_services if s])
                 if services_text:
@@ -1141,6 +1151,9 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
         system_prompt = f"""You are a {self.profession} assistant. 
 Answer the user's question briefly (1-2 sentences) using ONLY the context provided below.
 If the context doesn't contain the answer, say "I don't have that information, but let me help you with..." and continue the conversation."""
+        conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
+        if conversation_style and self.channel != "voice":
+            system_prompt += "\n\nDo NOT output <button> tags or numbered lists. Continue the conversation naturally."
         if self._language_instruction():
             system_prompt += "\n\n" + self._language_instruction()
         
@@ -1211,9 +1224,31 @@ If the context doesn't contain the answer, say "I don't have that information, b
 - DO NOT show previous options - continue with phone collection.""",
         }
 
+        conversation_style = bool(context.get("integration", {}).get("conversationStyle"))
+        # Conversational mode: no option lists / buttons for non-voice channels.
+        if conversation_style and self.channel != "voice":
+            state_prompts[ConversationState.GREETING] = (
+                f"You are a {self.profession} assistant. Greet the user and ask what they need "
+                f"in their own words. Do NOT present lead type options from context. "
+                f"Do NOT output <button> tags or numbered lists."
+            )
+            state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant.
+- If user asks a question, answer it briefly (1-2 sentences) using context, then ask what they need in their own words.
+- Ask the user to describe the lead type (e.g. appointment, callback, information) in free text.
+- DO NOT output <button> tags or numbered lists.
+- DO NOT ask for date/time - that is NOT part of this flow.
+- DO NOT ask for service selection yet - wait for the user to describe their need first."""
+            state_prompts[ConversationState.SERVICE_SELECTION] = f"""You are a {self.profession} assistant.
+- The user has ALREADY selected a lead type - do NOT show lead type options again.
+- If user asks a question, answer it briefly (1-2 sentences) using context, then ask what service they want in their own words.
+- Ask a natural question like 'Which service are you interested in?' (open-ended).
+- DO NOT output <button> tags or numbered lists.
+- DO NOT ask for date/time - that is NOT part of this flow.
+- Service selection is MANDATORY."""
+
         # For LEAD_TYPE_SELECTION (text channels): inject exact options from context so we never show a different list
         lead_types = context.get("lead_types", [])
-        if state == ConversationState.LEAD_TYPE_SELECTION and self.channel != "voice" and lead_types:
+        if state == ConversationState.LEAD_TYPE_SELECTION and self.channel != "voice" and lead_types and not conversation_style:
             def format_lead_option(lt: dict, index: int) -> str:
                 text = lt.get('text', '')
                 emoji = lt.get('emoji', '').strip() if lt.get('emoji') else ''
@@ -1287,7 +1322,7 @@ RULES:
         
         # For WhatsApp/Messenger/Instagram in LEAD_TYPE_SELECTION: format lead types directly with emojis
         # (like generate_greeting) instead of relying on LLM to preserve emojis
-        if state == ConversationState.LEAD_TYPE_SELECTION and self.channel in ("whatsapp", "messenger", "instagram"):
+        if state == ConversationState.LEAD_TYPE_SELECTION and self.channel in ("whatsapp", "messenger", "instagram") and not conversation_style:
             lead_types = context.get("lead_types", [])
             if lead_types:
                 from ..utils.language_utils import detect_language, get_language_name_for_prompt, get_language_name
@@ -1534,6 +1569,7 @@ Make it professional and informative."""
         from ..utils.translation_utils import translate_batch
 
         current_channel = (channel or self.channel or "web").lower()
+        conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
         lang_code = "en"
         if first_message and str(first_message).strip():
             lang_code = detect_language(str(first_message))
@@ -1590,6 +1626,10 @@ Make it professional and informative."""
             for idx, lt in enumerate(lead_types[:3]):  # Log first 3
                 if isinstance(lt, dict):
                     logger.info(f"  Lead type {idx+1}: text='{lt.get('text')}', emoji='{lt.get('emoji', 'NONE')}'")
+
+            if conversation_style:
+                # Conversational mode: no numbered lead-type list
+                return f"{greeting}\n\nHow can I help today?"
             
             options = "\n".join([f"{i}. {option_text(lt, i - 1)}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
             reply_line = get_string("please_reply_number", lang_code) if lang_code else "Please reply with the number of your choice."
@@ -1607,6 +1647,10 @@ Make it professional and informative."""
                 return f"{greeting}\n\nWould you like {options_text}?"
             return greeting
         else:
+            if conversation_style:
+                # Conversational mode: no <button> list for web
+                return f"{greeting}\n\nTell me what you're looking for."
+
             buttons = " ".join([f"<button>{option_text(lt, idx)}</button>" for idx, lt in enumerate(lead_types) if isinstance(lt, dict)])
             return f"{greeting} {buttons}"
 
