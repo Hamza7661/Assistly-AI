@@ -154,6 +154,13 @@ def get_or_create_instagram_session(sender_id: str, user_id: str) -> Tuple[str, 
 # Session timeout from environment variable (default: 5 minutes)
 SESSION_TIMEOUT = settings.session_timeout_seconds
 
+# Conversation-style toggle refresh:
+# Backend notifies this service when `integration.conversationStyle` changes.
+# For existing Messenger/Instagram sessions we do NOT clear them immediately.
+# Instead, the next incoming message will apply the new style only after
+# the session has been idle for `idle_seconds`.
+conversation_style_change_requests: Dict[str, Dict[str, Any]] = {}
+
 # Voice agent sessions
 voice_agent_service = VoiceAgentService(settings)
 
@@ -314,6 +321,56 @@ async def invalidate_whatsapp_sessions(
     
     logger.info("Invalidated WhatsApp sessions for twilio_phone=%s, removed %d session(s)", clean_phone, len(removed))
     return {"status": "ok", "twilio_phone": clean_phone, "removed_sessions": len(removed)}
+
+
+class ConversationStyleChangeBody(BaseModel):
+    app_id: str
+    conversation_style: bool
+    idle_seconds: int = 120
+
+
+@app.post("/api/v1/social/conversation-style/invalidate-sessions")
+async def invalidate_conversation_style_sessions(
+    body: ConversationStyleChangeBody,
+    x_invalidate_sessions_secret: Optional[str] = Header(default=None, alias="X-Invalidate-Sessions-Secret"),
+) -> Dict[str, Any]:
+    """
+    Mark existing Messenger/Instagram sessions for `app_id` as stale.
+
+    We don't clear in-memory sessions immediately. When a session becomes idle
+    for `idle_seconds`, the next incoming message will apply the new
+    `conversationStyle` to the session context.
+    """
+    if settings.tp_sign_secret:
+        if x_invalidate_sessions_secret != settings.tp_sign_secret:
+            raise HTTPException(status_code=401, detail="Invalid or missing secret")
+
+    clean_app_id = (body.app_id or "").strip()
+    if not clean_app_id:
+        raise HTTPException(status_code=400, detail="app_id required")
+
+    idle_seconds = max(0, int(body.idle_seconds or 120))
+    desired_conversation_style = bool(body.conversation_style)
+
+    current = conversation_style_change_requests.get(clean_app_id)
+    current_version = int(current.get("version", 0)) if isinstance(current, dict) else 0
+    new_version = current_version + 1
+
+    conversation_style_change_requests[clean_app_id] = {
+        "version": new_version,
+        "conversation_style": desired_conversation_style,
+        "idle_seconds": idle_seconds,
+        "requested_at": time.time(),
+    }
+
+    logger.info(
+        "Marked social sessions stale after idle: app_id=%s version=%s conversation_style=%s idle_seconds=%s",
+        clean_app_id,
+        new_version,
+        desired_conversation_style,
+        idle_seconds,
+    )
+    return {"status": "ok", "app_id": clean_app_id, "version": new_version, "idle_seconds": idle_seconds}
 
 
 def _maybe_parse_json(text: str) -> Optional[Dict]:
@@ -2615,7 +2672,23 @@ async def messenger_webhook(request: Request):
                 return {"status": "ok"}
             session_id = session_id_new
 
-        session["last_activity"] = time.time()
+        now = time.time()
+        last_activity = session.get("last_activity", 0)
+        app_id = session.get("app_id")
+        applied_version = session.get("conversation_style_applied_version")
+        pending = conversation_style_change_requests.get(app_id) if app_id else None
+        if pending and applied_version != pending.get("version"):
+            requested_at = float(pending.get("requested_at") or 0)
+            idle_seconds = int(pending.get("idle_seconds") or 120)
+            idle_start = max(last_activity, requested_at)
+            if now - idle_start >= idle_seconds:
+                session_context = session.get("context") or {}
+                integration = session_context.get("integration") or {}
+                if isinstance(integration, dict):
+                    integration["conversationStyle"] = bool(pending.get("conversation_style"))
+                    session["conversation_style_applied_version"] = pending.get("version")
+
+        session["last_activity"] = now
         conversation_history = session["history"]
         context = session["context"]
         flow_controller = session.get("flow_controller")
@@ -3420,7 +3493,23 @@ async def instagram_webhook(request: Request):
                 return {"status": "ok"}
             session_id = session_id_new
 
-        session["last_activity"] = time.time()
+        now = time.time()
+        last_activity = session.get("last_activity", 0)
+        app_id = session.get("app_id")
+        applied_version = session.get("conversation_style_applied_version")
+        pending = conversation_style_change_requests.get(app_id) if app_id else None
+        if pending and applied_version != pending.get("version"):
+            requested_at = float(pending.get("requested_at") or 0)
+            idle_seconds = int(pending.get("idle_seconds") or 120)
+            idle_start = max(last_activity, requested_at)
+            if now - idle_start >= idle_seconds:
+                session_context = session.get("context") or {}
+                integration = session_context.get("integration") or {}
+                if isinstance(integration, dict):
+                    integration["conversationStyle"] = bool(pending.get("conversation_style"))
+                    session["conversation_style_applied_version"] = pending.get("version")
+
+        session["last_activity"] = now
         conversation_history = session["history"]
         context = session["context"]
         email_validation_state = session["email_state"]

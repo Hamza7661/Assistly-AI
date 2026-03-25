@@ -1,6 +1,7 @@
 """Workflow manager to handle workflow questions in sequence with branching support"""
 from typing import Dict, Any, Optional, List, Tuple
 import logging
+import re
 
 logger = logging.getLogger("assistly.workflow_manager")
 
@@ -10,6 +11,10 @@ class WorkflowManager:
     
     def __init__(self, context: Dict[str, Any]):
         self.context = context
+        # Note: conversationStyle must be read dynamically from context so that
+        # toggle changes can apply to existing sessions without recreating this manager.
+        integration = (context.get("integration") or {}) if isinstance(context, dict) else {}
+        self.conversation_style: bool = bool(integration.get("conversationStyle"))
         self.current_treatment_plan: Optional[str] = None
         self.current_workflow: Optional[Dict[str, Any]] = None
         self.current_question_index: int = 0
@@ -22,6 +27,13 @@ class WorkflowManager:
         self._linked_question_ids: set = set()
         # Base URL for attachment download links (set from config/context)
         self.api_base_url: str = context.get("api_base_url", "")
+
+    def _conversation_style_enabled(self) -> bool:
+        """Read conversational style flag from the latest context."""
+        integration = self.context.get("integration") or {}
+        if not isinstance(integration, dict):
+            return False
+        return bool(integration.get("conversationStyle"))
     
     def start_workflow_for_treatment_plan(self, treatment_plan_name: str) -> bool:
         """Start workflow for a treatment plan. Returns True if workflow exists, False otherwise."""
@@ -174,8 +186,8 @@ class WorkflowManager:
                 f'<file url="{attachment_url}" name="{filename}">📎 {filename}</file>'
             )
         
-        # Add multiple-choice option buttons
-        if options:
+        # Add multiple-choice option buttons (disabled in conversational mode)
+        if options and not self._conversation_style_enabled():
             sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
             for opt in sorted_opts:
                 opt_text = opt.get("text", "").strip()
@@ -282,6 +294,35 @@ class WorkflowManager:
                 if opt_text.lower() == answer_lower:
                     matched_opt = opt
                     break
+
+        # Optional: partial match for conversational/free-text answers
+        if matched_opt is None and self._conversation_style_enabled():
+            answer_tokens = set(re.findall(r"\w+", answer_lower))
+            best_opt = None
+            best_score = 0
+
+            for opt in sorted_opts:
+                opt_text = (opt.get("text") or "").strip()
+                if not opt_text:
+                    continue
+
+                opt_lower = opt_text.lower()
+                # Strong substring match first (e.g. "I prefer morning" -> "morning")
+                if opt_lower and opt_lower in answer_lower:
+                    matched_opt = opt
+                    break
+
+                opt_tokens = set(re.findall(r"\w+", opt_lower))
+                # Keep only meaningful tokens to avoid matching on common short words
+                opt_tokens = {t for t in opt_tokens if len(t) > 2}
+                common = answer_tokens.intersection(opt_tokens)
+                score = len(common)
+                if score > best_score:
+                    best_score = score
+                    best_opt = opt
+
+            if matched_opt is None and best_opt is not None and best_score > 0:
+                matched_opt = best_opt
 
         if matched_opt is not None:
             is_terminal = bool(matched_opt.get("isTerminal"))
