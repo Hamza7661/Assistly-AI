@@ -538,6 +538,18 @@ Classify the intent:"""
                                 all_services.append(plan_name)
                         else:
                             all_services.append(str(plan))
+
+                # Conversational shortcut:
+                # If lead type is matched and the same message already implies a service (e.g., "I want to place an order"),
+                # immediately continue into service handling/workflow instead of asking service intent again.
+                if conversation_style_enabled and all_services:
+                    service_from_same_message = extractor.match_service(user_message, all_services)
+                    if service_from_same_message:
+                        logger.info(
+                            "Lead+service inferred from same message in conversational mode. lead_type=%s, service=%s",
+                            lead_type.get("value"), service_from_same_message
+                        )
+                        return await self.generate_response(flow_controller, user_message, conversation_history, context)
                 
                 # If only one service exists, auto-select it and skip service selection
                 if len(all_services) == 1:
@@ -1716,8 +1728,8 @@ Make it professional and informative."""
                     logger.info(f"  Lead type {idx+1}: text='{lt.get('text')}', emoji='{lt.get('emoji', 'NONE')}'")
 
             if conversation_style:
-                # Conversational mode: no numbered lead-type list
-                return f"{greeting}\n\nHow can I help today?"
+                # Conversational mode: return configured greeting as-is (avoid repetitive appended prompt)
+                return greeting
             
             options = "\n".join([f"{i}. {option_text(lt, i - 1)}" for i, lt in enumerate(lead_types, 1) if isinstance(lt, dict)])
             reply_line = get_string("please_reply_number", lang_code) if lang_code else "Please reply with the number of your choice."
@@ -1736,8 +1748,8 @@ Make it professional and informative."""
             return greeting
         else:
             if conversation_style:
-                # Conversational mode: no <button> list for web
-                return f"{greeting}\n\nTell me what you're looking for."
+                # Conversational mode: return configured greeting as-is (avoid repetitive appended prompt)
+                return greeting
 
             buttons = " ".join([f"<button>{option_text(lt, idx)}</button>" for idx, lt in enumerate(lead_types) if isinstance(lt, dict)])
             return f"{greeting} {buttons}"
