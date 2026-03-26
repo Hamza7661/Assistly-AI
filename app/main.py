@@ -1693,17 +1693,23 @@ async def whatsapp_webhook(request: Request):
         if user_text.strip().isdigit():
             number = int(user_text.strip())
             
-            # Check conversation history to determine what type of selection this is
-            # Look at the conversation flow to determine context
-            
-            # Check if we have a lead type selected (look for leadType in recent messages)
-            has_lead_type = any("leadType:" in msg.get("content", "") for msg in conversation_history[-3:] if msg.get("role") == "user")
-            
-            # Check if we have a service selected (look for service mentions in recent messages) 
-            has_service = any(any(keyword in msg.get("content", "").lower() for keyword in ["cosmetic", "general", "service", "menu"]) 
-                            for msg in conversation_history[-3:] if msg.get("role") == "user")
-            
-            logger.info(f"WhatsApp: Selection context - has_lead_type: {has_lead_type}, has_service: {has_service}")
+            # Determine selection context from stateful collected data (industry-agnostic).
+            # This is more reliable than keyword checks in prior user messages.
+            has_lead_type = bool(flow_controller.collected_data.get("leadType"))
+            has_service = bool(flow_controller.collected_data.get("serviceType"))
+
+            # Backward-safe fallback for older sessions where leadType marker was embedded in history.
+            if not has_lead_type:
+                has_lead_type = any(
+                    "leadType:" in msg.get("content", "")
+                    for msg in conversation_history[-3:]
+                    if msg.get("role") == "user"
+                )
+
+            logger.info(
+                f"WhatsApp: Selection context - state={flow_controller.state.value}, "
+                f"has_lead_type={has_lead_type}, has_service={has_service}"
+            )
             
             if not has_lead_type:
                 # First selection - must be lead type
