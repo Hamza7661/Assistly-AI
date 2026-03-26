@@ -84,10 +84,11 @@ class CalendarService:
         title: str = "Appointment",
         attendee_email: Optional[str] = None,
         description: Optional[str] = None,
+        time_zone: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         POST /api/v1/calendar/apps/:appId/appointments
-        Body: { start, end, title, attendeeEmail?, description? }
+        Body: { start, end, title, attendeeEmail?, description?, timeZone? }
         """
         path = f"/api/v1/calendar/apps/{app_id}/appointments"
         url = f"{self.base_url}{path}"
@@ -121,6 +122,8 @@ class CalendarService:
             body["attendeeEmail"] = attendee_email
         if description:
             body["description"] = description
+        if time_zone:
+            body["timeZone"] = time_zone
 
         logger.info("Calendar book_appointment app_id=%s start=%s", app_id, start_iso)
 
