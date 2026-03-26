@@ -1303,6 +1303,17 @@ If the context doesn't contain the answer, say "I don't have that information, b
         }
 
         conversation_style = bool(context.get("integration", {}).get("conversationStyle"))
+        lead_types = context.get("lead_types", [])
+        lead_type_examples: List[str] = []
+        for lt in lead_types:
+            if isinstance(lt, dict):
+                txt = (lt.get("text") or "").strip()
+            else:
+                txt = str(lt).strip()
+            if txt:
+                lead_type_examples.append(self._normalize_lead_option_for_voice(txt))
+        lead_type_examples = [x for x in lead_type_examples if x][:3]
+        lead_type_examples_text = ", ".join(lead_type_examples)
         # Conversational mode: no option lists / buttons for non-voice channels.
         if conversation_style and self.channel != "voice":
             state_prompts[ConversationState.GREETING] = (
@@ -1312,7 +1323,7 @@ If the context doesn't contain the answer, say "I don't have that information, b
             )
             state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant.
 - If user asks a question, answer it briefly (1-2 sentences) using context, then ask what they need next in free text.
-- Ask the user to describe the lead type (e.g. appointment, callback, information) in free text.
+- Ask the user what they'd like help with.{f" Examples from this business: {lead_type_examples_text}." if lead_type_examples_text else ""}
 - DO NOT output <button> tags or numbered lists.
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT ask for service selection yet - wait for the user to describe their need first."""
@@ -1325,7 +1336,6 @@ If the context doesn't contain the answer, say "I don't have that information, b
 - Service selection is MANDATORY."""
 
         # For LEAD_TYPE_SELECTION (text channels): inject exact options from context so we never show a different list
-        lead_types = context.get("lead_types", [])
         if state == ConversationState.LEAD_TYPE_SELECTION and self.channel != "voice" and lead_types and not conversation_style:
             def format_lead_option(lt: dict, index: int) -> str:
                 text = lt.get('text', '')
