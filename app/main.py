@@ -1700,7 +1700,7 @@ async def whatsapp_webhook(request: Request):
             has_lead_type = any("leadType:" in msg.get("content", "") for msg in conversation_history[-3:] if msg.get("role") == "user")
             
             # Check if we have a service selected (look for service mentions in recent messages) 
-            has_service = any(any(keyword in msg.get("content", "").lower() for keyword in ["cosmetic", "general", "dentistry", "treatment"]) 
+            has_service = any(any(keyword in msg.get("content", "").lower() for keyword in ["cosmetic", "general", "service", "menu"]) 
                             for msg in conversation_history[-3:] if msg.get("role") == "user")
             
             logger.info(f"WhatsApp: Selection context - has_lead_type: {has_lead_type}, has_service: {has_service}")
@@ -1720,7 +1720,7 @@ async def whatsapp_webhook(request: Request):
             elif has_lead_type and not has_service:
                 # Second selection - must be service plan
                 # Use the SAME filtered list shown to the user (by lead type's relevantServicePlans)
-                service_plans = context.get("service_plans", context.get("treatment_plans", []))
+                service_plans = context.get("service_plans", [])
                 lead_types = context.get("lead_types", [])
                 collected_lead_type = flow_controller.collected_data.get("leadType")
                 filtered_names = ResponseGenerator._filter_services_by_lead_type(

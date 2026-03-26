@@ -15,7 +15,7 @@ class WorkflowManager:
         # toggle changes can apply to existing sessions without recreating this manager.
         integration = (context.get("integration") or {}) if isinstance(context, dict) else {}
         self.conversation_style: bool = bool(integration.get("conversationStyle"))
-        self.current_treatment_plan: Optional[str] = None
+        self.current_service_name: Optional[str] = None
         self.current_workflow: Optional[Dict[str, Any]] = None
         self.current_question_index: int = 0
         # When branching, we track an explicit ordered list of question IDs to ask
@@ -35,27 +35,27 @@ class WorkflowManager:
             return False
         return bool(integration.get("conversationStyle"))
     
-    def start_workflow_for_treatment_plan(self, treatment_plan_name: str) -> bool:
-        """Start workflow for a treatment plan. Returns True if workflow exists, False otherwise."""
-        self.current_treatment_plan = treatment_plan_name
-        
-        treatment_plans = self.context.get("treatment_plans", [])
-        logger.info(f"Looking for treatment plan '{treatment_plan_name}' in {len(treatment_plans)} treatment plans")
-        treatment_plan = None
-        for tp in treatment_plans:
+    def start_workflow_for_service(self, service_name: str) -> bool:
+        """Start workflow for a service/menu item. Returns True if workflow exists, False otherwise."""
+        self.current_service_name = service_name
+
+        service_plans = self.context.get("service_plans", [])
+        logger.info(f"Looking for service '{service_name}' in {len(service_plans)} service plans")
+        service_plan = None
+        for tp in service_plans:
             if isinstance(tp, dict):
                 tp_question = tp.get("question", "")
-                if tp_question.lower() == treatment_plan_name.lower():
-                    treatment_plan = tp
-                    logger.info(f"✓ Found treatment plan: '{tp_question}' with keys: {list(tp.keys())}")
+                if tp_question.lower() == service_name.lower():
+                    service_plan = tp
+                    logger.info(f"✓ Found service plan: '{tp_question}' with keys: {list(tp.keys())}")
                     break
-        
-        if not treatment_plan:
-            logger.warning(f"✗ Treatment plan '{treatment_plan_name}' not found in context.")
+
+        if not service_plan:
+            logger.warning(f"✗ Service '{service_name}' not found in context.")
             return False
-        
-        attached_workflows = treatment_plan.get("attachedWorkflows", [])
-        logger.info(f"Treatment plan has {len(attached_workflows)} attached workflows")
+
+        attached_workflows = service_plan.get("attachedWorkflows", [])
+        logger.info(f"Service plan has {len(attached_workflows)} attached workflows")
         if not attached_workflows:
             return False
         
@@ -109,11 +109,11 @@ class WorkflowManager:
         self.is_active = True
         
         logger.info(
-            f"Started workflow '{workflow_id}' for '{treatment_plan_name}' "
+            f"Started workflow '{workflow_id}' for service '{service_name}' "
             f"with {len(sequential_questions)} sequential + {len(linked_question_ids)} linked questions"
         )
         return True
-    
+
     def _get_sorted_questions(self) -> List[Dict[str, Any]]:
         """Return the ordered question list (either the live queue or the sequential subset)."""
         if self._question_queue is not None:
@@ -377,7 +377,7 @@ class WorkflowManager:
     
     def reset(self):
         """Reset workflow state"""
-        self.current_treatment_plan = None
+        self.current_service_name = None
         self.current_workflow = None
         self.current_question_index = 0
         self._question_queue = None
