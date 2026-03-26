@@ -64,7 +64,7 @@ class ResponseGenerator:
 
     @staticmethod
     def _filter_services_by_lead_type(
-        treatment_plans: List[Any],
+        service_plans: List[Any],
         lead_types: List[Dict[str, Any]],
         collected_lead_type: Optional[str]
     ) -> Optional[List[str]]:
@@ -84,9 +84,9 @@ class ResponseGenerator:
             allowed = {str(s).strip().lower() for s in relevant if s}
             if not allowed:
                 return None
-            # Filter treatment plans to only those in relevantServicePlans
+            # Filter service plans to only those in relevantServicePlans
             filtered = []
-            for plan in treatment_plans:
+            for plan in service_plans:
                 if isinstance(plan, dict):
                     name = (plan.get("question") or plan.get("name") or plan.get("title") or "").strip()
                 else:
@@ -354,6 +354,7 @@ Classify the intent:"""
     ) -> str:
         """Generate response based on current state"""
         state = flow_controller.state
+        conversation_style_enabled = bool((context.get("integration") or {}).get("conversationStyle")) and self.channel != "voice"
         extractor = DataExtractor()
         validator = Validator()
         
@@ -446,6 +447,52 @@ Classify the intent:"""
             logger.error(f"Intent classification failed: {e}, treating as non-question")
             has_question = False
             question_type = "not_question"
+
+        app_industry = str((context.get("app") or {}).get("industry") or "").strip()
+
+        async def _answer_if_relevant_question(query: str) -> Optional[str]:
+            """
+            Conversational-mode guard:
+            - answer briefly when question is relevant to app industry / services / FAQs
+            - return None when out-of-scope so caller can redirect to current step
+            """
+            if not (conversation_style_enabled and has_question and query.strip()):
+                return None
+            if question_type == "not_question":
+                return None
+
+            scoped_query = query.strip()
+            if app_industry:
+                scoped_query = f"{query.strip()} (Industry: {app_industry})"
+
+            rag_context = await self._get_rag_context(scoped_query, context, is_question=True)
+            if not rag_context:
+                return None
+
+            context_l = rag_context.lower()
+            # Relevance markers from our domain context payloads (FAQ/services/lead options/workflows)
+            relevance_markers = (
+                "[source: faq",
+                "[source: service",
+                "[source: lead_type",
+                "faq",
+                "service",
+                "workflow",
+                "lead type",
+            )
+            has_domain_signal = any(marker in context_l for marker in relevance_markers)
+            if not has_domain_signal:
+                return None
+
+            answer = await self._generate_question_response(query, rag_context, conversation_history, context)
+            if not answer:
+                return None
+
+            # If model couldn't ground an answer, treat as out-of-scope in conversational mode.
+            answer_l = answer.lower()
+            if "i don't have that information" in answer_l:
+                return None
+            return answer
         
         # Handle data collection states - extract and validate before AI generation
         if state == ConversationState.LEAD_TYPE_SELECTION:
@@ -476,15 +523,15 @@ Classify the intent:"""
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
                 
                 # Check if there's only one service for this lead type - if so, auto-select it
-                treatment_plans = context.get("treatment_plans", [])
+                service_plans = context.get("service_plans", [])
                 lead_types = context.get("lead_types", [])
-                filtered_services = self._filter_services_by_lead_type(treatment_plans, lead_types, lead_type.get("value"))
+                filtered_services = self._filter_services_by_lead_type(service_plans, lead_types, lead_type.get("value"))
                 
                 if filtered_services is not None:
                     all_services = filtered_services
                 else:
                     all_services = []
-                    for plan in treatment_plans:
+                    for plan in service_plans:
                         if isinstance(plan, dict):
                             plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
                             if plan_name:
@@ -506,7 +553,7 @@ Classify the intent:"""
                     workflow_manager = flow_controller.workflow_manager
                     
                     workflow_started = False
-                    if workflow_manager.start_workflow_for_treatment_plan(single_service):
+                    if workflow_manager.start_workflow_for_service(single_service):
                         # Start workflow questions
                         flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
                         workflow_started = True
@@ -516,7 +563,7 @@ Classify the intent:"""
                             question_text = workflow_manager.format_question_with_options(current_question)
                             logger.info(f"✓ First workflow question: '{current_question.get('question', '')}'")
                             # If user asked a question, answer it briefly then ask workflow question
-                            if has_question:
+                            if has_question and not conversation_style_enabled:
                                 try:
                                     rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
                                     if rag_context and self.client:
@@ -558,6 +605,11 @@ Classify the intent:"""
                     
                     # Check if user asked a question (only if no workflow)
                     if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+                        if conversation_style_enabled:
+                            # In conversational mode, answer only if relevant to app industry/context.
+                            answer = await _answer_if_relevant_question(user_message)
+                            next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                            return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                         rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
                         return await self._generate_data_collected_with_question_response(
                             "service", single_service, rag_context,
@@ -571,6 +623,13 @@ Classify the intent:"""
                     logger.info(f"Multiple services available ({len(all_services)}) - showing service selection")
                     # Check if user asked a question along with lead type selection
                     if has_question:
+                        if conversation_style_enabled:
+                            answer = await _answer_if_relevant_question(user_message)
+                            next_prompt = await self._generate_service_selection_response(
+                                conversation_history, context,
+                                collected_lead_type=lead_type.get("value")
+                            )
+                            return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                         rag_context = await self._get_rag_context(user_message, context, is_question=True)
                         return await self._generate_data_collected_with_question_response(
                             "lead type", lead_type.get("text"), rag_context, 
@@ -585,85 +644,97 @@ Classify the intent:"""
                         )
             else:
                 logger.warning(f"No lead type matched for user input: '{user_message}'. Available lead types: {[lt.get('text') for lt in context.get('lead_types', [])]}")
-                # No match found - use AI to handle questions, but with strict prompt to only show lead types
+                # No match found: in conversational mode, keep asking for lead-type collection
+                if conversation_style_enabled:
+                    answer = await _answer_if_relevant_question(user_message)
+                    next_prompt = await self._generate_state_response(state, "", conversation_history, context)
+                    return f"{answer}\n\n{next_prompt}" if answer else next_prompt
+                # Otherwise, allow RAG to answer questions while staying in the lead-type phase.
                 rag_context = await self._get_rag_context(user_message if has_question else "lead type selection", context, is_question=has_question)
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
         
         if state == ConversationState.SERVICE_SELECTION:
-            treatment_plans = context.get("treatment_plans", [])
+            service_plans = context.get("service_plans", [])
             lead_types = context.get("lead_types", [])
             collected_lead_type = flow_controller.collected_data.get("leadType")
             
             # Filter services by lead type's relevantServicePlans when configured
-            filtered_names = self._filter_services_by_lead_type(treatment_plans, lead_types, collected_lead_type)
+            filtered_names = self._filter_services_by_lead_type(service_plans, lead_types, collected_lead_type)
             if filtered_names is not None:
-                all_treatment_plans = filtered_names
+                all_service_options = filtered_names
                 logger.info(f"SERVICE_SELECTION: Filtered to {len(filtered_names)} services for lead type '{collected_lead_type}'")
             else:
-                all_treatment_plans = []
-                for plan in treatment_plans:
+                all_service_options = []
+                for plan in service_plans:
                     if isinstance(plan, dict):
                         plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
                         if plan_name:
-                            all_treatment_plans.append(plan_name)
+                            all_service_options.append(plan_name)
                     else:
-                        all_treatment_plans.append(str(plan))
-                logger.info(f"SERVICE_SELECTION: No filtering - showing all {len(all_treatment_plans)} services")
+                        all_service_options.append(str(plan))
+                logger.info(f"SERVICE_SELECTION: No filtering - showing all {len(all_service_options)} services")
             
             # Numeric selection: "1", "2" = first, second service in the list shown to user
             service = None
             if user_message.strip().isdigit():
                 num = int(user_message.strip())
-                if 1 <= num <= len(all_treatment_plans):
-                    service = all_treatment_plans[num - 1]
+                if 1 <= num <= len(all_service_options):
+                    service = all_service_options[num - 1]
                     logger.info(f"SERVICE_SELECTION: Matched service by number #{num}: '{service}'")
             if not service:
-                service = extractor.match_service(user_message, all_treatment_plans)
+                service = extractor.match_service(user_message, all_service_options)
             
-            # Find the exact treatment plan name that was matched (for workflow detection)
-            matched_treatment_plan_name = None
+            # Find the exact service plan name that was matched (for workflow detection)
+            matched_service_name = None
             if service:
-                # Find the exact treatment plan name from the list (case-insensitive match)
-                for plan_name in all_treatment_plans:
+                # Find the exact service plan name from the list (case-insensitive match)
+                for plan_name in all_service_options:
                     if plan_name.lower() == service.lower():
-                        matched_treatment_plan_name = plan_name
+                        matched_service_name = plan_name
                         break
                 # If no exact match found, use the service as-is
-                if not matched_treatment_plan_name:
-                    matched_treatment_plan_name = service
+                if not matched_service_name:
+                    matched_service_name = service
             
             # If no match, accept user input as service type (user can choose any service)
             if not service:
                 # Check if it's a question - if so, handle it but stay in service selection
                 if has_question:
                     logger.info(f"User asked a question about services: '{user_message}'")
+                    if conversation_style_enabled:
+                        answer = await _answer_if_relevant_question(user_message)
+                        next_prompt = await self._generate_service_selection_response(
+                            conversation_history, context,
+                            collected_lead_type=collected_lead_type
+                        )
+                        return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_state_response(state, rag_context, conversation_history, context)
                 
-                # Accept user input as service type even if not in treatment plans
+                # Accept user input as service type even if not in configured service options
                 service = user_message.strip()
-                logger.info(f"Accepted user input as service type (not in treatment plans): '{service}'")
+                logger.info(f"Accepted user input as service type (not in configured service options): '{service}'")
             
             if service:
                 logger.info(f"Matched/selected service: {service}")
                 flow_controller.update_collected_data("serviceType", service)
                 
                 # ALWAYS check for workflows first (even if user asked a question)
-                # Use the exact treatment plan name for workflow detection
+                # Use the exact service plan name for workflow detection
                 workflow_started = False
-                if matched_treatment_plan_name and matched_treatment_plan_name in all_treatment_plans:
-                    logger.info(f"Checking for workflows for treatment plan: '{matched_treatment_plan_name}' (matched from service: '{service}')")
-                    if workflow_manager.start_workflow_for_treatment_plan(matched_treatment_plan_name):
+                if matched_service_name and matched_service_name in all_service_options:
+                    logger.info(f"Checking for workflows for service: '{matched_service_name}' (matched from service: '{service}')")
+                    if workflow_manager.start_workflow_for_service(matched_service_name):
                         # Start workflow questions
                         flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
                         workflow_started = True
-                        logger.info(f"✓ Started workflow for treatment plan '{matched_treatment_plan_name}' - transitioning to WORKFLOW_QUESTION state")
+                        logger.info(f"✓ Started workflow for service '{matched_service_name}' - transitioning to WORKFLOW_QUESTION state")
                         current_question = workflow_manager.get_current_question()
                         if current_question:
                             question_text = workflow_manager.format_question_with_options(current_question) or ""
                             logger.info(f"✓ First workflow question: '{current_question.get('question', '')}'")
                             # If user asked a question, answer it briefly then ask workflow question
-                            if has_question:
+                            if has_question and not conversation_style_enabled:
                                 try:
                                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                                     if rag_context and self.client:
@@ -694,7 +765,7 @@ Classify the intent:"""
                             flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                     else:
                         # No workflow found
-                        logger.info(f"No workflow found for treatment plan '{matched_treatment_plan_name}' - continuing to name collection")
+                        logger.info(f"No workflow found for service '{matched_service_name}' - continuing to name collection")
                         workflow_manager.reset()
                 
                 # If workflow was NOT started, continue to name collection
@@ -707,6 +778,10 @@ Classify the intent:"""
                 
                 # Check if user asked a question along with service selection (only if no workflow)
                 if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+                    if conversation_style_enabled:
+                        answer = await _answer_if_relevant_question(user_message)
+                        next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                        return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                     # Get RAG context for the question (pricing, info about the service)
                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
                     # Generate response that answers question AND asks for name
@@ -719,7 +794,7 @@ Classify the intent:"""
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 # This shouldn't happen now, but keep as fallback
-                logger.warning(f"Could not determine service from user input: '{user_message}'. Available treatment plans: {all_treatment_plans}")
+                logger.warning(f"Could not determine service from user input: '{user_message}'. Available service options: {all_service_options}")
                 # No match - use AI to handle questions, but ensure it stays in service selection
                 rag_context = await self._get_rag_context(user_message if has_question else "service selection", context, is_question=has_question)
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
@@ -738,9 +813,12 @@ Classify the intent:"""
             
             # Check if user is asking a question instead of answering the workflow question
             if has_question:
+                current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
+                if conversation_style_enabled:
+                    answer = await _answer_if_relevant_question(user_message)
+                    return f"{answer}\n\n{current_question_formatted}" if answer else current_question_formatted
                 logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
                 rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
                 if rag_context and self.client:
                     try:
                         answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
@@ -936,17 +1014,17 @@ Classify the intent:"""
         
         conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
         
-        treatment_plans = context.get("treatment_plans", [])
+        service_plans = context.get("service_plans", [])
         lead_types = context.get("lead_types", [])
         
         # Try to filter by lead type's relevantServicePlans
-        filtered = self._filter_services_by_lead_type(treatment_plans, lead_types, collected_lead_type)
+        filtered = self._filter_services_by_lead_type(service_plans, lead_types, collected_lead_type)
         if filtered is not None:
             all_services = filtered
             logger.info(f"Filtered {len(filtered)} services for lead type '{collected_lead_type}': {filtered}")
         else:
             all_services = []
-            for plan in treatment_plans:
+            for plan in service_plans:
                 if isinstance(plan, dict):
                     plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
                     if plan_name:
@@ -1030,13 +1108,13 @@ CRITICAL RULES:
         conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
         def _get_service_list(ctx: Dict[str, Any], lead_type_val: Optional[str] = None) -> List[str]:
             """Helper to get filtered or all services"""
-            treatment_plans = ctx.get("treatment_plans", [])
+            service_plans = ctx.get("service_plans", [])
             lead_types = ctx.get("lead_types", [])
-            filtered = self._filter_services_by_lead_type(treatment_plans, lead_types, lead_type_val)
+            filtered = self._filter_services_by_lead_type(service_plans, lead_types, lead_type_val)
             if filtered is not None:
                 return filtered
             all_services = []
-            for plan in treatment_plans:
+            for plan in service_plans:
                 if isinstance(plan, dict):
                     plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
                     if plan_name:
@@ -1229,18 +1307,18 @@ If the context doesn't contain the answer, say "I don't have that information, b
         if conversation_style and self.channel != "voice":
             state_prompts[ConversationState.GREETING] = (
                 f"You are a {self.profession} assistant. Greet the user and ask what they need "
-                f"in their own words. Do NOT present lead type options from context. "
+                f"in a natural way. Do NOT present lead type options from context. "
                 f"Do NOT output <button> tags or numbered lists."
             )
             state_prompts[ConversationState.LEAD_TYPE_SELECTION] = f"""You are a {self.profession} assistant.
-- If user asks a question, answer it briefly (1-2 sentences) using context, then ask what they need in their own words.
+- If user asks a question, answer it briefly (1-2 sentences) using context, then ask what they need next in free text.
 - Ask the user to describe the lead type (e.g. appointment, callback, information) in free text.
 - DO NOT output <button> tags or numbered lists.
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT ask for service selection yet - wait for the user to describe their need first."""
             state_prompts[ConversationState.SERVICE_SELECTION] = f"""You are a {self.profession} assistant.
 - The user has ALREADY selected a lead type - do NOT show lead type options again.
-- If user asks a question, answer it briefly (1-2 sentences) using context, then ask what service they want in their own words.
+- If user asks a question, answer it briefly (1-2 sentences) using context, then ask which service they want next in free text.
 - Ask a natural question like 'Which service are you interested in?' (open-ended).
 - DO NOT output <button> tags or numbered lists.
 - DO NOT ask for date/time - that is NOT part of this flow.
@@ -1280,9 +1358,9 @@ RULES:
                 f"Would you like {lead_voice_list}?" if lead_voice_list else "No lead types provided"
             )
 
-            treatment_plans = context.get("treatment_plans", [])
+            service_plans = context.get("service_plans", [])
             service_names = []
-            for plan in treatment_plans:
+            for plan in service_plans:
                 if isinstance(plan, dict):
                     plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
                     if plan_name:
