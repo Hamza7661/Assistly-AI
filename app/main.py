@@ -467,6 +467,19 @@ def _is_availability_intent(text: str) -> bool:
     return any(p in t for p in availability_phrases)
 
 
+def _extract_index_choice(text: str) -> Optional[int]:
+    """Extract numeric choice from text like '2', '2. Fri', or '2 - 10:00 AM'."""
+    if not text or not isinstance(text, str):
+        return None
+    match = re.match(r"^\s*(\d{1,2})\b", text.strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def _extract_otp_from_text(text: str) -> str:
     """Extract 6-digit OTP code from user text."""
     import re
@@ -880,15 +893,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "bot", "content": reply})
                     continue
                 try:
-                    num = int(str(user_text).strip())
+                    num = _extract_index_choice(str(user_text))
+                    if num is None:
+                        raise ValueError("No numeric choice parsed")
                     if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                         slot = calendar_slots[num - 1]
                         start_iso = slot.get("start", "")
                         end_iso = slot.get("end", "")
+                        slot_timezone = slot.get("timezone")
                         title = "Appointment"
                         calendar_service = CalendarService(settings)
                         book_result = await calendar_service.book_appointment(
-                            app_id_for_calendar, start_iso, end_iso, title
+                            app_id_for_calendar, start_iso, end_iso, title, time_zone=slot_timezone
                         )
                         calendar_flow = None
                         calendar_days = []
@@ -918,6 +934,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         calendar_slots = slots_for_day
                         calendar_selected_day = selected_date
                         lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        lines.append("Choose a time slot:")
                         for i, s in enumerate(slots_for_day[:15], 1):
                             start = s.get("start", "")
                             end = s.get("end", "")
@@ -925,10 +942,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 try:
                                     dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                     dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                    lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                    lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                                 except Exception:
-                                    lines.append(f"{i}. {start}–{end}")
-                        lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                    lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -983,10 +999,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             calendar_selected_day = None
                             max_days = 14
                             show_days = calendar_days_list[:max_days]
-                            lines = ["Pick a day (reply with the number):"]
+                            lines = ["Choose a day:"]
                             for i, day in enumerate(show_days, 1):
-                                lines.append(f"{i}. {day['label']}")
-                            lines.append("Then I'll show you available times for that day.")
+                                lines.append(f"<button>📅 {i}. {day['label']}</button>")
                             reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -1789,14 +1804,17 @@ async def whatsapp_webhook(request: Request):
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             try:
-                num = int(user_text.strip())
+                num = _extract_index_choice(user_text)
+                if num is None:
+                    raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
                     start_iso = slot.get("start", "")
                     end_iso = slot.get("end", "")
+                    slot_timezone = slot.get("timezone")
                     title = "Appointment"
                     calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
+                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title, time_zone=slot_timezone)
                     session["calendar_flow"] = None
                     session["calendar_days"] = None
                     session["calendar_slots"] = None
@@ -1825,6 +1843,7 @@ async def whatsapp_webhook(request: Request):
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
@@ -1832,10 +1851,9 @@ async def whatsapp_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"{i}. {start}–{end}")
-                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -1889,10 +1907,9 @@ async def whatsapp_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Pick a day (reply with the number):"]
+                        lines = ["Choose a day:"]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"{i}. {day['label']}")
-                        lines.append("Then I'll show you available times for that day.")
+                            lines.append(f"<button>📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -2731,14 +2748,17 @@ async def messenger_webhook(request: Request):
                 await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
             try:
-                num = int(message_text.strip())
+                num = _extract_index_choice(message_text)
+                if num is None:
+                    raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
                     start_iso = slot.get("start", "")
                     end_iso = slot.get("end", "")
+                    slot_timezone = slot.get("timezone")
                     title = "Appointment"
                     calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
+                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title, time_zone=slot_timezone)
                     session["calendar_flow"] = None
                     session["calendar_days"] = None
                     session["calendar_slots"] = None
@@ -2767,6 +2787,7 @@ async def messenger_webhook(request: Request):
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
@@ -2774,10 +2795,9 @@ async def messenger_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"{i}. {start}–{end}")
-                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -2831,10 +2851,9 @@ async def messenger_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Pick a day (reply with the number):"]
+                        lines = ["Choose a day:"]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"{i}. {day['label']}")
-                        lines.append("Then I'll show you available times for that day.")
+                            lines.append(f"<button>📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -3552,14 +3571,17 @@ async def instagram_webhook(request: Request):
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
             try:
-                num = int(message_text.strip())
+                num = _extract_index_choice(message_text)
+                if num is None:
+                    raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
                     start_iso = slot.get("start", "")
                     end_iso = slot.get("end", "")
+                    slot_timezone = slot.get("timezone")
                     title = "Appointment"
                     calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
+                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title, time_zone=slot_timezone)
                     session["calendar_flow"] = None
                     session["calendar_days"] = None
                     session["calendar_slots"] = None
@@ -3588,6 +3610,7 @@ async def instagram_webhook(request: Request):
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
@@ -3595,10 +3618,9 @@ async def instagram_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"{i}. {start}–{end}")
-                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -3652,10 +3674,9 @@ async def instagram_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Pick a day (reply with the number):"]
+                        lines = ["Choose a day:"]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"{i}. {day['label']}")
-                        lines.append("Then I'll show you available times for that day.")
+                            lines.append(f"<button>📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
