@@ -482,6 +482,43 @@ def _extract_index_choice(text: str) -> Optional[int]:
         return None
 
 
+def _format_slot_time_local(iso_str: str, iana_timezone: str) -> str:
+    """Format a UTC ISO datetime to a 12-hour local time string using the given IANA timezone."""
+    from datetime import datetime
+    try:
+        dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt_local = dt_utc
+        if iana_timezone and iana_timezone != "UTC":
+            try:
+                from zoneinfo import ZoneInfo
+                dt_local = dt_utc.astimezone(ZoneInfo(iana_timezone))
+            except Exception:
+                pass
+        h = dt_local.hour
+        m = dt_local.minute
+        period = "AM" if h < 12 else "PM"
+        display_h = h % 12 or 12
+        return f"{display_h}:{m:02d} {period}"
+    except Exception:
+        return iso_str
+
+
+def _get_tz_label(iana_timezone: str) -> str:
+    """Return a readable timezone label like 'Asia/Karachi (GMT+5)'."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(iana_timezone)
+        offset = datetime.now(tz).utcoffset()
+        total_minutes = int(offset.total_seconds() / 60)
+        sign = "+" if total_minutes >= 0 else "-"
+        abs_h, abs_m = divmod(abs(total_minutes), 60)
+        offset_str = f"GMT{sign}{abs_h}" if abs_m == 0 else f"GMT{sign}{abs_h}:{abs_m:02d}"
+        return f"{iana_timezone} ({offset_str})"
+    except Exception:
+        return iana_timezone or "UTC"
+
+
 def _extract_otp_from_text(text: str) -> str:
     """Extract 6-digit OTP code from user text."""
     import re
@@ -799,6 +836,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     calendar_slots: List[Dict[str, Any]] = []
     calendar_free_slots: List[Dict[str, Any]] = []
     calendar_selected_day: Optional[str] = None
+    calendar_pending_slot: Dict[str, Any] = {}
+    user_timezone: str = "UTC"
 
     # Build RAG vector store
     rag_service.build_vector_store(context)
@@ -823,6 +862,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except json.JSONDecodeError:
                 parsed = {}
                 user_text = data
+
+            # Capture user's IANA timezone sent from the widget
+            if isinstance(parsed, dict):
+                tz_hint = parsed.get("timezone")
+                if tz_hint and isinstance(tz_hint, str) and len(tz_hint) < 64:
+                    user_timezone = tz_hint
 
             # ── Handle file_upload messages from the chat widget ──────────────
             if isinstance(parsed, dict) and parsed.get("type") == "file_upload":
@@ -879,9 +924,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             integration = context.get("integration") or {}
             app_id_for_calendar = app_id  # from query params when widget is opened with ?app_id=...
 
-            # ── Calendar flow: same as WhatsApp – show days/slots from connected calendar, allow booking ──
+            # ── Calendar flow: show days/slots from connected calendar, allow booking ──
             if calendar_flow and app_id_for_calendar and str(user_text).strip():
-                from datetime import datetime
                 raw_lower = str(user_text).strip().lower()
                 if raw_lower in ("cancel", "back", "exit"):
                     calendar_flow = None
@@ -889,7 +933,34 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     calendar_slots = []
                     calendar_free_slots = []
                     calendar_selected_day = None
+                    calendar_pending_slot = {}
                     reply = "Cancelled. How can I help?"
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                # ── Confirm step: user typed service/reason — now book with that title ──
+                if calendar_flow == "confirm" and calendar_pending_slot:
+                    service_title = str(user_text).strip() or "Appointment"
+                    slot = calendar_pending_slot
+                    start_iso = slot.get("start", "")
+                    end_iso = slot.get("end", "")
+                    slot_timezone = slot.get("timezone")
+                    calendar_service = CalendarService(settings)
+                    book_result = await calendar_service.book_appointment(
+                        app_id_for_calendar, start_iso, end_iso, service_title, time_zone=slot_timezone
+                    )
+                    calendar_flow = None
+                    calendar_days = []
+                    calendar_slots = []
+                    calendar_free_slots = []
+                    calendar_selected_day = None
+                    calendar_pending_slot = {}
+                    if book_result.get("success"):
+                        time_str = _format_slot_time_local(start_iso, slot_timezone or "UTC")
+                        reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
+                    else:
+                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
@@ -899,28 +970,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if num is None:
                         raise ValueError("No numeric choice parsed")
                     if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                        # Save selected slot and ask for service/reason before booking
                         slot = calendar_slots[num - 1]
-                        start_iso = slot.get("start", "")
-                        end_iso = slot.get("end", "")
-                        slot_timezone = slot.get("timezone")
-                        title = "Appointment"
-                        calendar_service = CalendarService(settings)
-                        book_result = await calendar_service.book_appointment(
-                            app_id_for_calendar, start_iso, end_iso, title, time_zone=slot_timezone
-                        )
-                        calendar_flow = None
-                        calendar_days = []
-                        calendar_slots = []
-                        calendar_free_slots = []
-                        calendar_selected_day = None
-                        if book_result.get("success"):
-                            try:
-                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                                reply = f"Booked for {dt.strftime('%H:%M')}. You'll receive a confirmation."
-                            except Exception:
-                                reply = "Appointment booked. You'll receive a confirmation."
-                        else:
-                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                        calendar_pending_slot = slot
+                        calendar_flow = "confirm"
+                        time_str = _format_slot_time_local(slot.get("start", ""), slot.get("timezone") or "UTC")
+                        reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {time_str}"
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
                         await websocket.send_json({"type": "bot", "content": reply})
@@ -935,18 +990,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         calendar_flow = "slots"
                         calendar_slots = slots_for_day
                         calendar_selected_day = selected_date
+                        slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        tz_label = _get_tz_label(slot_tz)
                         lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        lines.append(f"🌐 All times shown in {tz_label}")
                         lines.append("Choose a time slot:")
                         for i, s in enumerate(slots_for_day[:15], 1):
                             start = s.get("start", "")
                             end = s.get("end", "")
                             if start and end:
-                                try:
-                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
-                                except Exception:
-                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                                t_start = _format_slot_time_local(start, slot_tz)
+                                t_end = _format_slot_time_local(end, slot_tz)
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {t_start}–{t_end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -1791,7 +1846,6 @@ async def whatsapp_webhook(request: Request):
 
         # Calendar flow: user already in day/slot selection; handle numeric reply or cancel
         if calendar_flow and app_id and user_text.strip():
-            from datetime import datetime
             raw_lower = user_text.strip().lower()
             if raw_lower in ("cancel", "back", "exit"):
                 session["calendar_flow"] = None
@@ -1799,7 +1853,33 @@ async def whatsapp_webhook(request: Request):
                 session["calendar_slots"] = None
                 session["calendar_free_slots"] = None
                 session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
                 reply = "Cancelled. How can I help?"
+                conversation_history.append({"role": "user", "content": user_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            # ── Confirm step: user replied with service/reason — book with that title ──
+            if calendar_flow == "confirm":
+                pending_slot = session.get("calendar_pending_slot") or {}
+                service_title = user_text.strip() or "Appointment"
+                start_iso = pending_slot.get("start", "")
+                end_iso = pending_slot.get("end", "")
+                slot_timezone = pending_slot.get("timezone")
+                calendar_service = CalendarService(settings)
+                book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, service_title, time_zone=slot_timezone)
+                session["calendar_flow"] = None
+                session["calendar_days"] = None
+                session["calendar_slots"] = None
+                session["calendar_free_slots"] = None
+                session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
+                if book_result.get("success"):
+                    time_str = _format_slot_time_local(start_iso, slot_timezone or "UTC")
+                    reply = f"✅ Your *{service_title}* is booked for {time_str}. Reply with anything to continue."
+                else:
+                    reply = book_result.get("error") or "Booking failed. Please try again or contact us."
                 conversation_history.append({"role": "user", "content": user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 whatsapp_sessions[session_id]["history"] = conversation_history
@@ -1811,26 +1891,11 @@ async def whatsapp_webhook(request: Request):
                     raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
-                    start_iso = slot.get("start", "")
-                    end_iso = slot.get("end", "")
-                    slot_timezone = slot.get("timezone")
-                    title = "Appointment"
-                    calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title, time_zone=slot_timezone)
-                    session["calendar_flow"] = None
-                    session["calendar_days"] = None
-                    session["calendar_slots"] = None
-                    session["calendar_free_slots"] = None
-                    session["calendar_selected_day"] = None
-                    if book_result.get("success"):
-                        try:
-                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            time_str = dt.strftime("%H:%M")
-                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
-                        except Exception:
-                            reply = "Appointment booked. Reply with anything to continue."
-                    else:
-                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    # Save slot and ask for service/reason before booking
+                    session["calendar_pending_slot"] = slot
+                    session["calendar_flow"] = "confirm"
+                    time_str = _format_slot_time_local(slot.get("start", ""), slot.get("timezone") or "UTC")
+                    reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {time_str}"
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
@@ -1844,18 +1909,18 @@ async def whatsapp_webhook(request: Request):
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
+                    slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                    tz_label = _get_tz_label(slot_tz)
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append(f"🌐 All times in {tz_label}")
                     lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
                         if start and end:
-                            try:
-                                dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                                dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
-                            except Exception:
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                            t_start = _format_slot_time_local(start, slot_tz)
+                            t_end = _format_slot_time_local(end, slot_tz)
+                            lines.append(f"<button value=\"{i}\">🕒 {i}. {t_start}–{t_end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
