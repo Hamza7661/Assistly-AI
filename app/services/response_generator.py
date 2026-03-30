@@ -454,7 +454,8 @@ Classify the intent:"""
             """
             Conversational-mode guard:
             - answer briefly when question is relevant to app industry / services / FAQs
-            - return None when out-of-scope so caller can redirect to current step
+            - for industry-relevant questions not in custom data, answer from general knowledge
+            - return None only when question is a non-question (e.g. pure data input)
             """
             if not (conversation_style_enabled and has_question and query.strip()):
                 return None
@@ -466,10 +467,8 @@ Classify the intent:"""
                 scoped_query = f"{query.strip()} (Industry: {app_industry})"
 
             rag_context = await self._get_rag_context(scoped_query, context, is_question=True)
-            if not rag_context:
-                return None
 
-            context_l = rag_context.lower()
+            context_l = (rag_context or "").lower()
             # Relevance markers from our domain context payloads (FAQ/services/lead options/workflows)
             relevance_markers = (
                 "[source: faq",
@@ -481,17 +480,19 @@ Classify the intent:"""
                 "lead type",
             )
             has_domain_signal = any(marker in context_l for marker in relevance_markers)
-            if not has_domain_signal:
-                return None
 
-            answer = await self._generate_question_response(query, rag_context, conversation_history, context)
+            # Industry-relevant question types that should be answered even without custom data
+            industry_question_types = {"pricing", "general_info", "procedure_info", "location_hours", "other"}
+
+            if not has_domain_signal and question_type not in industry_question_types:
+                # Truly off-topic: no custom data and not an industry-type question — let the LLM redirect gracefully
+                answer = await self._generate_question_response(query, rag_context or "", conversation_history, context)
+                return answer if answer else None
+
+            answer = await self._generate_question_response(query, rag_context or "", conversation_history, context)
             if not answer:
                 return None
 
-            # If model couldn't ground an answer, treat as out-of-scope in conversational mode.
-            answer_l = answer.lower()
-            if "i don't have that information" in answer_l:
-                return None
             return answer
         
         # Handle data collection states - extract and validate before AI generation
@@ -1238,9 +1239,18 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
         if not self.client:
             return get_fallback_message()
         
-        system_prompt = f"""You are a {self.profession} assistant. 
-Answer the user's question briefly (1-2 sentences) using ONLY the context provided below.
-If the context doesn't contain the answer, say "I don't have that information, but let me help you with..." and continue the conversation."""
+        system_prompt = f"""You are a knowledgeable, friendly {self.profession} assistant helping customers.
+
+When answering the user's question, follow these guidelines:
+- If the context below directly answers the question, use it.
+- If the context doesn't cover it but the question is relevant to the {self.profession} industry or our services (e.g. asking about a treatment, procedure, product, or general industry topic), answer naturally and helpfully from your general knowledge — like a well-informed staff member would.
+- If the question is completely unrelated to {self.profession} or our services (e.g. weather, politics, unrelated topics), respond with genuine warmth and empathy — acknowledge the question, then naturally redirect. Use varied, human-sounding phrases, for example:
+  * "Oh, I wish I could help with that! I'm really only set up to assist with {self.profession} services — but I'd love to help you with a treatment or booking if you're interested?"
+  * "Ha, that one's a little out of my world! I'm mostly here for {self.profession} stuff. Anything I can help you with on that front?"
+  * "Good question, though I'm afraid that's a bit beyond what I'm here for! I specialise in {self.profession} — is there anything about our services I can help with?"
+  Vary the phrasing naturally based on context. Never sound dismissive — always make the user feel welcome to ask about services.
+- NEVER say "I don't have that information" or any robotic variation of it. Always sound warm, human, and helpful.
+- Keep answers brief (1-2 sentences) then continue the conversation flow."""
         conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
         if conversation_style and self.channel != "voice":
             system_prompt += "\n\nDo NOT output <button> tags or numbered lists. Continue the conversation naturally."
