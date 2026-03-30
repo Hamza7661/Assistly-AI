@@ -1026,6 +1026,36 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "bot", "content": reply})
                 continue
 
+            # Strict personal-info-first guard:
+            # Once lead type is selected, enforce name -> email -> phone before
+            # service/workflow/booking states.
+            if flow_controller.collected_data.get("leadType") and flow_controller.state in (
+                ConversationState.SERVICE_SELECTION,
+                ConversationState.WORKFLOW_QUESTION,
+                ConversationState.APPOINTMENT_OFFER,
+                ConversationState.CALENDAR_BOOKING,
+                ConversationState.APPOINTMENT_CONFIRMATION,
+            ):
+                target_state = None
+                if not flow_controller.collected_data.get("leadName"):
+                    target_state = ConversationState.NAME_COLLECTION
+                elif not flow_controller.collected_data.get("leadEmail"):
+                    target_state = ConversationState.EMAIL_COLLECTION
+                elif (
+                    not flow_controller.skip_phone_collection
+                    and not flow_controller.collected_data.get("leadPhoneNumber")
+                ):
+                    target_state = ConversationState.PHONE_COLLECTION
+
+                if target_state is not None:
+                    flow_controller.transition_to(target_state)
+                    enforced_prompt = await response_generator._generate_state_response(
+                        flow_controller.state, "", conversation_history, context
+                    )
+                    conversation_history.append({"role": "assistant", "content": enforced_prompt})
+                    await websocket.send_json({"type": "bot", "content": enforced_prompt})
+                    continue
+
             # ── Calendar flow: show days/slots from connected calendar, allow booking ──
             if calendar_flow and app_id_for_calendar and str(user_text).strip():
                 raw_lower = str(user_text).strip().lower()
@@ -1112,8 +1142,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 except ValueError:
                     pass
 
-            # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-            if app_id_for_calendar and _is_availability_intent(str(user_text)):
+            # Calendar availability shortcut should only run in booking-related states.
+            # This prevents premature date/time prompts before personal info/service/workflow steps.
+            if (
+                app_id_for_calendar
+                and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+                and _is_availability_intent(str(user_text))
+            ):
                 from datetime import datetime, timedelta
                 now = datetime.utcnow()
                 from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
@@ -2104,7 +2139,11 @@ async def whatsapp_webhook(request: Request):
                 pass
 
         # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-        if app_id and _is_availability_intent(enhanced_user_text):
+        if (
+            app_id
+            and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+            and _is_availability_intent(enhanced_user_text)
+        ):
             from datetime import datetime, timedelta
             now = datetime.utcnow()
             from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
@@ -3050,7 +3089,11 @@ async def messenger_webhook(request: Request):
                 pass
 
         # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-        if app_id and _is_availability_intent(message_text):
+        if (
+            app_id
+            and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+            and _is_availability_intent(message_text)
+        ):
             from datetime import datetime, timedelta
             now = datetime.utcnow()
             from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
@@ -3875,7 +3918,11 @@ async def instagram_webhook(request: Request):
                 pass
 
         # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-        if app_id and _is_availability_intent(message_text):
+        if (
+            app_id
+            and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+            and _is_availability_intent(message_text)
+        ):
             from datetime import datetime, timedelta
             now = datetime.utcnow()
             from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
