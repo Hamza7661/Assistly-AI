@@ -503,6 +503,22 @@ def _format_slot_time_local(iso_str: str, iana_timezone: str) -> str:
         return iso_str
 
 
+def _get_tz_label(iana_timezone: str) -> str:
+    """Return a readable timezone label like 'Asia/Karachi (GMT+5)'."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(iana_timezone)
+        offset = datetime.now(tz).utcoffset()
+        total_minutes = int(offset.total_seconds() / 60)
+        sign = "+" if total_minutes >= 0 else "-"
+        abs_h, abs_m = divmod(abs(total_minutes), 60)
+        offset_str = f"GMT{sign}{abs_h}" if abs_m == 0 else f"GMT{sign}{abs_h}:{abs_m:02d}"
+        return f"{iana_timezone} ({offset_str})"
+    except Exception:
+        return iana_timezone or "UTC"
+
+
 def _extract_otp_from_text(text: str) -> str:
     """Extract 6-digit OTP code from user text."""
     import re
@@ -941,7 +957,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     calendar_selected_day = None
                     calendar_pending_slot = {}
                     if book_result.get("success"):
-                        time_str = _format_slot_time_local(start_iso, user_timezone)
+                        time_str = _format_slot_time_local(start_iso, slot_timezone or "UTC")
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
                     else:
                         reply = book_result.get("error") or "Booking failed. Please try again or contact us."
@@ -958,7 +974,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         slot = calendar_slots[num - 1]
                         calendar_pending_slot = slot
                         calendar_flow = "confirm"
-                        time_str = _format_slot_time_local(slot.get("start", ""), user_timezone)
+                        time_str = _format_slot_time_local(slot.get("start", ""), slot.get("timezone") or "UTC")
                         reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {time_str}"
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -974,14 +990,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         calendar_flow = "slots"
                         calendar_slots = slots_for_day
                         calendar_selected_day = selected_date
+                        slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        tz_label = _get_tz_label(slot_tz)
                         lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        lines.append(f"🌐 All times shown in {tz_label}")
                         lines.append("Choose a time slot:")
                         for i, s in enumerate(slots_for_day[:15], 1):
                             start = s.get("start", "")
                             end = s.get("end", "")
                             if start and end:
-                                t_start = _format_slot_time_local(start, user_timezone)
-                                t_end = _format_slot_time_local(end, user_timezone)
+                                t_start = _format_slot_time_local(start, slot_tz)
+                                t_end = _format_slot_time_local(end, slot_tz)
                                 lines.append(f"<button value=\"{i}\">🕒 {i}. {t_start}–{t_end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": user_text})
@@ -1890,13 +1909,15 @@ async def whatsapp_webhook(request: Request):
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
+                    slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                    tz_label = _get_tz_label(slot_tz)
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append(f"🌐 All times in {tz_label}")
                     lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
                         if start and end:
-                            slot_tz = s.get("timezone") or "UTC"
                             t_start = _format_slot_time_local(start, slot_tz)
                             t_end = _format_slot_time_local(end, slot_tz)
                             lines.append(f"<button value=\"{i}\">🕒 {i}. {t_start}–{t_end}</button>")
