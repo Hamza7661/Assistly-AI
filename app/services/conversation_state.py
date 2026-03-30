@@ -24,6 +24,9 @@ class ConversationState(Enum):
     PHONE_COLLECTION = "phone_collection"
     PHONE_OTP_SENT = "phone_otp_sent"
     PHONE_OTP_VERIFICATION = "phone_otp_verification"
+    APPOINTMENT_OFFER = "appointment_offer"
+    CALENDAR_BOOKING = "calendar_booking"
+    APPOINTMENT_CONFIRMATION = "appointment_confirmation"
     COMPLETE = "complete"
 
 
@@ -39,6 +42,9 @@ class FlowController:
             "leadName": None,
             "leadEmail": None,
             "leadPhoneNumber": None,
+            "sourceChannel": None,
+            "leadId": None,
+            "appointmentSlot": None,
             "title": None,
             "workflowAnswers": {}
         }
@@ -57,6 +63,21 @@ class FlowController:
         self.channel: str = integration.get("channel", "web")
         self.skip_phone_collection: bool = False
         self.workflow_manager: Optional[Any] = None  # Will be set by response_generator
+
+    def is_booking_lead_type(self) -> bool:
+        lead_type = (self.collected_data.get("leadType") or "").lower()
+        if not lead_type:
+            return False
+        keywords = ("book", "appointment", "treatment")
+        return any(k in lead_type for k in keywords)
+
+    def reset_service_flow(self):
+        self.collected_data["serviceType"] = None
+        self.collected_data["workflowAnswers"] = {}
+        self.collected_data["appointmentSlot"] = None
+        if self.workflow_manager:
+            self.workflow_manager.reset()
+        self.transition_to(ConversationState.SERVICE_SELECTION)
     
     def set_whatsapp(self, is_whatsapp: bool):
         """Set WhatsApp mode (phone already verified)"""
@@ -98,21 +119,21 @@ class FlowController:
         
         elif self.state == ConversationState.LEAD_TYPE_SELECTION:
             if self.collected_data["leadType"]:
-                return ConversationState.SERVICE_SELECTION
+                return ConversationState.NAME_COLLECTION
             return ConversationState.LEAD_TYPE_SELECTION
         
         elif self.state == ConversationState.SERVICE_SELECTION:
             if self.collected_data["serviceType"]:
-                # Check if workflow questions need to be asked
-                # This will be handled by response_generator checking workflow_manager
-                return ConversationState.NAME_COLLECTION
+                return ConversationState.WORKFLOW_QUESTION
             return ConversationState.SERVICE_SELECTION
         
         elif self.state == ConversationState.WORKFLOW_QUESTION:
             # Workflow questions are handled by workflow_manager
             # Check if workflow is complete
             if self.workflow_manager and self.workflow_manager.is_workflow_complete():
-                return ConversationState.NAME_COLLECTION
+                if self.is_booking_lead_type():
+                    return ConversationState.CALENDAR_BOOKING
+                return ConversationState.APPOINTMENT_OFFER
             return ConversationState.WORKFLOW_QUESTION
         
         elif self.state == ConversationState.NAME_COLLECTION:
@@ -125,9 +146,9 @@ class FlowController:
                 if self.validate_email:
                     return ConversationState.EMAIL_OTP_SENT
                 else:
-                    # Skip email OTP, go to phone or complete
+                    # Skip email OTP, go to phone or continue flow
                     if self.is_whatsapp or self.skip_phone_collection:
-                        return ConversationState.COMPLETE
+                        return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
                     else:
                         return ConversationState.PHONE_COLLECTION
             return ConversationState.EMAIL_COLLECTION
@@ -138,19 +159,19 @@ class FlowController:
         elif self.state == ConversationState.EMAIL_OTP_VERIFICATION:
             if self.otp_state["email_verified"]:
                 if self.is_whatsapp or self.skip_phone_collection:
-                    return ConversationState.COMPLETE
+                    return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
                 else:
                     return ConversationState.PHONE_COLLECTION
             return ConversationState.EMAIL_OTP_VERIFICATION
         
         elif self.state == ConversationState.PHONE_COLLECTION:
             if self.skip_phone_collection:
-                return ConversationState.COMPLETE
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             if self.collected_data["leadPhoneNumber"]:
                 if self.validate_phone:
                     return ConversationState.PHONE_OTP_SENT
                 else:
-                    return ConversationState.COMPLETE
+                    return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.PHONE_COLLECTION
         
         elif self.state == ConversationState.PHONE_OTP_SENT:
@@ -158,8 +179,17 @@ class FlowController:
         
         elif self.state == ConversationState.PHONE_OTP_VERIFICATION:
             if self.otp_state["phone_verified"]:
-                return ConversationState.COMPLETE
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.PHONE_OTP_VERIFICATION
+
+        elif self.state == ConversationState.APPOINTMENT_OFFER:
+            return ConversationState.APPOINTMENT_OFFER
+
+        elif self.state == ConversationState.CALENDAR_BOOKING:
+            return ConversationState.CALENDAR_BOOKING
+
+        elif self.state == ConversationState.APPOINTMENT_CONFIRMATION:
+            return ConversationState.APPOINTMENT_CONFIRMATION
         
         elif self.state == ConversationState.COMPLETE:
             return ConversationState.COMPLETE
@@ -205,6 +235,13 @@ class FlowController:
         
         if self.collected_data.get("leadPhoneNumber"):
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
+
+        if self.collected_data.get("sourceChannel"):
+            data["sourceChannel"] = self.collected_data.get("sourceChannel")
+        if self.collected_data.get("leadId"):
+            data["leadId"] = self.collected_data.get("leadId")
+        if self.collected_data.get("appointmentSlot"):
+            data["appointmentSlot"] = self.collected_data.get("appointmentSlot")
         
         # Add workflow answers if present
         workflow_answers = self.collected_data.get("workflowAnswers", {})
@@ -231,6 +268,9 @@ class FlowController:
             ConversationState.PHONE_COLLECTION: "Ask for the user's phone number.",
             ConversationState.PHONE_OTP_SENT: "Acknowledge OTP sent and wait for verification code.",
             ConversationState.PHONE_OTP_VERIFICATION: "Verify the OTP code provided.",
+            ConversationState.APPOINTMENT_OFFER: "Ask if the user wants to book now.",
+            ConversationState.CALENDAR_BOOKING: "Show and collect available date/time slots.",
+            ConversationState.APPOINTMENT_CONFIRMATION: "Ask user to confirm selected appointment details.",
             ConversationState.COMPLETE: "All information collected. Generate JSON."
         }
         return state_prompts.get(self.state, "Continue conversation naturally.")

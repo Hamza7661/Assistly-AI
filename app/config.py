@@ -18,6 +18,7 @@ class Settings(BaseModel):
     
     # Session configuration
     session_timeout_seconds: int = Field(default=300, alias="SESSION_TIMEOUT_SECONDS")  # 5 minutes default
+    lead_dedupe_window_hours: int = Field(default=4, alias="LEAD_DEDUPE_WINDOW_HOURS")
     # Note: Session invalidation endpoint uses tp_sign_secret for authentication (same as other third-party API calls)
     
     # Twilio WhatsApp configuration

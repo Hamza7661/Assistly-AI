@@ -24,10 +24,20 @@ class ResponseGenerator:
         self.response_language: Optional[str] = None  # e.g. "Spanish" for prompts; None/English = no instruction
         # Backend API base for generating attachment download URLs
         self.api_base_url: str = getattr(settings, "api_base_url", "").rstrip("/") + "/api/v1"
+        # Cache for lead-type empathy prefixes to avoid repeated LLM calls
+        self._empathy_prefix_cache: Dict[str, str] = {}
 
     def set_response_language(self, language_name: Optional[str]) -> None:
         """Set language for all user-facing replies (e.g. 'Spanish'). None or 'English' = keep default."""
         self.response_language = language_name
+
+    @staticmethod
+    def _conversation_style_enabled(context: Dict[str, Any]) -> bool:
+        integration = (context.get("integration") or {}) if isinstance(context, dict) else {}
+        value = integration.get("conversationStyle")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     def _language_instruction(self) -> str:
         """Return system instruction to respond in response_language, or empty string if English/default."""
@@ -45,7 +55,7 @@ class ResponseGenerator:
     def set_channel(self, channel: str):
         """Set current channel (web, whatsapp, messenger, voice)"""
         normalized = (channel or "web").lower()
-        if normalized not in {"web", "whatsapp", "messenger", "voice"}:
+        if normalized not in {"web", "whatsapp", "messenger", "instagram", "voice"}:
             normalized = "web"
         logger.info(f"ResponseGenerator channel set to {normalized}")
         self.channel = normalized
@@ -117,6 +127,52 @@ class ResponseGenerator:
                 break
 
         return cleaned.rstrip(" .?")
+
+    async def _generate_empathy_prefix_for_lead_type(
+        self,
+        lead_type_value: Optional[str],
+        lead_types: List[Dict[str, Any]],
+    ) -> str:
+        """Return a short empathy line tailored to selected lead type."""
+        lead_value = (lead_type_value or "").strip().lower()
+        lead_text = ""
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            if (lt.get("value") or "").strip().lower() == lead_value:
+                lead_text = (lt.get("text") or lt.get("value") or "").strip()
+                break
+        label = lead_text or (lead_type_value or "your request")
+        fallback = f"Great choice - I am here to help with {label}."
+        cache_key = f"{(lead_type_value or '').strip().lower()}|{(self.response_language or '').strip().lower()}|{self.channel}"
+        if cache_key in self._empathy_prefix_cache:
+            return self._empathy_prefix_cache[cache_key]
+
+        if not self.client:
+            self._empathy_prefix_cache[cache_key] = fallback
+            return fallback
+
+        system_prompt = (
+            f"Write one short, warm empathy sentence for a customer who selected this lead type: '{label}'. "
+            "Keep it under 14 words. No emojis. No question marks."
+        )
+        if self._language_instruction():
+            system_prompt += f" {self._language_instruction()}"
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": system_prompt}],
+                max_tokens=40,
+                temperature=0.4,
+            )
+            line = (response.choices[0].message.content or "").strip()
+            result = line or fallback
+            self._empathy_prefix_cache[cache_key] = result
+            return result
+        except Exception:
+            self._empathy_prefix_cache[cache_key] = fallback
+            return fallback
 
     
     async def _classify_intent(self, user_message: str) -> Dict[str, Any]:
@@ -354,7 +410,7 @@ Classify the intent:"""
     ) -> str:
         """Generate response based on current state"""
         state = flow_controller.state
-        conversation_style_enabled = bool((context.get("integration") or {}).get("conversationStyle")) and self.channel != "voice"
+        conversation_style_enabled = self._conversation_style_enabled(context) and self.channel != "voice"
         extractor = DataExtractor()
         validator = Validator()
         
@@ -522,6 +578,19 @@ Classify the intent:"""
                 flow_controller.update_collected_data("leadType", lead_type.get("value"))
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
+                # Personal info first: after lead type, immediately collect name/email/phone
+                if flow_controller.state == ConversationState.NAME_COLLECTION:
+                    name_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                    empathy_line = await self._generate_empathy_prefix_for_lead_type(
+                        flow_controller.collected_data.get("leadType"),
+                        context.get("lead_types", []),
+                    )
+                    return f"{empathy_line} {name_prompt}"
+                if flow_controller.state in (
+                    ConversationState.EMAIL_COLLECTION,
+                    ConversationState.PHONE_COLLECTION,
+                ):
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
                 
                 # Check if there's only one service for this lead type - if so, auto-select it
                 service_plans = context.get("service_plans", [])
@@ -601,18 +670,18 @@ Classify the intent:"""
                             logger.info(f"✓ Returning workflow question (no user question to answer first)")
                             return question_text
                         else:
-                            logger.warning(f"Workflow started but no questions found - continuing to name collection")
+                            logger.warning(f"Workflow started but no questions found - continuing to next state")
                             workflow_manager.reset()
-                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                            flow_controller.transition_to(flow_controller.get_next_state())
                     else:
-                        logger.info(f"No workflow found for auto-selected service '{single_service}' - continuing to name collection")
+                        logger.info(f"No workflow found for auto-selected service '{single_service}' - continuing to next state")
                         workflow_manager.reset()
                     
-                    # If workflow was NOT started, continue to name collection
+                    # If workflow was NOT started, continue to next state
                     if not workflow_started:
-                        logger.info(f"No workflow started - transitioning to name collection")
+                        logger.info(f"No workflow started - transitioning to next state")
                         workflow_manager.reset()
-                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        flow_controller.transition_to(flow_controller.get_next_state())
                     
                     logger.info(f"Transitioned to state: {flow_controller.state.value}")
                     
@@ -772,20 +841,20 @@ Classify the intent:"""
                             logger.info(f"✓ Returning workflow question (no user question to answer first)")
                             return question_text
                         else:
-                            # No questions found, continue to name collection
-                            logger.warning(f"Workflow started but no questions found - continuing to name collection")
+                            # No questions found, continue to next state
+                            logger.warning(f"Workflow started but no questions found - continuing to next state")
                             workflow_manager.reset()
-                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                            flow_controller.transition_to(flow_controller.get_next_state())
                     else:
                         # No workflow found
-                        logger.info(f"No workflow found for service '{matched_service_name}' - continuing to name collection")
+                        logger.info(f"No workflow found for service '{matched_service_name}' - continuing to next state")
                         workflow_manager.reset()
                 
-                # If workflow was NOT started, continue to name collection
+                # If workflow was NOT started, continue to next state
                 if not workflow_started:
-                    logger.info(f"No workflow started - transitioning to name collection")
+                    logger.info(f"No workflow started - transitioning to next state")
                     workflow_manager.reset()
-                    flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    flow_controller.transition_to(flow_controller.get_next_state())
                 
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
                 
@@ -797,10 +866,10 @@ Classify the intent:"""
                         return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                     # Get RAG context for the question (pricing, info about the service)
                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
-                    # Generate response that answers question AND asks for name
+                    # Generate response that answers question AND asks for next step
                     return await self._generate_data_collected_with_question_response(
                         "service", service, rag_context,
-                        "name", conversation_history, context
+                        "workflow", conversation_history, context
                     )
                 elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                     # Just acknowledge and move to name collection - no RAG needed
@@ -813,14 +882,31 @@ Classify the intent:"""
                 return await self._generate_state_response(state, rag_context, conversation_history, context)
         
         if state == ConversationState.WORKFLOW_QUESTION:
+            # Graceful switch: if user selects another service while in workflow, restart service flow.
+            service_plans = context.get("service_plans", [])
+            all_services = []
+            for plan in service_plans:
+                if isinstance(plan, dict):
+                    nm = plan.get("question", plan.get("name", plan.get("title", "")))
+                    if nm:
+                        all_services.append(nm)
+                else:
+                    all_services.append(str(plan))
+            switched_service = extractor.match_service(user_message, all_services)
+            if switched_service and (flow_controller.collected_data.get("serviceType") or "").lower() != switched_service.lower():
+                flow_controller.update_collected_data("serviceType", switched_service)
+                flow_controller.reset_service_flow()
+                return f"Switching to {switched_service}. " + await self._generate_service_selection_response(
+                    conversation_history, context, collected_lead_type=flow_controller.collected_data.get("leadType")
+                )
             # Handle workflow question
             current_question = workflow_manager.get_current_question()
             if not current_question:
-                # Workflow complete, store answers and move to name collection
+                # Workflow complete, store answers and move to next state
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                 workflow_manager.reset()
-                flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             
@@ -853,14 +939,14 @@ Classify the intent:"""
                     workflow_answers = workflow_manager.get_workflow_answers()
                     flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                     workflow_manager.reset()
-                    flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                    flow_controller.transition_to(flow_controller.get_next_state())
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
                 workflow_manager.reset()
-                flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
         
@@ -972,6 +1058,25 @@ Classify the intent:"""
                 else:
                     # No RAG needed for standard phone collection prompt
                     return await self._generate_state_response(state, "", conversation_history, context)
+
+        if state == ConversationState.APPOINTMENT_OFFER:
+            text = user_message.strip().lower()
+            if text in {"yes", "y", "book", "book now", "sure"}:
+                flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                return "BOOK_APPOINTMENT_REQUESTED"
+            if text in {"no", "n", "no thanks", "later"}:
+                flow_controller.transition_to(ConversationState.COMPLETE)
+                return await self._generate_json(flow_controller, conversation_history)
+            return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
+
+        if state == ConversationState.CALENDAR_BOOKING:
+            return "BOOK_APPOINTMENT_REQUESTED"
+
+        if state == ConversationState.APPOINTMENT_CONFIRMATION:
+            if user_message.strip().lower() in {"confirm", "yes", "ok"}:
+                flow_controller.transition_to(ConversationState.COMPLETE)
+                return await self._generate_json(flow_controller, conversation_history)
+            return "Please confirm the selected appointment slot to continue."
         
         # Check if all data is collected and we can generate JSON
         if flow_controller.can_generate_json():
@@ -1025,7 +1130,7 @@ Classify the intent:"""
         if not self.client:
             return "Which service are you interested in?"
         
-        conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
+        conversation_style = self._conversation_style_enabled(context)
         
         service_plans = context.get("service_plans", [])
         lead_types = context.get("lead_types", [])
@@ -1324,7 +1429,7 @@ When answering the user's question, follow these guidelines:
 - DO NOT show previous options - continue with phone collection.""",
         }
 
-        conversation_style = bool(context.get("integration", {}).get("conversationStyle"))
+        conversation_style = self._conversation_style_enabled(context)
         lead_types = context.get("lead_types", [])
         lead_type_examples: List[str] = []
         for lt in lead_types:
