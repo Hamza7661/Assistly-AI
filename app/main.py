@@ -4,6 +4,7 @@ import re
 import time
 import secrets
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException, Header
@@ -827,6 +828,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     response_generator = ResponseGenerator(settings, rag_service)
     response_generator.set_profession(str(context.get("profession") or "Business"))
     response_generator.set_channel("web")
+    flow_controller.update_collected_data("sourceChannel", "web")
     
     extractor = DataExtractor()
     conversation_history: List[Dict[str, str]] = []
@@ -843,6 +845,26 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     rag_service.build_vector_store(context)
     
     flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+    lead_id: Optional[str] = None
+    last_snapshot: Dict[str, Any] = {}
+
+    try:
+      location_country = (context.get("country") or "US")
+      ok_lead, lead_resp = await lead_service.create_interaction_lead(
+          app_id=app_id,
+          user_id=user_id,
+          location={"country": location_country, "countryCode": location_country},
+          initial_interaction="widget_opened",
+          source_channel="web",
+          dedupe_window_hours=settings.lead_dedupe_window_hours,
+      )
+      if ok_lead and isinstance(lead_resp, dict):
+          lead_obj = ((lead_resp.get("data") or {}).get("lead") or {})
+          lead_id = str(lead_obj.get("_id") or "")
+          if lead_id:
+              flow_controller.update_collected_data("leadId", lead_id)
+    except Exception as lead_exc:
+      logger.warning("WebSocket interaction lead creation failed: %s", lead_exc)
 
     # Send greeting (from DB) + lead types as buttons as soon as widget opens; no first user message required
     try:
@@ -923,6 +945,86 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             integration = context.get("integration") or {}
             app_id_for_calendar = app_id  # from query params when widget is opened with ?app_id=...
+
+            # Global lead-type switch interrupt:
+            # If user selects a different lead type mid-flow, terminate current branch
+            # (including calendar/workflow) and restart from the new lead type gracefully.
+            lead_types_list = context.get("lead_types", [])
+            switched_lead_type = None
+            # IMPORTANT:
+            # - Numeric lead-type picks (1/2/3...) are only valid while user is in LEAD_TYPE_SELECTION.
+            # - Mid-flow override must be explicit lead-type text/button value to avoid hijacking
+            #   numeric workflow answers (e.g., selecting option "1" for a workflow question).
+            if (
+                flow_controller.state == ConversationState.LEAD_TYPE_SELECTION
+                and str(user_text).strip().isdigit()
+            ):
+                num = int(str(user_text).strip())
+                if 1 <= num <= len(lead_types_list):
+                    candidate = lead_types_list[num - 1]
+                    if isinstance(candidate, dict):
+                        switched_lead_type = candidate
+            if not switched_lead_type:
+                switched_lead_type = extractor.match_lead_type(str(user_text), lead_types_list)
+
+            if (
+                switched_lead_type
+                and flow_controller.state != ConversationState.LEAD_TYPE_SELECTION
+                and (flow_controller.collected_data.get("leadType") or "").strip().lower()
+                != (switched_lead_type.get("value") or "").strip().lower()
+            ):
+                previous_lead_type = flow_controller.collected_data.get("leadType")
+                # Break any ongoing calendar branch
+                calendar_flow = None
+                calendar_days = []
+                calendar_slots = []
+                calendar_free_slots = []
+                calendar_selected_day = None
+                calendar_pending_slot = {}
+
+                # Reset service/workflow context and apply the new lead type
+                if flow_controller.workflow_manager:
+                    flow_controller.workflow_manager.reset()
+                flow_controller.update_collected_data("leadType", switched_lead_type.get("value"))
+                flow_controller.update_collected_data("serviceType", None)
+                flow_controller.update_collected_data("workflowAnswers", {})
+                flow_controller.update_collected_data("appointmentSlot", None)
+                existing_switch_history = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
+                switch_history = list(existing_switch_history) if isinstance(existing_switch_history, list) else []
+                switch_history.append({
+                    "from": previous_lead_type,
+                    "to": switched_lead_type.get("value"),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                })
+                flow_controller.update_collected_data("leadTypeSwitchHistory", switch_history)
+
+                # Keep already collected personal info; continue from the right next step
+                if not flow_controller.collected_data.get("leadName"):
+                    flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                elif not flow_controller.collected_data.get("leadEmail"):
+                    flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                elif (
+                    not flow_controller.skip_phone_collection
+                    and not flow_controller.collected_data.get("leadPhoneNumber")
+                ):
+                    flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+                else:
+                    if flow_controller.is_booking_lead_type():
+                        flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                    else:
+                        flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+
+                switch_msg = (
+                    f"Switched to **{switched_lead_type.get('text', switched_lead_type.get('value', 'new lead type'))}**. "
+                    f"Let's continue from here."
+                )
+                next_prompt = await response_generator._generate_state_response(
+                    flow_controller.state, "", conversation_history, context
+                )
+                reply = f"{switch_msg}\n\n{next_prompt}"
+                conversation_history.append({"role": "assistant", "content": reply})
+                await websocket.send_json({"type": "bot", "content": reply})
+                continue
 
             # ── Calendar flow: show days/slots from connected calendar, allow booking ──
             if calendar_flow and app_id_for_calendar and str(user_text).strip():
@@ -1392,14 +1494,66 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     continue
             
             # Check if JSON was generated (all data collected)
+            if str(reply).strip() == "BOOK_APPOINTMENT_REQUESTED":
+                from datetime import datetime, timedelta
+                now = datetime.utcnow()
+                from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+                to_dt = now + timedelta(days=7)
+                to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+                slot_minutes = integration.get("calendarSlotMinutes", 30)
+                if slot_minutes not in (15, 30, 60):
+                    slot_minutes = 30
+                try:
+                    calendar_service = CalendarService(settings)
+                    result = await calendar_service.get_availability(
+                        app_id_for_calendar, from_date, to_date, slot_minutes=slot_minutes
+                    )
+                    if result.get("error"):
+                        reply = "I couldn't fetch availability right now. Please try again later."
+                    else:
+                        free_slots = result.get("freeSlots") or []
+                        if not free_slots:
+                            reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+                        else:
+                            by_date: Dict[str, List[Dict[str, Any]]] = {}
+                            for slot in free_slots:
+                                start = slot.get("start") or ""
+                                date_key = start[:10] if len(start) >= 10 else ""
+                                if date_key:
+                                    by_date.setdefault(date_key, []).append(slot)
+                            days_order = sorted(by_date.keys())
+                            calendar_days_list = []
+                            for d in days_order:
+                                try:
+                                    dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                except Exception:
+                                    calendar_days_list.append({"date": d, "label": d})
+                            calendar_flow = "days"
+                            calendar_days = calendar_days_list
+                            calendar_free_slots = free_slots
+                            calendar_slots = []
+                            calendar_selected_day = None
+                            lines = ["Choose a day:"]
+                            for i, day in enumerate(calendar_days_list[:14], 1):
+                                lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+                            reply = "\n".join(lines)
+                except Exception as cal_exc:
+                    logger.exception("WebSocket: Calendar availability error: %s", cal_exc)
+                    reply = "I couldn't fetch availability right now. Please try again later."
+
             parsed_json = _maybe_parse_json(reply)
             if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
                 # Add appId if available (for app-scoped leads)
                 if app_id:
                     parsed_json["appId"] = app_id
-                # Create lead
+                # Update existing interaction lead if available, otherwise create a new lead
                 try:
-                    ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                    if lead_id:
+                        parsed_json["status"] = "complete"
+                        ok, _ = await lead_service.update_lead(user_id, lead_id, parsed_json)
+                    else:
+                        ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
                     final_msg = get_string("final_success", lang_code) if ok else get_string("final_fallback", lang_code)
                 except Exception:
                     final_msg = get_string("final_fallback", lang_code)
@@ -1417,6 +1571,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 break
             
             # Regular conversation response
+            # Progressive lead updates while conversation is in progress.
+            if lead_id:
+                snapshot = {
+                    "leadType": flow_controller.collected_data.get("leadType"),
+                    "serviceType": flow_controller.collected_data.get("serviceType"),
+                    "leadName": flow_controller.collected_data.get("leadName"),
+                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                    "leadTypeSwitchHistory": flow_controller.collected_data.get("leadTypeSwitchHistory"),
+                    "status": "in_progress"
+                }
+                if snapshot != last_snapshot:
+                    try:
+                        await lead_service.update_lead(user_id, lead_id, snapshot)
+                        last_snapshot = dict(snapshot)
+                    except Exception as sync_exc:
+                        logger.warning("Lead progressive update failed: %s", sync_exc)
             conversation_history.append({"role": "assistant", "content": reply})
             await websocket.send_json({"type": "bot", "content": reply})
             # Signal the frontend to show the file upload button if the bot is requesting a file
@@ -1690,6 +1861,7 @@ async def whatsapp_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
+            flow_controller.update_collected_data("sourceChannel", "whatsapp")
             
             # First message from user (e.g. "السلام علیکم") – detect language and greet in that language
             first_message = (message_data.get("body") or "").strip()
@@ -1745,6 +1917,7 @@ async def whatsapp_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
+            flow_controller.update_collected_data("sourceChannel", "whatsapp")
             session["flow_controller"] = flow_controller
             session["response_generator"] = response_generator
         
@@ -2722,6 +2895,7 @@ async def messenger_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("messenger")
+            flow_controller.update_collected_data("sourceChannel", "facebook")
             rag_service.build_vector_store(context)
 
             messenger_sessions[session_id]["flow_controller"] = flow_controller
@@ -2792,6 +2966,7 @@ async def messenger_webhook(request: Request):
         if not flow_controller or not response_generator:
             logger.error("Messenger: flow_controller or response_generator missing in session")
             return {"status": "error"}
+        flow_controller.update_collected_data("sourceChannel", "facebook")
 
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
@@ -3550,6 +3725,7 @@ async def instagram_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("instagram")
+            flow_controller.update_collected_data("sourceChannel", "instagram")
             rag_service.build_vector_store(context)
             
             instagram_sessions[session_id]["flow_controller"] = flow_controller
@@ -3615,6 +3791,7 @@ async def instagram_webhook(request: Request):
         if not flow_controller or not response_generator:
             logger.error("Instagram: flow_controller or response_generator not initialized")
             return {"status": "error"}
+        flow_controller.update_collected_data("sourceChannel", "instagram")
 
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")

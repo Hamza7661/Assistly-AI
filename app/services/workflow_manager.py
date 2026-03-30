@@ -33,7 +33,10 @@ class WorkflowManager:
         integration = self.context.get("integration") or {}
         if not isinstance(integration, dict):
             return False
-        return bool(integration.get("conversationStyle"))
+        value = integration.get("conversationStyle")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
     
     def start_workflow_for_service(self, service_name: str) -> bool:
         """Start workflow for a service/menu item. Returns True if workflow exists, False otherwise."""
