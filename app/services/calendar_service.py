@@ -129,7 +129,14 @@ class CalendarService:
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             resp = await client.post(url, headers=headers, json=body)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as http_err:
+                logger.error(
+                    "Calendar book_appointment HTTP error app_id=%s status=%s body=%s",
+                    app_id, http_err.response.status_code, http_err.response.text[:200]
+                )
+                return {"success": False, "error": f"Booking request failed (HTTP {http_err.response.status_code})"}
             data = resp.json()
 
         status = data.get("status")

@@ -463,6 +463,8 @@ def _is_availability_intent(text: str) -> bool:
         "schedule a viewing",
         "schedule a service",
         "schedule a checkup",
+        "book a treatment",
+        "book treatment",
     ]
     return any(p in t for p in availability_phrases)
 
