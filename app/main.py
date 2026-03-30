@@ -944,9 +944,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 try:
                                     dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                     dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                    lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                                 except Exception:
-                                    lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
+                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -1003,7 +1003,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             show_days = calendar_days_list[:max_days]
                             lines = ["Choose a day:"]
                             for i, day in enumerate(show_days, 1):
-                                lines.append(f"<button>📅 {i}. {day['label']}</button>")
+                                lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                             reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -1853,9 +1853,9 @@ async def whatsapp_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -1911,7 +1911,7 @@ async def whatsapp_webhook(request: Request):
                         show_days = calendar_days_list[:max_days]
                         lines = ["Choose a day:"]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button>📅 {i}. {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -2797,9 +2797,9 @@ async def messenger_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -2855,7 +2855,7 @@ async def messenger_webhook(request: Request):
                         show_days = calendar_days_list[:max_days]
                         lines = ["Choose a day:"]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button>📅 {i}. {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -3620,9 +3620,9 @@ async def instagram_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button>🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"<button>🕒 {i}. {start}–{end}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -3678,7 +3678,7 @@ async def instagram_webhook(request: Request):
                         show_days = calendar_days_list[:max_days]
                         lines = ["Choose a day:"]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button>📅 {i}. {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
