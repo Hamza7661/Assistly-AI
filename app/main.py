@@ -4,7 +4,7 @@ import re
 import time
 import secrets
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException, Header
@@ -485,7 +485,6 @@ def _extract_index_choice(text: str) -> Optional[int]:
 
 def _format_slot_time_local(iso_str: str, iana_timezone: str) -> str:
     """Format a UTC ISO datetime to a 12-hour local time string using the given IANA timezone."""
-    from datetime import datetime
     try:
         dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         dt_local = dt_utc
@@ -506,7 +505,6 @@ def _format_slot_time_local(iso_str: str, iana_timezone: str) -> str:
 
 def _get_tz_label(iana_timezone: str) -> str:
     """Return a readable timezone label like 'Asia/Karachi (GMT+5)'."""
-    from datetime import datetime
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(iana_timezone)
@@ -777,6 +775,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     app_id: Optional[str] = websocket.query_params.get("app_id")
     user_id: Optional[str] = websocket.query_params.get("user_id")
+    country_hint_raw: Optional[str] = websocket.query_params.get("country")
+    country_hint = (country_hint_raw or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country_hint):
+        country_hint = ""
 
     # App-wise: accept app_id (embed widget) or legacy user_id
     if app_id:
@@ -849,7 +851,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     last_snapshot: Dict[str, Any] = {}
 
     try:
-      location_country = (context.get("country") or "US")
+      location_country = country_hint or (context.get("country") or "US")
       ok_lead, lead_resp = await lead_service.create_interaction_lead(
           app_id=app_id,
           user_id=user_id,
@@ -1149,7 +1151,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
                 and _is_availability_intent(str(user_text))
             ):
-                from datetime import datetime, timedelta
                 now = datetime.utcnow()
                 from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
                 to_dt = now + timedelta(days=7)
@@ -1530,7 +1531,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             
             # Check if JSON was generated (all data collected)
             if str(reply).strip() == "BOOK_APPOINTMENT_REQUESTED":
-                from datetime import datetime, timedelta
                 now = datetime.utcnow()
                 from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
                 to_dt = now + timedelta(days=7)
@@ -2144,7 +2144,6 @@ async def whatsapp_webhook(request: Request):
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
             and _is_availability_intent(enhanced_user_text)
         ):
-            from datetime import datetime, timedelta
             now = datetime.utcnow()
             from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
             to_dt = now + timedelta(days=7)
@@ -3014,7 +3013,6 @@ async def messenger_webhook(request: Request):
 
         # Calendar flow: same as WhatsApp – day/slot selection or cancel
         if calendar_flow and app_id and message_text.strip():
-            from datetime import datetime
             raw_lower = message_text.strip().lower()
             if raw_lower in ("cancel", "back", "exit"):
                 session["calendar_flow"] = None
@@ -3094,7 +3092,6 @@ async def messenger_webhook(request: Request):
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
             and _is_availability_intent(message_text)
         ):
-            from datetime import datetime, timedelta
             now = datetime.utcnow()
             from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
             to_dt = now + timedelta(days=7)
@@ -3843,7 +3840,6 @@ async def instagram_webhook(request: Request):
 
         # Calendar flow: same as WhatsApp/Messenger – day/slot selection or cancel
         if calendar_flow and app_id and message_text.strip():
-            from datetime import datetime
             raw_lower = message_text.strip().lower()
             if raw_lower in ("cancel", "back", "exit"):
                 session["calendar_flow"] = None
@@ -3923,7 +3919,6 @@ async def instagram_webhook(request: Request):
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
             and _is_availability_intent(message_text)
         ):
-            from datetime import datetime, timedelta
             now = datetime.utcnow()
             from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
             to_dt = now + timedelta(days=7)
