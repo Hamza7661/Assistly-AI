@@ -1038,18 +1038,27 @@ Classify the intent:"""
                     else:
                         flow_controller.transition_to(flow_controller.get_next_state())
                         logger.info(f"Transitioned to state: {flow_controller.state.value}")
-                        # Answer question then generate JSON
+                        # Answer question and continue flow; only finalize when complete.
                         answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
-                        json_data = await self._generate_json(flow_controller, conversation_history)
-                        return f"{answer}\n\n{json_data}"
+                        if flow_controller.can_generate_json():
+                            json_data = await self._generate_json(flow_controller, conversation_history)
+                            return f"{answer}\n\n{json_data}"
+                        next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                        return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                 else:
                     # No question, proceed normally
                     if flow_controller.validate_phone:
                         return "SEND_PHONE:" + phone
                     else:
                         flow_controller.transition_to(flow_controller.get_next_state())
-                        # Generate JSON
-                        return await self._generate_json(flow_controller, conversation_history)
+                        # Only generate JSON when all required fields are complete.
+                        # For booking lead types, next_state is SERVICE_SELECTION, so we must
+                        # continue the guided flow (service -> calendar) instead of finalizing.
+                        if flow_controller.can_generate_json():
+                            return await self._generate_json(flow_controller, conversation_history)
+                        return await self._generate_state_response(
+                            flow_controller.state, "", conversation_history, context
+                        )
             else:
                 # Phone not extracted - check if user asked a question
                 if has_question:

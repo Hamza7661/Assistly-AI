@@ -385,6 +385,86 @@ def _maybe_parse_json(text: str) -> Optional[Dict]:
         return None
 
 
+def _looks_like_internal_lead_payload(text: str) -> bool:
+    """Detect internal lead payloads that should never be sent to end users."""
+    if not text or not isinstance(text, str):
+        return False
+
+    parsed = _maybe_parse_json(text)
+    if not isinstance(parsed, dict):
+        return False
+
+    payload_keys = {
+        "leadType",
+        "serviceType",
+        "leadName",
+        "leadEmail",
+        "leadPhoneNumber",
+        "history",
+        "workflowAnswers",
+        "appointmentSlot",
+        "sourceChannel",
+        "title",
+    }
+    return any(k in parsed for k in payload_keys)
+
+
+async def _continue_after_otp_delivery_failed(
+    flow_controller: FlowController,
+    response_generator: ResponseGenerator,
+    conversation_history: List[Dict[str, str]],
+    context: Dict[str, Any],
+    lang_code: str,
+    kind: str,
+) -> str:
+    """
+    When email/SMS OTP cannot be sent (provider/network), skip verification and advance the flow.
+    Wrong codes entered by the user are handled separately (stay in verification).
+    """
+    logger.warning("OTP delivery failed; skipping verification and advancing flow (kind=%s)", kind)
+    if kind == "email":
+        flow_controller.skip_email_verification_after_send_failure()
+        prefix = get_string("otp_unavailable_skip_email", lang_code)
+    else:
+        flow_controller.skip_phone_verification_after_send_failure()
+        prefix = get_string("otp_unavailable_skip_phone", lang_code)
+    next_prompt = await response_generator._generate_state_response(
+        flow_controller.state, "", conversation_history, context
+    )
+    body = (next_prompt or "").strip()
+    return f"{prefix}\n\n{body}" if body else prefix
+
+
+async def _continue_after_otp_delivery_failed_with_session(
+    flow_controller: FlowController,
+    response_generator: ResponseGenerator,
+    conversation_history: List[Dict[str, str]],
+    context: Dict[str, Any],
+    lang_code: str,
+    kind: str,
+    email_validation_state: Optional[Dict[str, Any]] = None,
+    phone_validation_state: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Session-aware wrapper for WhatsApp/Messenger/Instagram handlers.
+    Keeps per-channel OTP state in sync when delivery fails.
+    """
+    if kind == "email" and email_validation_state is not None:
+        email_validation_state["otp_sent"] = False
+        email_validation_state["otp_verified"] = True
+    if kind == "phone" and phone_validation_state is not None:
+        phone_validation_state["otp_sent"] = False
+        phone_validation_state["otp_verified"] = True
+    return await _continue_after_otp_delivery_failed(
+        flow_controller,
+        response_generator,
+        conversation_history,
+        context,
+        lang_code,
+        kind,
+    )
+
+
 def _validate_email_verification(email_validation_state: Dict) -> bool:
     """Validate that email has been verified."""
     return email_validation_state.get("otp_verified", False)
@@ -1238,7 +1318,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     customer_name = flow_controller.collected_data.get("leadName", "Customer")
                     if email:
                         ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
-                        reply = get_string("otp_resend", lang_code, email) if ok else get_string("otp_resend_fail_email", lang_code)
+                        if ok:
+                            reply = get_string("otp_resend", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_email", lang_code)
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -1260,7 +1345,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if ok:
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = get_string("perfect_otp_sent_email", lang_code, email) if ok else get_string("found_email_cant_send", lang_code)
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -1372,7 +1461,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     reply = get_string("otp_sent_email", lang_code, email)
                 else:
-                    reply = get_string("otp_send_fail_email", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1401,7 +1492,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     reply = get_string("otp_sent_phone", lang_code, phone)
                 else:
-                    reply = get_string("otp_send_fail_phone", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1422,7 +1515,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     reply = get_string("otp_sent_email", lang_code, email)
                 else:
-                    reply = get_string("otp_send_fail_email", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1443,7 +1538,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     reply = get_string("otp_sent_phone", lang_code, phone)
                 else:
-                    reply = get_string("otp_send_fail_phone", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1457,7 +1554,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     phone = flow_controller.collected_data.get("leadPhoneNumber")
                     if phone:
                         ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
-                        reply = get_string("otp_resend", lang_code, phone) if ok else get_string("otp_resend_fail_phone", lang_code)
+                        if ok:
+                            reply = get_string("otp_resend", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                            )
                     else:
                         reply = get_string("no_phone", lang_code)
                     
@@ -1471,7 +1573,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     customer_name = flow_controller.collected_data.get("leadName", "Customer")
                     if email:
                         ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
-                        reply = get_string("otp_resend", lang_code, email) if ok else get_string("otp_resend_fail_email", lang_code)
+                        if ok:
+                            reply = get_string("otp_resend", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_email", lang_code)
                     
@@ -1495,7 +1602,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if ok:
                             flow_controller.otp_state["phone_sent"] = True
                             flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                        reply = get_string("perfect_otp_sent_phone", lang_code, phone) if ok else get_string("found_phone_cant_send", lang_code)
+                            reply = get_string("perfect_otp_sent_phone", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                            )
                     else:
                         reply = get_string("no_problem_phone", lang_code)
                         flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -1520,7 +1631,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if ok:
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = get_string("perfect_otp_sent_email", lang_code, email) if ok else get_string("found_email_cant_send", lang_code)
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -1602,6 +1717,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "reviewUrl": review_url,
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
+                await websocket.close(code=1000)
+                break
+
+            # Hard safety guard: never expose internal JSON/payloads in chat bubbles.
+            if _looks_like_internal_lead_payload(reply):
+                logger.error("Blocked internal payload from being sent to user chat (user_id=%s)", user_id)
+                graceful_msg = get_string("final_fallback", lang_code)
+                conversation_history.append({"role": "assistant", "content": graceful_msg})
+                await websocket.send_json({"type": "bot", "content": graceful_msg})
                 await websocket.close(code=1000)
                 break
             
@@ -2261,7 +2385,18 @@ async def whatsapp_webhook(request: Request):
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     
-                    reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     logger.info(f"WhatsApp: Email OTP sent, returning early to prevent JSON generation")
@@ -2283,11 +2418,18 @@ async def whatsapp_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("otp_sent_email", session.get("response_language_code", "en"), stored_email)
-                            if ok
-                            else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
-                        )
+                        if ok:
+                            reply = get_string("otp_sent_email", session.get("response_language_code", "en"), stored_email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                session.get("response_language_code", "en"),
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                         conversation_history.append({"role": "assistant", "content": reply})
                         await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                         logger.info(f"WhatsApp: Stored email OTP retry handled, returning early")
@@ -2306,7 +2448,18 @@ async def whatsapp_webhook(request: Request):
                 # Resend OTP to existing email
                 customer_name = email_validation_state.get("customer_name", flow_controller.collected_data.get("leadName", "Customer"))
                 ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], customer_name)
-                reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"]) if ok else get_string("otp_resend_fail_email", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"])
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
@@ -2348,7 +2501,18 @@ async def whatsapp_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("found_email_cant_send", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                 else:
                     reply = get_string("no_problem_email", session.get("response_language_code", "en"))
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -2455,7 +2619,18 @@ async def whatsapp_webhook(request: Request):
                 email_validation_state["email"] = email
                 email_validation_state["customer_name"] = customer_name
             
-            reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "email",
+                    email_validation_state=email_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2484,7 +2659,18 @@ async def whatsapp_webhook(request: Request):
                 phone_validation_state["otp_sent"] = True
                 phone_validation_state["phone"] = phone
             
-            reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("otp_send_fail_phone", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "phone",
+                    phone_validation_state=phone_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2504,7 +2690,18 @@ async def whatsapp_webhook(request: Request):
                 email_validation_state["email"] = email
                 email_validation_state["customer_name"] = customer_name
             
-            reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "email",
+                    email_validation_state=email_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2527,7 +2724,18 @@ async def whatsapp_webhook(request: Request):
                 phone_validation_state["otp_sent"] = True
                 phone_validation_state["phone"] = phone
             
-            reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("otp_send_fail_phone", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "phone",
+                    phone_validation_state=phone_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2582,7 +2790,18 @@ async def whatsapp_webhook(request: Request):
             if retry_type == 'resend_otp' and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
                 # Resend OTP to existing phone number
                 ok, _ = await phone_validation_service.send_sms_otp(user_id, phone_validation_state["phone"])
-                reply = get_string("otp_resend", session.get("response_language_code", "en"), phone_validation_state["phone"]) if ok else get_string("otp_resend_fail_phone", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_resend", session.get("response_language_code", "en"), phone_validation_state["phone"])
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
@@ -2593,7 +2812,18 @@ async def whatsapp_webhook(request: Request):
                 # Resend OTP to existing email
                 customer_name = email_validation_state.get("customer_name", flow_controller.collected_data.get("leadName", "Customer"))
                 ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], customer_name)
-                reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"]) if ok else get_string("otp_resend_fail_email", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"])
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
@@ -2622,7 +2852,18 @@ async def whatsapp_webhook(request: Request):
                         phone_validation_state["otp_sent"] = True
                         flow_controller.otp_state["phone_sent"] = True
                         flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                    reply = get_string("perfect_otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("found_phone_cant_send", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("perfect_otp_sent_phone", session.get("response_language_code", "en"), phone)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "phone",
+                            phone_validation_state=phone_validation_state,
+                        )
                 else:
                     reply = get_string("no_problem_phone", session.get("response_language_code", "en"))
                     flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -2668,7 +2909,18 @@ async def whatsapp_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("found_email_cant_send", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                 else:
                     reply = get_string("no_problem_email", session.get("response_language_code", "en"))
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -2713,7 +2965,18 @@ async def whatsapp_webhook(request: Request):
                 ok, _ = await email_validation_service.send_otp_email(user_id, email, email_validation_state["customer_name"])
                 if ok:
                     email_validation_state["otp_sent"] = True
-                reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2744,7 +3007,18 @@ async def whatsapp_webhook(request: Request):
                 ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
                 if ok:
                     phone_validation_state["otp_sent"] = True
-                reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("otp_send_fail_phone", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -3196,11 +3470,18 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("otp_send_fail_email", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                         conversation_history.append({"role": "assistant", "content": reply})
                         session["history"] = conversation_history
                         await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3226,11 +3507,18 @@ async def messenger_webhook(request: Request):
                                 email_validation_state["otp_sent"] = True
                                 flow_controller.otp_state["email_sent"] = True
                                 flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                            reply = (
-                                get_string("otp_sent_email", lang_code, stored_email)
-                                if ok
-                                else get_string("otp_send_fail_email", lang_code)
-                            )
+                            if ok:
+                                reply = get_string("otp_sent_email", lang_code, stored_email)
+                            else:
+                                reply = await _continue_after_otp_delivery_failed_with_session(
+                                    flow_controller,
+                                    response_generator,
+                                    conversation_history,
+                                    context,
+                                    lang_code,
+                                    "email",
+                                    email_validation_state=email_validation_state,
+                                )
                             conversation_history.append({"role": "assistant", "content": reply})
                             session["history"] = conversation_history
                             await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3251,11 +3539,18 @@ async def messenger_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3276,11 +3571,18 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -3366,11 +3668,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3387,11 +3696,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3412,11 +3728,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3433,11 +3756,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3485,11 +3815,18 @@ async def messenger_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3497,11 +3834,18 @@ async def messenger_webhook(request: Request):
 
                 elif retry_type == "resend_otp" and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
                     ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone_validation_state["phone"])
-                    reply = (
-                        get_string("otp_resend", lang_code, phone_validation_state["phone"])
-                        if ok
-                        else get_string("otp_resend_fail_phone", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, phone_validation_state["phone"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "phone",
+                            phone_validation_state=phone_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3522,11 +3866,18 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -3548,11 +3899,18 @@ async def messenger_webhook(request: Request):
                             phone_validation_state["otp_sent"] = True
                             flow_controller.otp_state["phone_sent"] = True
                             flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_phone", lang_code, phone)
-                            if ok
-                            else get_string("found_phone_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_phone", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "phone",
+                                phone_validation_state=phone_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_phone", lang_code)
                         flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -3598,11 +3956,18 @@ async def messenger_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = (
-                        get_string("otp_sent_email", lang_code, email)
-                        if ok
-                        else get_string("otp_send_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_sent_email", lang_code, email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -4023,11 +4388,18 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("otp_send_fail_email", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                         conversation_history.append({"role": "assistant", "content": reply})
                         session["history"] = conversation_history
                         await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4047,11 +4419,18 @@ async def instagram_webhook(request: Request):
                                 email_validation_state["otp_sent"] = True
                                 flow_controller.otp_state["email_sent"] = True
                                 flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                            reply = (
-                                get_string("otp_sent_email", lang_code, stored_email)
-                                if ok
-                                else get_string("otp_send_fail_email", lang_code)
-                            )
+                            if ok:
+                                reply = get_string("otp_sent_email", lang_code, stored_email)
+                            else:
+                                reply = await _continue_after_otp_delivery_failed_with_session(
+                                    flow_controller,
+                                    response_generator,
+                                    conversation_history,
+                                    context,
+                                    lang_code,
+                                    "email",
+                                    email_validation_state=email_validation_state,
+                                )
                             conversation_history.append({"role": "assistant", "content": reply})
                             session["history"] = conversation_history
                             await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4072,11 +4451,18 @@ async def instagram_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4097,11 +4483,18 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -4185,11 +4578,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4205,11 +4605,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4230,11 +4637,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4251,11 +4665,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4302,11 +4723,18 @@ async def instagram_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4314,11 +4742,18 @@ async def instagram_webhook(request: Request):
 
                 elif retry_type == "resend_otp" and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
                     ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone_validation_state["phone"])
-                    reply = (
-                        get_string("otp_resend", lang_code, phone_validation_state["phone"])
-                        if ok
-                        else get_string("otp_resend_fail_phone", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, phone_validation_state["phone"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "phone",
+                            phone_validation_state=phone_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -4339,11 +4774,18 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -4365,11 +4807,18 @@ async def instagram_webhook(request: Request):
                             phone_validation_state["otp_sent"] = True
                             flow_controller.otp_state["phone_sent"] = True
                             flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_phone", lang_code, phone)
-                            if ok
-                            else get_string("found_phone_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_phone", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "phone",
+                                phone_validation_state=phone_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_phone", lang_code)
                         flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -4413,11 +4862,18 @@ async def instagram_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = (
-                        get_string("otp_sent_email", lang_code, email)
-                        if ok
-                        else get_string("otp_send_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_sent_email", lang_code, email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
