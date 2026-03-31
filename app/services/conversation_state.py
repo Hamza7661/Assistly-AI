@@ -200,6 +200,28 @@ class FlowController:
         """Transition to new state"""
         logger.info(f"State transition: {self.state.value} → {new_state.value}")
         self.state = new_state
+
+    def skip_email_verification_after_send_failure(self) -> None:
+        """
+        Advance when email OTP could not be delivered (provider/network).
+        Does not apply when the user enters a wrong code — that path stays in verification.
+        """
+        self.update_collected_data("emailVerificationSkipped", True)
+        self.otp_state["email_verified"] = True
+        self.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+        next_state = self.get_next_state()
+        self.transition_to(next_state)
+
+    def skip_phone_verification_after_send_failure(self) -> None:
+        """
+        Advance when SMS OTP could not be delivered (provider/network).
+        Does not apply when the user enters a wrong code — that path stays in verification.
+        """
+        self.update_collected_data("phoneVerificationSkipped", True)
+        self.otp_state["phone_verified"] = True
+        self.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
+        next_state = self.get_next_state()
+        self.transition_to(next_state)
     
     def can_generate_json(self) -> bool:
         """Check if all required data is collected for JSON generation"""
@@ -242,6 +264,10 @@ class FlowController:
             data["leadId"] = self.collected_data.get("leadId")
         if self.collected_data.get("appointmentSlot"):
             data["appointmentSlot"] = self.collected_data.get("appointmentSlot")
+        if self.collected_data.get("emailVerificationSkipped"):
+            data["emailVerificationSkipped"] = True
+        if self.collected_data.get("phoneVerificationSkipped"):
+            data["phoneVerificationSkipped"] = True
         
         # Add workflow answers if present
         workflow_answers = self.collected_data.get("workflowAnswers", {})
