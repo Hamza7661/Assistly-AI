@@ -1317,7 +1317,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             calendar_selected_day = None
                             max_days = 14
                             show_days = calendar_days_list[:max_days]
-                            lines = ["Choose a day:"]
+                            service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                            if service_title:
+                                intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                            else:
+                                intro = "Here are the available dates for your appointment. Please choose a day:"
+                            lines = [intro]
                             for i, day in enumerate(show_days, 1):
                                 lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                             reply = "\n".join(lines)
@@ -1727,7 +1732,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             calendar_free_slots = free_slots
                             calendar_slots = []
                             calendar_selected_day = None
-                            lines = ["Choose a day:"]
+                            service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                            if service_title:
+                                intro = f"Great! Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                            else:
+                                intro = "Great! Here are the available dates for your appointment. Please choose a day:"
+                            lines = [intro]
                             for i, day in enumerate(calendar_days_list[:14], 1):
                                 lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                             reply = "\n".join(lines)
@@ -2352,7 +2362,12 @@ async def whatsapp_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Choose a day:"]
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                        if service_title:
+                            intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                        else:
+                            intro = "Here are the available dates for your appointment. Please choose a day:"
+                        lines = [intro]
                         for i, day in enumerate(show_days, 1):
                             lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
@@ -3450,7 +3465,12 @@ async def messenger_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Choose a day:"]
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                        if service_title:
+                            intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                        else:
+                            intro = "Here are the available dates for your appointment. Please choose a day:"
+                        lines = [intro]
                         for i, day in enumerate(show_days, 1):
                             lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
@@ -4368,7 +4388,12 @@ async def instagram_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Choose a day:"]
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                        if service_title:
+                            intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                        else:
+                            intro = "Here are the available dates for your appointment. Please choose a day:"
+                        lines = [intro]
                         for i, day in enumerate(show_days, 1):
                             lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
