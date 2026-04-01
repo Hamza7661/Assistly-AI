@@ -952,6 +952,7 @@ Classify the intent:"""
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                     if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                         flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                    if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                         return "BOOK_APPOINTMENT_REQUESTED"
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
@@ -962,6 +963,7 @@ Classify the intent:"""
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                     flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                     return "BOOK_APPOINTMENT_REQUESTED"
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
         
