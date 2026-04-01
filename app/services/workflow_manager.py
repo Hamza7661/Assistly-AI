@@ -81,17 +81,29 @@ class WorkflowManager:
         if not questions:
             return False
 
-        # Collect every question ID that is a branch target (nextQuestionId) across
-        # all options of all questions.  These "linked" questions must NOT appear in
-        # the default sequential queue — they are only inserted when explicitly branched to.
+        # Collect branch-only targets:
+        # - If nextQuestionId simply points to the immediate next ordered question,
+        #   treat it as linear progression (NOT branch-only).
+        # - If it jumps elsewhere, treat target as branch-only and exclude it from
+        #   the default sequential queue until that branch is selected.
+        question_order_map = {
+            q.get("_id"): int(q.get("order", 0))
+            for q in questions
+            if q.get("_id")
+        }
         linked_question_ids: set = set()
         for q in questions:
+            source_id = q.get("_id")
+            source_order = question_order_map.get(source_id)
             for opt in (q.get("options") or []):
                 nqid = opt.get("nextQuestionId")
-                if nqid:
+                if not nqid:
+                    continue
+                target_order = question_order_map.get(nqid)
+                if source_order is None or target_order is None or target_order != source_order + 1:
                     linked_question_ids.add(nqid)
 
-        logger.info(f"Workflow linked (branch-only) question IDs: {linked_question_ids}")
+        logger.info(f"Workflow branch-only linked question IDs: {linked_question_ids}")
 
         active_questions = [q for q in questions if q.get("isActive", True)]
         # Only sequential questions go into the initial queue
