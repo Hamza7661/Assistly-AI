@@ -950,6 +950,9 @@ Classify the intent:"""
                     workflow_manager.reset()
                     flow_controller.transition_to(flow_controller.get_next_state())
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                    if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                        flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                        return "BOOK_APPOINTMENT_REQUESTED"
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
             else:
                 workflow_answers = workflow_manager.get_workflow_answers()
@@ -957,6 +960,9 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                    flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                    return "BOOK_APPOINTMENT_REQUESTED"
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
         
         if state == ConversationState.NAME_COLLECTION:
