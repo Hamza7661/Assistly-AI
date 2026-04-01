@@ -86,21 +86,21 @@ class WorkflowManager:
         #   treat it as linear progression (NOT branch-only).
         # - If it jumps elsewhere, treat target as branch-only and exclude it from
         #   the default sequential queue until that branch is selected.
-        question_order_map = {
-            q.get("_id"): int(q.get("order", 0))
-            for q in questions
-            if q.get("_id")
-        }
+        ordered_questions = sorted(questions, key=lambda q: q.get("order", 0))
+        sequence_ids = [q.get("_id") for q in ordered_questions if q.get("_id")]
+        sequence_index_map = {qid: idx for idx, qid in enumerate(sequence_ids)}
         linked_question_ids: set = set()
         for q in questions:
             source_id = q.get("_id")
-            source_order = question_order_map.get(source_id)
+            source_index = sequence_index_map.get(source_id)
             for opt in (q.get("options") or []):
                 nqid = opt.get("nextQuestionId")
                 if not nqid:
                     continue
-                target_order = question_order_map.get(nqid)
-                if source_order is None or target_order is None or target_order != source_order + 1:
+                target_index = sequence_index_map.get(nqid)
+                # If branch target is not the immediate next sequential question,
+                # treat it as branch-only.
+                if source_index is None or target_index is None or target_index != source_index + 1:
                     linked_question_ids.add(nqid)
 
         logger.info(f"Workflow branch-only linked question IDs: {linked_question_ids}")
