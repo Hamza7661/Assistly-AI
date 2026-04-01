@@ -862,7 +862,16 @@ Classify the intent:"""
                 if has_question and flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                     if conversation_style_enabled:
                         answer = await _answer_if_relevant_question(user_message)
-                        next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                        if flow_controller.state == ConversationState.SERVICE_SELECTION:
+                            next_prompt = await self._generate_service_selection_response(
+                                conversation_history,
+                                context,
+                                collected_lead_type=flow_controller.collected_data.get("leadType"),
+                            )
+                        else:
+                            next_prompt = await self._generate_state_response(
+                                flow_controller.state, "", conversation_history, context
+                            )
                         return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                     # Get RAG context for the question (pricing, info about the service)
                     rag_context = await self._get_rag_context(f"{service} {user_message}", context, is_question=True)
@@ -1056,6 +1065,12 @@ Classify the intent:"""
                         # continue the guided flow (service -> calendar) instead of finalizing.
                         if flow_controller.can_generate_json():
                             return await self._generate_json(flow_controller, conversation_history)
+                        if flow_controller.state == ConversationState.SERVICE_SELECTION:
+                            return await self._generate_service_selection_response(
+                                conversation_history,
+                                context,
+                                collected_lead_type=flow_controller.collected_data.get("leadType"),
+                            )
                         return await self._generate_state_response(
                             flow_controller.state, "", conversation_history, context
                         )
@@ -1404,7 +1419,7 @@ When answering the user's question, follow these guidelines:
         """Generate response using minimal prompt based on state"""
         if not self.client:
             return "I'm here to help you."
-        
+
         # Minimal state-specific prompts (3-5 lines) - STRICT FLOW ENFORCEMENT
         # CRITICAL: If user asks a question, answer it briefly (1-2 sentences) then re-ask for required data
         state_prompts = {

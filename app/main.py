@@ -1153,9 +1153,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     continue
-                # ── Confirm step: user typed service/reason — now book with that title ──
+                # ── Confirm step: user must explicitly confirm selected slot ──
                 if calendar_flow == "confirm" and calendar_pending_slot:
-                    service_title = str(user_text).strip() or "Appointment"
+                    confirm_text = str(user_text).strip().lower()
+                    if confirm_text not in {"confirm", "yes", "y", "book", "book now"}:
+                        reply = (
+                            "Please confirm your booking to continue.\n"
+                            "<button value=\"confirm\">Confirm booking</button> "
+                            "<button value=\"cancel\">Cancel</button>"
+                        )
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await websocket.send_json({"type": "bot", "content": reply})
+                        continue
+
+                    service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
                     slot = calendar_pending_slot
                     start_iso = slot.get("start", "")
                     end_iso = slot.get("end", "")
@@ -1171,25 +1183,56 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     calendar_selected_day = None
                     calendar_pending_slot = {}
                     if book_result.get("success"):
+                        flow_controller.update_collected_data("appointmentSlot", {
+                            "start": start_iso,
+                            "end": end_iso,
+                            "timezone": slot_timezone or "UTC",
+                            "serviceType": service_title,
+                        })
                         time_str = _format_slot_time_local(start_iso, slot_timezone or "UTC")
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
+                        # Booking confirmation is the terminal step for this lead cycle.
+                        try:
+                            if lead_id:
+                                completion_payload = {
+                                    "status": "complete",
+                                    "serviceType": flow_controller.collected_data.get("serviceType"),
+                                    "leadType": flow_controller.collected_data.get("leadType"),
+                                    "leadName": flow_controller.collected_data.get("leadName"),
+                                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                                    "appointmentSlot": flow_controller.collected_data.get("appointmentSlot"),
+                                }
+                                await lead_service.update_lead(user_id, lead_id, completion_payload)
+                        except Exception as completion_exc:
+                            logger.warning("Lead completion update after booking failed: %s", completion_exc)
                     else:
                         reply = book_result.get("error") or "Booking failed. Please try again or contact us."
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
+                    if book_result.get("success"):
+                        await websocket.close(code=1000)
+                        break
                     continue
                 try:
                     num = _extract_index_choice(str(user_text))
                     if num is None:
                         raise ValueError("No numeric choice parsed")
                     if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
-                        # Save selected slot and ask for service/reason before booking
+                        # Save selected slot and ask user to confirm booking
                         slot = calendar_slots[num - 1]
                         calendar_pending_slot = slot
                         calendar_flow = "confirm"
                         time_str = _format_slot_time_local(slot.get("start", ""), slot.get("timezone") or "UTC")
-                        reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {time_str}"
+                        selected_service = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                        reply = (
+                            f"Selected service: {selected_service}\n"
+                            f"Selected time: 🕒 {time_str}\n\n"
+                            "Please confirm your booking:\n"
+                            "<button value=\"confirm\">Confirm booking</button> "
+                            "<button value=\"cancel\">Cancel</button>"
+                        )
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
                         await websocket.send_json({"type": "bot", "content": reply})
