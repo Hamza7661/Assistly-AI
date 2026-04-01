@@ -1190,13 +1190,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     calendar_selected_day = None
                     calendar_pending_slot = {}
                     if book_result.get("success"):
+                        _display_tz = integration.get("calendarTimezone") or slot_timezone or "UTC"
                         flow_controller.update_collected_data("appointmentSlot", {
                             "start": start_iso,
                             "end": end_iso,
-                            "timezone": slot_timezone or "UTC",
+                            "timezone": _display_tz,
                             "serviceType": service_title,
                         })
-                        time_str = _format_slot_time_local(start_iso, slot_timezone or "UTC")
+                        _bk_start = _format_slot_time_local(start_iso, _display_tz)
+                        _bk_end = _format_slot_time_local(end_iso, _display_tz)
+                        try:
+                            from zoneinfo import ZoneInfo
+                            _bk_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(_display_tz))
+                            _bk_date = _bk_dt.strftime("%a %d/%m/%Y")
+                        except Exception:
+                            _bk_date = start_iso[:10]
+                        time_str = f"{_bk_date}, {_bk_start} – {_bk_end}"
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
                         # Booking confirmation is the terminal step for this lead cycle.
                         try:
@@ -1248,11 +1257,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         slot = calendar_slots[num - 1]
                         calendar_pending_slot = slot
                         calendar_flow = "confirm"
-                        time_str = _format_slot_time_local(slot.get("start", ""), slot.get("timezone") or "UTC")
+                        _confirm_tz = integration.get("calendarTimezone") or "UTC"
+                        t_start = _format_slot_time_local(slot.get("start", ""), _confirm_tz)
+                        t_end = _format_slot_time_local(slot.get("end", ""), _confirm_tz)
+                        try:
+                            from zoneinfo import ZoneInfo
+                            _dt_local = datetime.fromisoformat(slot.get("start", "").replace("Z", "+00:00")).astimezone(ZoneInfo(_confirm_tz))
+                            _date_label = _dt_local.strftime("%a %d/%m/%Y")
+                        except Exception:
+                            _date_label = slot.get("start", "")[:10]
                         selected_service = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
                         reply = (
                             f"Selected service: {selected_service}\n"
-                            f"Selected time: 🕒 {time_str}\n\n"
+                            f"Selected time: 🕒 {_date_label}, {t_start} – {t_end}\n\n"
                             "Please confirm your booking:\n"
                             "<button value=\"confirm\">Confirm booking</button> "
                             "<button value=\"cancel\">Cancel</button>"
@@ -1265,6 +1282,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         day_info = calendar_days[num - 1]
                         selected_date = day_info.get("date", "")
                         _cal_tz_filter = integration.get("calendarTimezone") or "UTC"
+                        _now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
                         def _slot_local_date(s: Dict[str, Any], tz: str) -> str:
                             try:
                                 from zoneinfo import ZoneInfo
@@ -1275,6 +1293,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         slots_for_day = [
                             s for s in calendar_free_slots
                             if _slot_local_date(s, _cal_tz_filter) == selected_date
+                            and datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc
                         ]
                         calendar_flow = "slots"
                         calendar_slots = slots_for_day
@@ -1321,7 +1340,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if result.get("error"):
                         reply = "I couldn't fetch availability right now. Please try again later."
                     else:
-                        free_slots = result.get("freeSlots") or []
+                        _now_utc_sc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                        free_slots = [
+                            s for s in (result.get("freeSlots") or [])
+                            if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_sc
+                        ]
                         if not free_slots:
                             if not result.get("calendarConnected"):
                                 reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -1348,7 +1371,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 try:
                                     from zoneinfo import ZoneInfo
                                     dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
-                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                                 except Exception:
                                     calendar_days_list.append({"date": d, "label": d})
                             calendar_flow = "days"
@@ -1750,7 +1773,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if result.get("error"):
                         reply = "I couldn't fetch availability right now. Please try again later."
                     else:
-                        free_slots = result.get("freeSlots") or []
+                        _now_utc_bk = datetime.utcnow().replace(tzinfo=timezone.utc)
+                        free_slots = [
+                            s for s in (result.get("freeSlots") or [])
+                            if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_bk
+                        ]
                         if not free_slots:
                             reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
                         else:
@@ -1774,7 +1801,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 try:
                                     from zoneinfo import ZoneInfo
                                     dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
-                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                                 except Exception:
                                     calendar_days_list.append({"date": d, "label": d})
                             calendar_flow = "days"
@@ -2311,8 +2338,17 @@ async def whatsapp_webhook(request: Request):
                 session["calendar_selected_day"] = None
                 session["calendar_pending_slot"] = None
                 if book_result.get("success"):
-                    time_str = _format_slot_time_local(start_iso, slot_timezone or "UTC")
-                    reply = f"✅ Your *{service_title}* is booked for {time_str}. Reply with anything to continue."
+                    _wa_tz = slot_timezone or "UTC"
+                    _wa_start = _format_slot_time_local(start_iso, _wa_tz)
+                    _wa_end = _format_slot_time_local(end_iso, _wa_tz)
+                    try:
+                        from zoneinfo import ZoneInfo
+                        _wa_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
+                        _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
+                    except Exception:
+                        _wa_date = start_iso[:10]
+                    time_str = f"{_wa_date}, {_wa_start} – {_wa_end}"
+                    reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
                 else:
                     reply = book_result.get("error") or "Booking failed. Please try again or contact us."
                 conversation_history.append({"role": "user", "content": user_text})
@@ -2329,8 +2365,16 @@ async def whatsapp_webhook(request: Request):
                     # Save slot and ask for service/reason before booking
                     session["calendar_pending_slot"] = slot
                     session["calendar_flow"] = "confirm"
-                    time_str = _format_slot_time_local(slot.get("start", ""), slot.get("timezone") or "UTC")
-                    reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {time_str}"
+                    _wa_tz = integration.get("calendarTimezone") or "UTC"
+                    _wa_t_start = _format_slot_time_local(slot.get("start", ""), _wa_tz)
+                    _wa_t_end = _format_slot_time_local(slot.get("end", ""), _wa_tz)
+                    try:
+                        from zoneinfo import ZoneInfo
+                        _wa_dt = datetime.fromisoformat(slot.get("start", "").replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
+                        _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
+                    except Exception:
+                        _wa_date = slot.get("start", "")[:10]
+                    reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}"
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
@@ -2402,7 +2446,7 @@ async def whatsapp_webhook(request: Request):
                         for d in days_order:
                             try:
                                 dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
                         session["calendar_flow"] = "days"
@@ -3505,7 +3549,7 @@ async def messenger_webhook(request: Request):
                         for d in days_order:
                             try:
                                 dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
                         session["calendar_flow"] = "days"
@@ -4428,7 +4472,7 @@ async def instagram_webhook(request: Request):
                         for d in days_order:
                             try:
                                 dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
                         session["calendar_flow"] = "days"
