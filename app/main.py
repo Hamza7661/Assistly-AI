@@ -1173,8 +1173,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     end_iso = slot.get("end", "")
                     slot_timezone = slot.get("timezone")
                     calendar_service = CalendarService(settings)
+                    customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                    customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                    customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
                     book_result = await calendar_service.book_appointment(
-                        app_id_for_calendar, start_iso, end_iso, service_title, time_zone=slot_timezone
+                        app_id_for_calendar, start_iso, end_iso, service_title,
+                        attendee_email=customer_email,
+                        time_zone=slot_timezone,
+                        customer_name=customer_name,
+                        customer_phone=customer_phone,
                     )
                     calendar_flow = None
                     calendar_days = []
@@ -1194,14 +1201,31 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         # Booking confirmation is the terminal step for this lead cycle.
                         try:
                             if lead_id:
+                                full_history = conversation_history + [
+                                    {"role": "user", "content": user_text},
+                                    {"role": "assistant", "content": reply},
+                                ]
+                                customer_name = flow_controller.collected_data.get("leadName") or "Customer"
+                                lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                                appointment_details = {
+                                    "eventId": book_result.get("eventId"),
+                                    "start": book_result.get("start") or start_iso,
+                                    "end": book_result.get("end") or end_iso,
+                                    "link": book_result.get("link"),
+                                    "confirmed": True,
+                                }
                                 completion_payload = {
                                     "status": "complete",
+                                    "title": f"{service_title} – {customer_name}",
                                     "serviceType": flow_controller.collected_data.get("serviceType"),
                                     "leadType": flow_controller.collected_data.get("leadType"),
                                     "leadName": flow_controller.collected_data.get("leadName"),
                                     "leadEmail": flow_controller.collected_data.get("leadEmail"),
                                     "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
-                                    "appointmentSlot": flow_controller.collected_data.get("appointmentSlot"),
+                                    "appointmentDetails": appointment_details,
+                                    "summary": f"{customer_name} booked a {service_title} appointment for {time_str}.",
+                                    "description": f"{customer_name} ({lead_type_val}) booked {service_title}. Appointment confirmed at {time_str}.",
+                                    "history": full_history,
                                 }
                                 await lead_service.update_lead(user_id, lead_id, completion_payload)
                         except Exception as completion_exc:
@@ -1240,14 +1264,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if calendar_flow == "days" and 1 <= num <= len(calendar_days):
                         day_info = calendar_days[num - 1]
                         selected_date = day_info.get("date", "")
+                        _cal_tz_filter = integration.get("calendarTimezone") or "UTC"
+                        def _slot_local_date(s: Dict[str, Any], tz: str) -> str:
+                            try:
+                                from zoneinfo import ZoneInfo
+                                dt_u = datetime.fromisoformat((s.get("start") or "").replace("Z", "+00:00"))
+                                return dt_u.astimezone(ZoneInfo(tz)).strftime("%Y-%m-%d")
+                            except Exception:
+                                return (s.get("start") or "")[:10]
                         slots_for_day = [
                             s for s in calendar_free_slots
-                            if (s.get("start") or "")[:10] == selected_date
+                            if _slot_local_date(s, _cal_tz_filter) == selected_date
                         ]
                         calendar_flow = "slots"
                         calendar_slots = slots_for_day
                         calendar_selected_day = selected_date
-                        slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        slot_tz = integration.get("calendarTimezone") or (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
                         tz_label = _get_tz_label(slot_tz)
                         lines = [f"Times on {day_info.get('label', selected_date)}:"]
                         lines.append(f"🌐 All times shown in {tz_label}")
@@ -1296,17 +1328,26 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             else:
                                 reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
                         else:
+                            cal_tz = integration.get("calendarTimezone") or "UTC"
                             by_date: Dict[str, List[Dict[str, Any]]] = {}
                             for slot in free_slots:
                                 start = slot.get("start") or ""
-                                date_key = start[:10] if len(start) >= 10 else ""
-                                if date_key:
-                                    by_date.setdefault(date_key, []).append(slot)
+                                if not start:
+                                    continue
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_local = dt_utc.astimezone(ZoneInfo(cal_tz))
+                                    date_key = dt_local.strftime("%Y-%m-%d")
+                                except Exception:
+                                    date_key = start[:10]
+                                by_date.setdefault(date_key, []).append(slot)
                             days_order = sorted(by_date.keys())
                             calendar_days_list = []
                             for d in days_order:
                                 try:
-                                    dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                    from zoneinfo import ZoneInfo
+                                    dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
                                     calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
                                 except Exception:
                                     calendar_days_list.append({"date": d, "label": d})
@@ -1713,17 +1754,26 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if not free_slots:
                             reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
                         else:
+                            cal_tz = integration.get("calendarTimezone") or "UTC"
                             by_date: Dict[str, List[Dict[str, Any]]] = {}
                             for slot in free_slots:
                                 start = slot.get("start") or ""
-                                date_key = start[:10] if len(start) >= 10 else ""
-                                if date_key:
-                                    by_date.setdefault(date_key, []).append(slot)
+                                if not start:
+                                    continue
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_local = dt_utc.astimezone(ZoneInfo(cal_tz))
+                                    date_key = dt_local.strftime("%Y-%m-%d")
+                                except Exception:
+                                    date_key = start[:10]
+                                by_date.setdefault(date_key, []).append(slot)
                             days_order = sorted(by_date.keys())
                             calendar_days_list = []
                             for d in days_order:
                                 try:
-                                    dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                    from zoneinfo import ZoneInfo
+                                    dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
                                     calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
                                 except Exception:
                                     calendar_days_list.append({"date": d, "label": d})
