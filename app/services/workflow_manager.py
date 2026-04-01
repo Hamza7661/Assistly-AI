@@ -37,6 +37,12 @@ class WorkflowManager:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    def _normalize_id(self, value: Any) -> str:
+        """Normalize IDs to comparable strings across payload shapes."""
+        if value is None:
+            return ""
+        return str(value).strip()
     
     def start_workflow_for_service(self, service_name: str) -> bool:
         """Start workflow for a service/menu item. Returns True if workflow exists, False otherwise."""
@@ -62,14 +68,14 @@ class WorkflowManager:
         if not attached_workflows:
             return False
         
-        workflow_id = attached_workflows[0].get("workflowId")
+        workflow_id = self._normalize_id(attached_workflows[0].get("workflowId"))
         if not workflow_id:
             return False
         
         workflows = self.context.get("workflows", [])
         workflow = None
         for wf in workflows:
-            if wf.get("_id") == workflow_id:
+            if self._normalize_id(wf.get("_id")) == workflow_id:
                 workflow = wf
                 break
         
@@ -87,14 +93,14 @@ class WorkflowManager:
         # - If it jumps elsewhere, treat target as branch-only and exclude it from
         #   the default sequential queue until that branch is selected.
         ordered_questions = sorted(questions, key=lambda q: q.get("order", 0))
-        sequence_ids = [q.get("_id") for q in ordered_questions if q.get("_id")]
+        sequence_ids = [self._normalize_id(q.get("_id")) for q in ordered_questions if q.get("_id")]
         sequence_index_map = {qid: idx for idx, qid in enumerate(sequence_ids)}
         linked_question_ids: set = set()
         for q in questions:
-            source_id = q.get("_id")
+            source_id = self._normalize_id(q.get("_id"))
             source_index = sequence_index_map.get(source_id)
             for opt in (q.get("options") or []):
-                nqid = opt.get("nextQuestionId")
+                nqid = self._normalize_id(opt.get("nextQuestionId"))
                 if not nqid:
                     continue
                 target_index = sequence_index_map.get(nqid)
@@ -108,7 +114,7 @@ class WorkflowManager:
         active_questions = [q for q in questions if q.get("isActive", True)]
         # Only sequential questions go into the initial queue
         sequential_questions = sorted(
-            [q for q in active_questions if q.get("_id") not in linked_question_ids],
+            [q for q in active_questions if self._normalize_id(q.get("_id")) not in linked_question_ids],
             key=lambda q: q.get("order", 0)
         )
 
@@ -123,6 +129,17 @@ class WorkflowManager:
         self.workflow_answers = {}
         self.is_active = True
         
+        logger.info(
+            "Workflow queue initialized: %s",
+            [
+                {
+                    "id": self._normalize_id(q.get("_id")),
+                    "order": q.get("order", 0),
+                    "question": (q.get("question", "")[:80] + "...") if len(q.get("question", "")) > 80 else q.get("question", ""),
+                }
+                for q in sequential_questions
+            ],
+        )
         logger.info(
             f"Started workflow '{workflow_id}' for service '{service_name}' "
             f"with {len(sequential_questions)} sequential + {len(linked_question_ids)} linked questions"
@@ -139,7 +156,7 @@ class WorkflowManager:
         return sorted(
             [
                 q for q in questions
-                if q.get("isActive", True) and q.get("_id") not in self._linked_question_ids
+                if q.get("isActive", True) and self._normalize_id(q.get("_id")) not in self._linked_question_ids
             ],
             key=lambda q: q.get("order", 0)
         )
@@ -249,7 +266,11 @@ class WorkflowManager:
                 
                 insert_at = self._queue_index + 1
                 # Remove if already in queue to avoid duplicates
-                self._question_queue = [q for q in self._question_queue if q.get("_id") != next_question_id]
+                target_id = self._normalize_id(next_question_id)
+                self._question_queue = [
+                    q for q in self._question_queue
+                    if self._normalize_id(q.get("_id")) != target_id
+                ]
                 self._question_queue.insert(insert_at, target_q)
                 self._queue_index += 1
 
@@ -370,9 +391,10 @@ class WorkflowManager:
         """Search for a question in the current workflow by _id"""
         if not self.current_workflow:
             return None
+        target_id = self._normalize_id(question_id)
         questions = self.current_workflow.get("questions", [])
         for q in questions:
-            if q.get("_id") == question_id:
+            if self._normalize_id(q.get("_id")) == target_id:
                 return q
         return None
     
