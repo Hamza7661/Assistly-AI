@@ -162,6 +162,11 @@ SESSION_TIMEOUT = settings.session_timeout_seconds
 # the session has been idle for `idle_seconds`.
 conversation_style_change_requests: Dict[str, Dict[str, Any]] = {}
 
+# Web widget: resume interrupted chats (in-memory; best-effort across reconnects / page navigations)
+WIDGET_CHAT_RESUME: Dict[str, Dict[str, Any]] = {}
+WIDGET_RESUME_TTL_SEC = 86400 * 2
+WIDGET_RESUME_MAX_KEYS = 4000
+
 # Voice agent sessions
 voice_agent_service = VoiceAgentService(settings)
 
@@ -598,6 +603,164 @@ def _get_tz_label(iana_timezone: str) -> str:
         return iana_timezone or "UTC"
 
 
+def _calendar_tz_from_integration(integration: Dict[str, Any]) -> str:
+    tz = (integration or {}).get("calendarTimezone") or "UTC"
+    return str(tz) if tz else "UTC"
+
+
+def _availability_window_from_tomorrow_utc(integration: Dict[str, Any], horizon_days: int = 14) -> Tuple[str, str]:
+    """UTC ISO Z range for calendar API: start tomorrow 00:00 in the business calendar timezone."""
+    from zoneinfo import ZoneInfo
+
+    cal_tz = _calendar_tz_from_integration(integration)
+    try:
+        zi = ZoneInfo(cal_tz)
+    except Exception:
+        zi = ZoneInfo("UTC")
+    now_local = datetime.now(zi)
+    tomorrow = (now_local + timedelta(days=1)).date()
+    start_local = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=zi)
+    end_local = start_local + timedelta(days=horizon_days)
+    start_utc = start_local.astimezone(timezone.utc).replace(microsecond=0)
+    end_utc = end_local.astimezone(timezone.utc).replace(microsecond=0)
+    return (
+        start_utc.isoformat().replace("+00:00", "Z"),
+        end_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _local_slot_date_key(iso_start: str, cal_tz: str) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+
+        dt_utc = datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
+        return dt_utc.astimezone(ZoneInfo(cal_tz)).strftime("%Y-%m-%d")
+    except Exception:
+        return (iso_start or "")[:10]
+
+
+def _tomorrow_date_key_in_tz(cal_tz: str) -> str:
+    from zoneinfo import ZoneInfo
+
+    try:
+        zi = ZoneInfo(cal_tz)
+    except Exception:
+        zi = ZoneInfo("UTC")
+    return (datetime.now(zi) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _filter_slots_from_tomorrow_local(slots: List[Dict[str, Any]], cal_tz: str) -> List[Dict[str, Any]]:
+    if not slots:
+        return []
+    cutoff = _tomorrow_date_key_in_tz(cal_tz)
+    return [s for s in slots if _local_slot_date_key((s.get("start") or ""), cal_tz) >= cutoff]
+
+
+def _normalize_service_title_for_plan_match(title: str) -> str:
+    t = (title or "").strip()
+    t = re.sub(r"\*+", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip().lower()
+
+
+def _find_post_booking_note(service_plans: List[Any], service_title: str) -> str:
+    target = _normalize_service_title_for_plan_match(service_title)
+    for sp in service_plans or []:
+        if not isinstance(sp, dict):
+            continue
+        q = _normalize_service_title_for_plan_match(str(sp.get("question", "")))
+        if q == target:
+            raw = sp.get("postBookingNote")
+            return (str(raw).strip() if raw is not None else "")
+    return ""
+
+
+def _html_post_booking_to_chat_text(html: str) -> str:
+    from html import unescape
+
+    s = html
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</p>\s*", "\n", s, flags=re.I)
+    s = re.sub(r"<p[^>]*>", "", s, flags=re.I)
+    s = re.sub(r"<li[^>]*>", "\n• ", s, flags=re.I)
+    s = re.sub(r"</li>", "", s, flags=re.I)
+    s = re.sub(r"</(ul|ol)>", "\n", s, flags=re.I)
+    s = re.sub(r"<(ul|ol)[^>]*>", "\n", s, flags=re.I)
+
+    def _bold_tag(m: Any) -> str:
+        inner = (m.group(1) or "").strip()
+        return f"**{inner}**" if inner else ""
+
+    s = re.sub(r"<strong[^>]*>([\s\S]*?)</strong>", _bold_tag, s, flags=re.I)
+    s = re.sub(r"<b[^>]*>([\s\S]*?)</b>", _bold_tag, s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = unescape(s)
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def _format_post_booking_note_for_chat(note: str) -> str:
+    raw = (note or "").strip()
+    if not raw:
+        return ""
+    if "<" in raw and ">" in raw:
+        return _html_post_booking_to_chat_text(raw)
+    lines_out: List[str] = []
+    for ln in raw.splitlines():
+        piece = ln.strip()
+        if not piece:
+            continue
+        if re.match(r"^[-•*]\s*", piece):
+            piece = re.sub(r"^[-•*]\s+", "", piece)
+            lines_out.append(f"• {piece}")
+        else:
+            lines_out.append(f"• {piece}")
+    return "\n".join(lines_out)
+
+
+def _snapshot_flow_controller_for_resume(fc: FlowController) -> Dict[str, Any]:
+    wm = fc.workflow_manager
+    return {
+        "state": fc.state.value,
+        "collected_data": json.loads(json.dumps(fc.collected_data, default=str)),
+        "otp_state": dict(fc.otp_state),
+        "workflow": wm.export_state() if wm else None,
+    }
+
+
+def _restore_flow_controller_from_resume(fc: FlowController, snap: Optional[Dict[str, Any]]) -> None:
+    if not snap or not isinstance(snap, dict):
+        return
+    st = snap.get("state")
+    if st:
+        try:
+            fc.state = ConversationState(st)
+        except Exception:
+            pass
+    cd = snap.get("collected_data")
+    if isinstance(cd, dict):
+        fc.collected_data = {**fc.collected_data, **cd}
+    ot = snap.get("otp_state")
+    if isinstance(ot, dict):
+        fc.otp_state = {**fc.otp_state, **ot}
+    wf_snap = snap.get("workflow")
+    if wf_snap:
+        from .services.workflow_manager import WorkflowManager
+
+        wm = WorkflowManager(fc.context)
+        wm.import_state(wf_snap)
+        fc.workflow_manager = wm
+
+
+def _prune_widget_resume_store() -> None:
+    if len(WIDGET_CHAT_RESUME) <= WIDGET_RESUME_MAX_KEYS:
+        return
+    items = sorted(WIDGET_CHAT_RESUME.items(), key=lambda kv: kv[1].get("saved_at", 0))
+    drop = max(1, len(items) // 2)
+    for k, _ in items[:drop]:
+        WIDGET_CHAT_RESUME.pop(k, None)
+
+
 def _extract_otp_from_text(text: str) -> str:
     """Extract 6-digit OTP code from user text."""
     import re
@@ -853,6 +1016,9 @@ def _bot_requests_file_upload(text: str) -> bool:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
 
+    resume_key = (websocket.query_params.get("resume") or "").strip()
+    widget_session_complete = False
+
     app_id: Optional[str] = websocket.query_params.get("app_id")
     user_id: Optional[str] = websocket.query_params.get("user_id")
     country_hint_raw: Optional[str] = websocket.query_params.get("country")
@@ -925,34 +1091,69 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     # Build RAG vector store
     rag_service.build_vector_store(context)
-    
-    flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+
     lead_id: Optional[str] = None
     last_snapshot: Dict[str, Any] = {}
+    restored = False
+    if resume_key and app_id:
+        resume_blob = WIDGET_CHAT_RESUME.get(resume_key)
+        if (
+            isinstance(resume_blob, dict)
+            and str(resume_blob.get("app_id") or "") == str(app_id)
+            and (time.time() - float(resume_blob.get("saved_at", 0))) < WIDGET_RESUME_TTL_SEC
+            and not resume_blob.get("terminal")
+        ):
+            restored = True
+            conversation_history = list(resume_blob.get("conversation_history") or [])
+            calendar_flow = resume_blob.get("calendar_flow")
+            calendar_days = list(resume_blob.get("calendar_days") or [])
+            calendar_slots = list(resume_blob.get("calendar_slots") or [])
+            calendar_free_slots = list(resume_blob.get("calendar_free_slots") or [])
+            calendar_selected_day = resume_blob.get("calendar_selected_day")
+            calendar_pending_slot = dict(resume_blob.get("calendar_pending_slot") or {})
+            user_timezone = str(resume_blob.get("user_timezone") or "UTC")
+            _restore_flow_controller_from_resume(flow_controller, resume_blob.get("flow"))
+            lid = resume_blob.get("lead_id")
+            if lid:
+                lead_id = str(lid)
+                flow_controller.update_collected_data("leadId", lead_id)
 
-    try:
-      location_country = country_hint or (context.get("country") or "US")
-      ok_lead, lead_resp = await lead_service.create_interaction_lead(
-          app_id=app_id,
-          user_id=user_id,
-          location={"country": location_country, "countryCode": location_country},
-          initial_interaction="widget_opened",
-          source_channel="web",
-          dedupe_window_hours=settings.lead_dedupe_window_hours,
-      )
-      if ok_lead and isinstance(lead_resp, dict):
-          lead_obj = ((lead_resp.get("data") or {}).get("lead") or {})
-          lead_id = str(lead_obj.get("_id") or "")
-          if lead_id:
-              flow_controller.update_collected_data("leadId", lead_id)
-    except Exception as lead_exc:
-      logger.warning("WebSocket interaction lead creation failed: %s", lead_exc)
+    if not restored:
+        flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+        try:
+            location_country = country_hint or (context.get("country") or "US")
+            ok_lead, lead_resp = await lead_service.create_interaction_lead(
+                app_id=app_id,
+                user_id=user_id,
+                location={"country": location_country, "countryCode": location_country},
+                initial_interaction="widget_opened",
+                source_channel="web",
+                dedupe_window_hours=settings.lead_dedupe_window_hours,
+            )
+            if ok_lead and isinstance(lead_resp, dict):
+                lead_obj = ((lead_resp.get("data") or {}).get("lead") or {})
+                lead_id = str(lead_obj.get("_id") or "")
+                if lead_id:
+                    flow_controller.update_collected_data("leadId", lead_id)
+        except Exception as lead_exc:
+            logger.warning("WebSocket interaction lead creation failed: %s", lead_exc)
 
-    # Send greeting (from DB) + lead types as buttons as soon as widget opens; no first user message required
+    # Greeting for new sessions; resumed sessions replay transcript from snapshot
     try:
-        initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
-        conversation_history.append({"role": "assistant", "content": initial_reply})
-        await websocket.send_json({"type": "bot", "content": initial_reply})
+        if restored:
+            for turn in conversation_history[-50:]:
+                role = turn.get("role")
+                content = str(turn.get("content") or "")
+                if not content:
+                    continue
+                if role == "assistant":
+                    await websocket.send_json({"type": "bot", "content": content})
+                elif role == "user":
+                    await websocket.send_json({"type": "user_replay", "content": content})
+        else:
+            initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
+            conversation_history.append({"role": "assistant", "content": initial_reply})
+            await websocket.send_json({"type": "bot", "content": initial_reply})
     except Exception as greeting_exc:
         logger.exception("Failed to generate greeting: %s", greeting_exc)
         await websocket.send_json({"type": "error", "content": "Failed to load greeting. Please try again."})
@@ -1177,11 +1378,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
                     customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
                     _service_plans_ctx = context.get("service_plans", [])
-                    _post_booking_note = next(
-                        (sp.get("postBookingNote", "") for sp in _service_plans_ctx
-                         if isinstance(sp, dict) and sp.get("question", "").strip().lower() == service_title.strip().lower()),
-                        ""
-                    )
+                    _post_booking_note_raw = _find_post_booking_note(_service_plans_ctx, service_title)
+                    _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
                     book_result = await calendar_service.book_appointment(
                         app_id_for_calendar, start_iso, end_iso, service_title,
                         attendee_email=customer_email,
@@ -1189,7 +1387,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         customer_name=customer_name,
                         customer_phone=customer_phone,
                         lead_id=lead_id,
-                        post_booking_note=_post_booking_note,
+                        post_booking_note=_post_booking_note_raw,
                     )
                     calendar_flow = None
                     calendar_days = []
@@ -1215,8 +1413,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             _bk_date = start_iso[:10]
                         time_str = f"{_bk_date}, {_bk_start} – {_bk_end}"
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
-                        if _post_booking_note:
-                            reply += f"\n\n📋 Important Instructions:\n{_post_booking_note}"
+                        if _post_booking_note_chat:
+                            reply += f"\n\n📋 **Important Instructions**\n{_post_booking_note_chat}"
                         # Booking confirmation is the terminal step for this lead cycle.
                         try:
                             if lead_id:
@@ -1255,8 +1453,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
-                        await websocket.close(code=1000)
-                        break
+                        widget_session_complete = True
+                        if resume_key:
+                            WIDGET_CHAT_RESUME.pop(resume_key, None)
                     continue
                 try:
                     num = _extract_index_choice(str(user_text))
@@ -1338,10 +1537,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
                 and _is_availability_intent(str(user_text))
             ):
-                now = datetime.utcnow()
-                from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-                to_dt = now + timedelta(days=7)
-                to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+                from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
                 slot_minutes = integration.get("calendarSlotMinutes", 30)
                 if slot_minutes not in (15, 30, 60):
                     slot_minutes = 30
@@ -1353,11 +1549,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if result.get("error"):
                         reply = "I couldn't fetch availability right now. Please try again later."
                     else:
+                        cal_tz_fc = _calendar_tz_from_integration(integration)
                         _now_utc_sc = datetime.utcnow().replace(tzinfo=timezone.utc)
                         free_slots = [
                             s for s in (result.get("freeSlots") or [])
                             if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_sc
                         ]
+                        free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_fc)
                         if not free_slots:
                             if not result.get("calendarConnected"):
                                 reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -1771,10 +1969,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             
             # Check if JSON was generated (all data collected)
             if str(reply).strip() == "BOOK_APPOINTMENT_REQUESTED":
-                now = datetime.utcnow()
-                from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-                to_dt = now + timedelta(days=7)
-                to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+                from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
                 slot_minutes = integration.get("calendarSlotMinutes", 30)
                 if slot_minutes not in (15, 30, 60):
                     slot_minutes = 30
@@ -1786,11 +1981,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if result.get("error"):
                         reply = "I couldn't fetch availability right now. Please try again later."
                     else:
+                        cal_tz_fc = _calendar_tz_from_integration(integration)
                         _now_utc_bk = datetime.utcnow().replace(tzinfo=timezone.utc)
                         free_slots = [
                             s for s in (result.get("freeSlots") or [])
                             if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_bk
                         ]
+                        free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_fc)
                         if not free_slots:
                             reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
                         else:
@@ -1860,8 +2057,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "reviewUrl": review_url,
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
-                await websocket.close(code=1000)
-                break
+                conversation_history.append({"role": "assistant", "content": final_msg})
+                widget_session_complete = True
+                if resume_key:
+                    WIDGET_CHAT_RESUME.pop(resume_key, None)
+                continue
 
             # Hard safety guard: never expose internal JSON/payloads in chat bubbles.
             if _looks_like_internal_lead_payload(reply):
@@ -1869,8 +2069,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 graceful_msg = get_string("final_fallback", lang_code)
                 conversation_history.append({"role": "assistant", "content": graceful_msg})
                 await websocket.send_json({"type": "bot", "content": graceful_msg})
-                await websocket.close(code=1000)
-                break
+                widget_session_complete = True
+                if resume_key:
+                    WIDGET_CHAT_RESUME.pop(resume_key, None)
+                continue
             
             # Regular conversation response
             # Progressive lead updates while conversation is in progress.
@@ -1912,6 +2114,33 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "content": "An unexpected error occurred. Please try again."})
         except Exception:
             pass
+    finally:
+        if (
+            resume_key
+            and app_id
+            and fetch_by_app
+            and not widget_session_complete
+            and flow_controller.state != ConversationState.COMPLETE
+        ):
+            try:
+                WIDGET_CHAT_RESUME[resume_key] = {
+                    "saved_at": time.time(),
+                    "app_id": app_id,
+                    "terminal": False,
+                    "conversation_history": conversation_history[-50:],
+                    "calendar_flow": calendar_flow,
+                    "calendar_days": calendar_days,
+                    "calendar_slots": calendar_slots,
+                    "calendar_free_slots": calendar_free_slots,
+                    "calendar_selected_day": calendar_selected_day,
+                    "calendar_pending_slot": calendar_pending_slot,
+                    "user_timezone": user_timezone,
+                    "flow": _snapshot_flow_controller_for_resume(flow_controller),
+                    "lead_id": lead_id,
+                }
+                _prune_widget_resume_store()
+            except Exception:
+                pass
 
 
 @app.post("/webhook/voice-agent")
@@ -2428,10 +2657,7 @@ async def whatsapp_webhook(request: Request):
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
             and _is_availability_intent(enhanced_user_text)
         ):
-            now = datetime.utcnow()
-            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-            to_dt = now + timedelta(days=7)
-            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
             if slot_minutes not in (15, 30, 60):
                 slot_minutes = 30
@@ -2441,7 +2667,13 @@ async def whatsapp_webhook(request: Request):
                 if result.get("error"):
                     reply = "I couldn't fetch availability right now. Please try again later."
                 else:
-                    free_slots = result.get("freeSlots") or []
+                    cal_tz_wa = _calendar_tz_from_integration(integration)
+                    _now_utc_wa = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    free_slots = [
+                        s for s in (result.get("freeSlots") or [])
+                        if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_wa
+                    ]
+                    free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_wa)
                     if not free_slots:
                         if not result.get("calendarConnected"):
                             reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -2451,14 +2683,23 @@ async def whatsapp_webhook(request: Request):
                         by_date: Dict[str, List[Dict[str, Any]]] = {}
                         for slot in free_slots:
                             start = slot.get("start") or ""
-                            date_key = start[:10] if len(start) >= 10 else ""
-                            if date_key:
-                                by_date.setdefault(date_key, []).append(slot)
+                            if not start:
+                                continue
+                            try:
+                                from zoneinfo import ZoneInfo
+
+                                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                date_key = dt_utc.astimezone(ZoneInfo(cal_tz_wa)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_key = start[:10]
+                            by_date.setdefault(date_key, []).append(slot)
                         days_order = sorted(by_date.keys())
                         calendar_days_list = []
                         for d in days_order:
                             try:
-                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                from zoneinfo import ZoneInfo
+
+                                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz_wa))
                                 calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
@@ -3541,10 +3782,7 @@ async def messenger_webhook(request: Request):
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
             and _is_availability_intent(message_text)
         ):
-            now = datetime.utcnow()
-            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-            to_dt = now + timedelta(days=7)
-            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
             if slot_minutes not in (15, 30, 60):
                 slot_minutes = 30
@@ -3554,7 +3792,13 @@ async def messenger_webhook(request: Request):
                 if result.get("error"):
                     reply = "I couldn't fetch availability right now. Please try again later."
                 else:
-                    free_slots = result.get("freeSlots") or []
+                    cal_tz_ms = _calendar_tz_from_integration(integration)
+                    _now_utc_ms = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    free_slots = [
+                        s for s in (result.get("freeSlots") or [])
+                        if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_ms
+                    ]
+                    free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_ms)
                     if not free_slots:
                         if not result.get("calendarConnected"):
                             reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -3564,14 +3808,23 @@ async def messenger_webhook(request: Request):
                         by_date: Dict[str, List[Dict[str, Any]]] = {}
                         for slot in free_slots:
                             start = slot.get("start") or ""
-                            date_key = start[:10] if len(start) >= 10 else ""
-                            if date_key:
-                                by_date.setdefault(date_key, []).append(slot)
+                            if not start:
+                                continue
+                            try:
+                                from zoneinfo import ZoneInfo
+
+                                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                date_key = dt_utc.astimezone(ZoneInfo(cal_tz_ms)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_key = start[:10]
+                            by_date.setdefault(date_key, []).append(slot)
                         days_order = sorted(by_date.keys())
                         calendar_days_list = []
                         for d in days_order:
                             try:
-                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                from zoneinfo import ZoneInfo
+
+                                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz_ms))
                                 calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
@@ -4458,10 +4711,7 @@ async def instagram_webhook(request: Request):
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
             and _is_availability_intent(message_text)
         ):
-            now = datetime.utcnow()
-            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-            to_dt = now + timedelta(days=7)
-            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
             if slot_minutes not in (15, 30, 60):
                 slot_minutes = 30
@@ -4471,7 +4721,13 @@ async def instagram_webhook(request: Request):
                 if result.get("error"):
                     reply = "I couldn't fetch availability right now. Please try again later."
                 else:
-                    free_slots = result.get("freeSlots") or []
+                    cal_tz_ig = _calendar_tz_from_integration(integration)
+                    _now_utc_ig = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    free_slots = [
+                        s for s in (result.get("freeSlots") or [])
+                        if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_ig
+                    ]
+                    free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_ig)
                     if not free_slots:
                         if not result.get("calendarConnected"):
                             reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -4481,14 +4737,23 @@ async def instagram_webhook(request: Request):
                         by_date: Dict[str, List[Dict[str, Any]]] = {}
                         for slot in free_slots:
                             start = slot.get("start") or ""
-                            date_key = start[:10] if len(start) >= 10 else ""
-                            if date_key:
-                                by_date.setdefault(date_key, []).append(slot)
+                            if not start:
+                                continue
+                            try:
+                                from zoneinfo import ZoneInfo
+
+                                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                date_key = dt_utc.astimezone(ZoneInfo(cal_tz_ig)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_key = start[:10]
+                            by_date.setdefault(date_key, []).append(slot)
                         days_order = sorted(by_date.keys())
                         calendar_days_list = []
                         for d in days_order:
                             try:
-                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
+                                from zoneinfo import ZoneInfo
+
+                                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz_ig))
                                 calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
