@@ -422,3 +422,36 @@ class WorkflowManager:
         self.workflow_answers = {}
         self.is_active = False
         self._linked_question_ids = set()
+
+    def export_state(self) -> Optional[Dict[str, Any]]:
+        """JSON-friendly snapshot for web widget session resume."""
+        if not self.is_active:
+            return None
+        q_copy = list(self._question_queue) if self._question_queue is not None else None
+        return {
+            "current_service_name": self.current_service_name,
+            "current_workflow": self.current_workflow,
+            "current_question_index": self.current_question_index,
+            "_queue_index": self._queue_index,
+            "_question_queue": q_copy,
+            "workflow_answers": dict(self.workflow_answers),
+            "_linked_question_ids": list(self._linked_question_ids),
+            "is_active": self.is_active,
+        }
+
+    def import_state(self, data: Optional[Dict[str, Any]]) -> None:
+        """Restore from export_state()."""
+        self.reset()
+        if not data or not isinstance(data, dict):
+            return
+        self.current_service_name = data.get("current_service_name")
+        self.current_workflow = data.get("current_workflow")
+        self.current_question_index = int(data.get("current_question_index", 0))
+        self._queue_index = int(data.get("_queue_index", 0))
+        self._question_queue = data.get("_question_queue")
+        self.workflow_answers = dict(data.get("workflow_answers") or {})
+        lids = data.get("_linked_question_ids")
+        self._linked_question_ids = set(lids) if isinstance(lids, list) else set()
+        self.is_active = bool(data.get("is_active"))
+        if self.is_active and not self.current_workflow:
+            self.is_active = False

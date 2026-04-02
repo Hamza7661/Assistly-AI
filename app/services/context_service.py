@@ -367,11 +367,7 @@ class ContextService:
             "treatments",
         ], [])
         
-        # Capitalize first letter of service plan questions
-        if isinstance(service_plans, list):
-            for plan in service_plans:
-                if isinstance(plan, dict) and "question" in plan:
-                    plan["question"] = plan["question"].capitalize()
+        # Preserve service plan titles as configured (capitalise() would corrupt mixed-case names).
 
         # Profession/industry: prefer app's industry over user's professionDescription
         profession = ""
