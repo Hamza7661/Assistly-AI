@@ -309,7 +309,14 @@ class ContextService:
         lead_types: List[LeadTypeEntry] = []
         if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
             # Already in desired shape; preserve relevantServicePlans, synonyms, and emoji (per-app from DB)
-            for idx, item in enumerate(lead_types_raw, start=1):
+            items_in_order = list(lead_types_raw)
+            # Preserve configured sequence: sort by `order` when present.
+            try:
+                if any(isinstance(x, dict) and x.get("order") is not None for x in items_in_order):
+                    items_in_order.sort(key=lambda x: (x.get("order") if isinstance(x, dict) and x.get("order") is not None else 10**9))
+            except Exception:
+                pass
+            for idx, item in enumerate(items_in_order, start=1):
                 value = str(item.get("value") or item.get("id") or idx)
                 text = str(item.get("text") or value)
                 entry: LeadTypeEntry = {"id": item.get("id") or idx, "value": value, "text": text}

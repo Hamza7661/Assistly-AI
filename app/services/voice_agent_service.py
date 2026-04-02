@@ -629,6 +629,10 @@ RULES:
             if self.app_id:
                 lead_data["appId"] = self.app_id
             
+            # Ensure source channel is set so dashboard can filter voice leads
+            if not lead_data.get("sourceChannel"):
+                lead_data["sourceChannel"] = "voice"
+            
             # Create lead
             ok, _ = await self.lead_service.create_public_lead(self.user_id, lead_data)
             
