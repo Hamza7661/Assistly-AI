@@ -1182,6 +1182,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         time_zone=slot_timezone,
                         customer_name=customer_name,
                         customer_phone=customer_phone,
+                        lead_id=lead_id,
                     )
                     calendar_flow = None
                     calendar_days = []
@@ -1224,7 +1225,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     "confirmed": True,
                                 }
                                 completion_payload = {
-                                    "status": "complete",
+                                    "status": "confirmed",
                                     "title": f"{service_title} – {customer_name}",
                                     "serviceType": flow_controller.collected_data.get("serviceType"),
                                     "leadType": flow_controller.collected_data.get("leadType"),

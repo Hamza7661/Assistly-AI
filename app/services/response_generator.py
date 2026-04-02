@@ -91,18 +91,29 @@ class ResponseGenerator:
             relevant = lt.get("relevantServicePlans")
             if not relevant or not isinstance(relevant, list):
                 return None  # No filtering configured
-            allowed = {str(s).strip().lower() for s in relevant if s}
-            if not allowed:
+            requested = [str(s).strip() for s in relevant if s and str(s).strip()]
+            if not requested:
                 return None
-            # Filter service plans to only those in relevantServicePlans
-            filtered = []
+
+            # Build a case-insensitive lookup from available service plans.
+            available: Dict[str, str] = {}
             for plan in service_plans:
                 if isinstance(plan, dict):
                     name = (plan.get("question") or plan.get("name") or plan.get("title") or "").strip()
                 else:
                     name = str(plan).strip()
-                if name and name.lower() in allowed:
-                    filtered.append(name)
+                if not name:
+                    continue
+                key = name.lower()
+                if key not in available:
+                    available[key] = name
+
+            # Preserve the configured order of relevantServicePlans.
+            filtered: List[str] = []
+            for r in requested:
+                key = r.lower()
+                if key in available:
+                    filtered.append(available[key])
             return filtered if filtered else None
         return None
 

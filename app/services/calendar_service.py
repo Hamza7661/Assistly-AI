@@ -87,6 +87,7 @@ class CalendarService:
         time_zone: Optional[str] = None,
         customer_name: Optional[str] = None,
         customer_phone: Optional[str] = None,
+        lead_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         POST /api/v1/calendar/apps/:appId/appointments
@@ -130,6 +131,8 @@ class CalendarService:
             body["customerName"] = customer_name
         if customer_phone:
             body["customerPhone"] = customer_phone
+        if lead_id:
+            body["leadId"] = lead_id
 
         logger.info("Calendar book_appointment app_id=%s start=%s", app_id, start_iso)
 
