@@ -1176,6 +1176,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
                     customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
                     customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                    _service_plans_ctx = context.get("service_plans", [])
+                    _post_booking_note = next(
+                        (sp.get("postBookingNote", "") for sp in _service_plans_ctx
+                         if isinstance(sp, dict) and sp.get("question", "").strip().lower() == service_title.strip().lower()),
+                        ""
+                    )
                     book_result = await calendar_service.book_appointment(
                         app_id_for_calendar, start_iso, end_iso, service_title,
                         attendee_email=customer_email,
@@ -1183,6 +1189,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         customer_name=customer_name,
                         customer_phone=customer_phone,
                         lead_id=lead_id,
+                        post_booking_note=_post_booking_note,
                     )
                     calendar_flow = None
                     calendar_days = []
@@ -1208,6 +1215,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             _bk_date = start_iso[:10]
                         time_str = f"{_bk_date}, {_bk_start} – {_bk_end}"
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
+                        if _post_booking_note:
+                            reply += f"\n\n📋 Important Instructions:\n{_post_booking_note}"
                         # Booking confirmation is the terminal step for this lead cycle.
                         try:
                             if lead_id:
@@ -1269,8 +1278,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             _date_label = slot.get("start", "")[:10]
                         selected_service = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
                         reply = (
-                            f"Selected service: {selected_service}\n"
-                            f"Selected time: 🕒 {_date_label}, {t_start} – {t_end}\n\n"
+                            f"📋 Booking Summary\n"
+                            f"──────────────────\n"
+                            f"Service:  {selected_service}\n"
+                            f"Date:     {_date_label}\n"
+                            f"Time:     🕒 {t_start} – {t_end}\n\n"
                             "Please confirm your booking:\n"
                             "<button value=\"confirm\">Confirm booking</button> "
                             "<button value=\"cancel\">Cancel</button>"
@@ -3187,9 +3199,19 @@ async def whatsapp_webhook(request: Request):
             cleaned_reply = cleaned_reply.strip()
         
         # Send appropriate WhatsApp message
-        if buttons:
-            # For WhatsApp, convert buttons to numbered list instead of interactive buttons
-            # (interactive buttons don't work well in Twilio sandbox)
+        if buttons and len(buttons) <= 3:
+            # Try native interactive buttons first; fall back to numbered list on failure
+            wa_buttons = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
+            success, message = await whatsapp_service.send_interactive_buttons(user_phone, cleaned_reply, wa_buttons, from_phone=twilio_phone)
+            if not success:
+                logger.info("Interactive buttons failed (%s), falling back to numbered list", message)
+                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
+                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                if not success:
+                    logger.error("Failed to send WhatsApp message: %s", message)
+        elif buttons:
+            # 4+ options — use numbered list
             button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
             full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
             success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
@@ -4137,14 +4159,8 @@ async def messenger_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                btn_text = "\n\n" + "\n".join(
-                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
-                )
-                await messenger_service.send_message(
-                    sender_id,
-                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
-                    page_access_token,
-                )
+                qrs = [{"title": btn["title"], "payload": btn["title"]} for btn in buttons]
+                await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
             else:
                 await messenger_service.send_message(sender_id, reply, page_access_token)
 
@@ -5048,14 +5064,8 @@ async def instagram_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                btn_text = "\n\n" + "\n".join(
-                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
-                )
-                await instagram_service.send_message(
-                    sender_id,
-                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
-                    instagram_access_token,
-                )
+                qrs = [{"title": btn["title"], "payload": btn["title"]} for btn in buttons]
+                await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
             else:
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
 

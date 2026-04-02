@@ -87,6 +87,77 @@ class MessengerGraphService:
                 logger.error("Failed to send Messenger message: %s", e)
                 raise
 
+    async def send_quick_replies(
+        self,
+        recipient_psid: str,
+        message_text: str,
+        quick_replies: List[Dict[str, str]],
+        page_access_token: str,
+    ) -> Dict[str, Any]:
+        """
+        Send a message with quick reply chips to a Messenger user.
+        Messenger supports up to 13 quick replies.
+
+        Args:
+            recipient_psid:    Page-Scoped User ID of the recipient.
+            message_text:      Message body displayed above the chips.
+            quick_replies:     List of {"title": "...", "payload": "..."} dicts.
+            page_access_token: Facebook Page Access Token.
+
+        Returns:
+            Graph API response dict.
+        """
+        if not page_access_token:
+            raise ValueError("Page access token is required to send Messenger quick replies")
+
+        if len(message_text) > 2000:
+            message_text = message_text[:1997] + "..."
+
+        url = f"{self.base_url}/me/messages"
+        payload = {
+            "recipient": {"id": recipient_psid},
+            "message": {
+                "text": message_text,
+                "quick_replies": [
+                    {
+                        "content_type": "text",
+                        "title": qr["title"][:20],
+                        "payload": qr.get("payload", qr["title"])[:1000],
+                    }
+                    for qr in quick_replies[:13]
+                ],
+            },
+            "messaging_type": "RESPONSE",
+        }
+        params = {"access_token": page_access_token}
+
+        logger.info(
+            "Sending Messenger quick replies to PSID=%s with %d options",
+            recipient_psid,
+            len(quick_replies[:13]),
+        )
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(url, json=payload, params=params)
+                response.raise_for_status()
+                result = response.json()
+                logger.info(
+                    "Messenger quick replies sent successfully. Message ID: %s",
+                    result.get("message_id", "unknown"),
+                )
+                return result
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "Messenger Graph API error (quick replies): %s – %s",
+                    e.response.status_code,
+                    e.response.text,
+                )
+                raise
+            except Exception as e:
+                logger.error("Failed to send Messenger quick replies: %s", e)
+                raise
+
     # ------------------------------------------------------------------
     # Security
     # ------------------------------------------------------------------

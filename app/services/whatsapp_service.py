@@ -156,13 +156,16 @@ class WhatsAppService:
             start_time = time.time()
             logger.info("Sending WhatsApp interactive message at %s to %s with %d buttons", 
                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), 
-                       formatted_phone, len(buttons))
+                       to_phone, len(buttons))
             
+            # Twilio supports interactive buttons via the Content Templates API.
+            # Attempt to send using persistent_action with the interactive JSON payload;
+            # this works on verified WhatsApp Business Accounts.
             message_obj = self.client.messages.create(
                 from_=whatsapp_from,
                 to=whatsapp_to,
-                content_sid=None,  # We'll use the interactive content directly
-                content_variables=json.dumps(interactive_content)
+                body=body_text,
+                persistent_action=[f"reply:{btn['reply']['id']}:{btn['reply']['title']}" for btn in interactive_content["action"]["buttons"]]
             )
             
             end_time = time.time()
