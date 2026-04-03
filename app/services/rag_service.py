@@ -238,6 +238,8 @@ class RAGService:
             
         except Exception as e:
             logger.error(f"Failed to build vector store: {e}")
+            self.vector_store = None
+            self.retriever = None
             return False
     
     def _create_qa_chain(self) -> None:
