@@ -31,20 +31,20 @@ def resolve_lead_type(
     if not user_text or not lead_types:
         return None
 
-    raw = str(user_text).strip()
-    if not raw:
+    normalized = DataExtractor.normalize_lead_type_user_input(str(user_text))
+    if not normalized:
         return None
 
     if mode == LeadTypeResolutionMode.LEAD_SELECTION:
-        if raw.isdigit():
-            num = int(raw)
+        if normalized.isdigit():
+            num = int(normalized)
             if 1 <= num <= len(lead_types):
                 candidate = lead_types[num - 1]
                 if isinstance(candidate, dict):
                     return candidate
-        return DataExtractor.match_lead_type(user_text, lead_types)
+        return DataExtractor.match_lead_type(normalized, lead_types)
 
     # MID_FLOW_SWITCH
-    if raw.isdigit():
+    if normalized.isdigit():
         return None
-    return DataExtractor.match_lead_type_strict(user_text, lead_types)
+    return DataExtractor.match_lead_type_strict(normalized, lead_types)
