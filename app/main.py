@@ -168,6 +168,18 @@ WIDGET_CHAT_RESUME: Dict[str, Dict[str, Any]] = {}
 WIDGET_RESUME_TTL_SEC = 86400 * 2
 WIDGET_RESUME_MAX_KEYS = 4000
 
+# Mid-flow lead-type switch is only meaningful after the user left the greeting / lead menu.
+_LEAD_TYPE_SWITCH_ALLOWED_STATES = frozenset(
+    s
+    for s in ConversationState
+    if s
+    not in (
+        ConversationState.GREETING,
+        ConversationState.LEAD_TYPE_SELECTION,
+        ConversationState.COMPLETE,
+    )
+)
+
 # Voice agent sessions
 voice_agent_service = VoiceAgentService(settings)
 
@@ -1235,6 +1247,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
 
+            # Bad or partial resume blobs may leave state on default GREETING while the client
+            # already showed the greeting. The next user action is lead-type selection — not a
+            # mid-flow switch. Stale collected_data.leadType from a merge bug would otherwise
+            # satisfy "existing lead type" + state != LEAD_TYPE_SELECTION and fire the switch
+            # handler on the *first* button tap (re-greeting / wrong branch).
+            if flow_controller.state == ConversationState.GREETING:
+                flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+                _user_turns_so_far = sum(
+                    1 for m in conversation_history if m.get("role") == "user"
+                )
+                if _user_turns_so_far == 0:
+                    flow_controller.update_collected_data("leadType", None)
+                    flow_controller.collected_data["title"] = None
+                    flow_controller.collected_data["leadTypeSwitchHistory"] = []
+
             integration = context.get("integration") or {}
             app_id_for_calendar = app_id  # from query params when widget is opened with ?app_id=...
 
@@ -1252,14 +1279,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     str(user_text), lead_types_list, LeadTypeResolutionMode.MID_FLOW_SWITCH
                 )
 
-            # Only treat as a mid-flow "switch" if we already had a lead type. Otherwise the
-            # first button/text selection (leadType still empty) wrongly hits this branch and
-            # resets the flow or logs a bogus switch from null.
+            # Only treat as a mid-flow "switch" if we already had a lead type and we are past
+            # the greeting / initial lead menu (see _LEAD_TYPE_SWITCH_ALLOWED_STATES).
             _existing_lt = (flow_controller.collected_data.get("leadType") or "").strip()
             if (
                 switched_lead_type
                 and _existing_lt
-                and flow_controller.state != ConversationState.LEAD_TYPE_SELECTION
+                and flow_controller.state in _LEAD_TYPE_SWITCH_ALLOWED_STATES
                 and _existing_lt.lower()
                 != (switched_lead_type.get("value") or "").strip().lower()
             ):
