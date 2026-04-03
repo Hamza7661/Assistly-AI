@@ -1052,6 +1052,32 @@ Classify the intent:"""
                     return await self._generate_state_response(state, "", conversation_history, context)
         
         if state == ConversationState.PHONE_COLLECTION:
+            # Graceful email correction during phone step:
+            # If the user provides/updates email before phone, accept latest email.
+            # - With email verification enabled: restart email OTP on the new email.
+            # - With email verification disabled: keep moving on phone collection.
+            if email and validator.is_valid_email(email) and not (phone and validator.is_valid_phone(phone)):
+                flow_controller.update_collected_data("leadEmail", email)
+                if flow_controller.validate_email:
+                    # Force re-verification for the updated email (latest email wins)
+                    flow_controller.otp_state["email_sent"] = False
+                    flow_controller.otp_state["email_verified"] = False
+                    if has_question:
+                        rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        return f"{answer}|||SEND_EMAIL:{email}"
+                    return "SEND_EMAIL:" + email
+
+                # Email verification disabled: accept latest email and continue phone step
+                if has_question:
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                    answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                    phone_prompt = await self._generate_state_response(
+                        ConversationState.PHONE_COLLECTION, "", conversation_history, context
+                    )
+                    return f"{answer}\n\nThanks — I have updated your email to {email}.\n\n{phone_prompt}"
+                return f"Thanks — I have updated your email to {email}. Please share your phone number to continue."
+
             if phone and validator.is_valid_phone(phone):
                 flow_controller.update_collected_data("leadPhoneNumber", phone)
                 

@@ -218,13 +218,17 @@ class WorkflowManager:
                 f'<file url="{attachment_url}" name="{filename}">📎 {filename}</file>'
             )
         
-        # Add multiple-choice option buttons (disabled in conversational mode)
+        # Add option controls (disabled in conversational mode)
         if options and not self._conversation_style_enabled():
             sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
+            input_mode = str(question.get("choiceInputMode") or "button").strip().lower()
             for opt in sorted_opts:
                 opt_text = opt.get("text", "").strip()
                 if opt_text:
-                    parts.append(f"<button>{opt_text}</button>")
+                    if input_mode == "checkbox":
+                        parts.append(f'<checkbox value="{opt_text}">{opt_text}</checkbox>')
+                    else:
+                        parts.append(f"<button>{opt_text}</button>")
         
         return "\n".join(parts)
     
@@ -311,51 +315,62 @@ class WorkflowManager:
             return (None, False)
 
         sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
-        answer_stripped = answer.strip()
-        answer_lower = answer_stripped.lower()
+        raw_answer = answer.strip()
+        # Support checkbox submissions where frontend sends multiple selections
+        # as comma-separated labels (e.g. "Option A, Option B").
+        parts = [p.strip() for p in re.split(r"[,;\n]+", raw_answer) if p.strip()]
+        candidate_answers = parts or [raw_answer]
 
         matched_opt = None
 
-        # Try numeric match first (e.g. user typed "4" → pick 4th option)
-        if answer_stripped.isdigit():
-            number = int(answer_stripped)
-            if 1 <= number <= len(sorted_opts):
-                matched_opt = sorted_opts[number - 1]
-                logger.info(f"Workflow: Numeric match #{number} -> option '{matched_opt.get('text')}'")
+        for candidate in candidate_answers:
+            answer_lower = candidate.lower()
 
-        # Fall back to exact text match (case-insensitive)
-        if matched_opt is None:
+            # Try numeric match first (e.g. user typed "4" → pick 4th option)
+            if candidate.isdigit():
+                number = int(candidate)
+                if 1 <= number <= len(sorted_opts):
+                    matched_opt = sorted_opts[number - 1]
+                    logger.info(f"Workflow: Numeric match #{number} -> option '{matched_opt.get('text')}'")
+                    break
+
+            # Fall back to exact text match (case-insensitive)
             for opt in sorted_opts:
                 opt_text = (opt.get("text") or "").strip()
                 if opt_text.lower() == answer_lower:
                     matched_opt = opt
                     break
+            if matched_opt is not None:
+                break
 
         # Optional: partial match for conversational/free-text answers
         if matched_opt is None and self._conversation_style_enabled():
-            answer_tokens = set(re.findall(r"\w+", answer_lower))
             best_opt = None
             best_score = 0
+            for candidate in candidate_answers:
+                answer_lower = candidate.lower()
+                answer_tokens = set(re.findall(r"\w+", answer_lower))
+                for opt in sorted_opts:
+                    opt_text = (opt.get("text") or "").strip()
+                    if not opt_text:
+                        continue
 
-            for opt in sorted_opts:
-                opt_text = (opt.get("text") or "").strip()
-                if not opt_text:
-                    continue
+                    opt_lower = opt_text.lower()
+                    # Strong substring match first (e.g. "I prefer morning" -> "morning")
+                    if opt_lower and opt_lower in answer_lower:
+                        matched_opt = opt
+                        break
 
-                opt_lower = opt_text.lower()
-                # Strong substring match first (e.g. "I prefer morning" -> "morning")
-                if opt_lower and opt_lower in answer_lower:
-                    matched_opt = opt
+                    opt_tokens = set(re.findall(r"\w+", opt_lower))
+                    # Keep only meaningful tokens to avoid matching on common short words
+                    opt_tokens = {t for t in opt_tokens if len(t) > 2}
+                    common = answer_tokens.intersection(opt_tokens)
+                    score = len(common)
+                    if score > best_score:
+                        best_score = score
+                        best_opt = opt
+                if matched_opt is not None:
                     break
-
-                opt_tokens = set(re.findall(r"\w+", opt_lower))
-                # Keep only meaningful tokens to avoid matching on common short words
-                opt_tokens = {t for t in opt_tokens if len(t) > 2}
-                common = answer_tokens.intersection(opt_tokens)
-                score = len(common)
-                if score > best_score:
-                    best_score = score
-                    best_opt = opt
 
             if matched_opt is None and best_opt is not None and best_score > 0:
                 matched_opt = best_opt

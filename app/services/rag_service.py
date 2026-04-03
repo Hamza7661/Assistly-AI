@@ -921,6 +921,48 @@ Generate the initial greeting with lead type buttons. Use EXACT format: <button>
             logger.error(f"Error getting initial greeting: {e}")
             return None
     
+    async def answer_faq_question(
+        self,
+        query: str,
+        profession: Optional[str] = None,
+        context_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Answer a side question using FAQ/RAG context without advancing conversation flow.
+
+        Designed for the interjection handler: the caller retains full control of the flow
+        state machine. This method ONLY answers the question — it never returns JSON or
+        flow-advancing instructions.
+        """
+        if not self.llm:
+            return None
+        try:
+            active_profession = (
+                str((context_data or {}).get("profession") or profession or "").strip()
+                or "Business"
+            )
+            context_str = await self.get_relevant_context(query) if self.retriever else ""
+            prompt = (
+                f"You are a knowledgeable {active_profession} assistant. "
+                f"Answer the following question concisely in 1-3 sentences.\n\n"
+                f"RULES:\n"
+                f"- Use the context below if it answers the question directly.\n"
+                f"- If the question is about the {active_profession} industry but not in the context, "
+                f"answer from your general knowledge like a well-informed staff member would.\n"
+                f"- If the question is completely unrelated to {active_profession}, respond warmly: "
+                f"\"That's a bit outside my area! I'm mostly here for {active_profession} services.\"\n"
+                f"- DO NOT ask questions back. DO NOT mention booking or lead type selection. "
+                f"DO NOT produce JSON.\n\n"
+                f"Context:\n{context_str or '(no specific context found)'}\n\n"
+                f"Question: {query}\n\n"
+                f"Answer:"
+            )
+            response = await self.llm.ainvoke(prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+            return answer.strip() if answer else None
+        except Exception as e:
+            logger.error(f"Error in answer_faq_question: {e}")
+            return None
+
     def clear_vector_store(self) -> None:
         """Clear the current vector store"""
         self.vector_store = None

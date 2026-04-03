@@ -1272,6 +1272,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 flow_controller.update_collected_data("serviceType", None)
                 flow_controller.update_collected_data("workflowAnswers", {})
                 flow_controller.update_collected_data("appointmentSlot", None)
+
+                # Keep already provided personal/verification info on lead-type switch.
+                # We only reset service/workflow/booking branch data.
+
                 existing_switch_history = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
                 switch_history = list(existing_switch_history) if isinstance(existing_switch_history, list) else []
                 switch_history.append({
@@ -1281,7 +1285,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 })
                 flow_controller.update_collected_data("leadTypeSwitchHistory", switch_history)
 
-                # Keep already collected personal info; continue from the right next step
+                # Keep already collected name; continue from the right next step
                 if not flow_controller.collected_data.get("leadName"):
                     flow_controller.transition_to(ConversationState.NAME_COLLECTION)
                 elif not flow_controller.collected_data.get("leadEmail"):
@@ -1297,9 +1301,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     else:
                         flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
 
+                # Polished switch confirmation using empathy prefix
+                try:
+                    _lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
+                        switched_lead_type.get("value"), context.get("lead_types", [])
+                    )
+                except Exception:
+                    _lt_empathy = ""
+                _lt_label = switched_lead_type.get("text") or switched_lead_type.get("value") or "the new option"
                 switch_msg = (
-                    f"Switched to **{switched_lead_type.get('text', switched_lead_type.get('value', 'new lead type'))}**. "
-                    f"Let's continue from here."
+                    f"{_lt_empathy} I've updated your request to **{_lt_label}**."
+                    if _lt_empathy
+                    else f"Got it — switched to **{_lt_label}**."
                 )
                 next_prompt = await response_generator._generate_state_response(
                     flow_controller.state, "", conversation_history, context
@@ -1308,6 +1321,128 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
                 continue
+
+            # ── Service-type switch interrupt ─────────────────────────────────────────
+            # Detects when user selects a different service while one is already active
+            # mid-flow (WORKFLOW_QUESTION / booking / calendar). Resets that branch
+            # cleanly and records the switch in serviceSwitchHistory.
+            _svc_switch_states = {
+                ConversationState.WORKFLOW_QUESTION,
+                ConversationState.APPOINTMENT_OFFER,
+                ConversationState.CALENDAR_BOOKING,
+                ConversationState.APPOINTMENT_CONFIRMATION,
+            }
+            _svc_pool = context.get("service_plans", []) or context.get("treatment_plans", [])
+            if (
+                _svc_pool
+                and flow_controller.collected_data.get("serviceType")
+                and flow_controller.state in _svc_switch_states
+            ):
+                _matched_svc = extractor.match_service(str(user_text), _svc_pool)
+                if (
+                    _matched_svc
+                    and _matched_svc.strip().lower()
+                    != (flow_controller.collected_data.get("serviceType") or "").strip().lower()
+                ):
+                    _prev_svc = flow_controller.collected_data.get("serviceType")
+                    # Clear all calendar state
+                    calendar_flow = None
+                    calendar_days = []
+                    calendar_slots = []
+                    calendar_free_slots = []
+                    calendar_selected_day = None
+                    calendar_pending_slot = {}
+                    # Reset workflow/booking data
+                    if flow_controller.workflow_manager:
+                        flow_controller.workflow_manager.reset()
+                    flow_controller.update_collected_data("serviceType", _matched_svc)
+                    flow_controller.update_collected_data("workflowAnswers", {})
+                    flow_controller.update_collected_data("appointmentSlot", None)
+                    # Record service switch history
+                    _existing_svc_hist = flow_controller.collected_data.get("serviceSwitchHistory") or []
+                    _svc_hist = list(_existing_svc_hist) if isinstance(_existing_svc_hist, list) else []
+                    _svc_hist.append({
+                        "from": _prev_svc,
+                        "to": _matched_svc,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    flow_controller.update_collected_data("serviceSwitchHistory", _svc_hist)
+                    # Transition to the first question of the new service
+                    flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+                    _svc_switch_next = await response_generator._generate_state_response(
+                        flow_controller.state, "", conversation_history, context
+                    )
+                    _svc_reply = (
+                        f"Of course! I've switched you over to **{_matched_svc}**. "
+                        f"Let me continue from there.\n\n{_svc_switch_next}"
+                    )
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": _svc_reply})
+                    await websocket.send_json({"type": "bot", "content": _svc_reply})
+                    logger.info(
+                        "service_switch from=%s to=%s state=%s",
+                        _prev_svc, _matched_svc, flow_controller.state.value
+                    )
+                    continue
+
+            # ── Side-question interjection ─────────────────────────────────────────────
+            # When a required step is pending and the user asks an in-industry question,
+            # answer via RAG/FAQ then re-prompt the exact pending step — without advancing
+            # state or writing any collected-data fields on this turn.
+            _INTERJECTION_STATES = {
+                ConversationState.SERVICE_SELECTION,
+                ConversationState.WORKFLOW_QUESTION,
+                ConversationState.NAME_COLLECTION,
+                ConversationState.EMAIL_COLLECTION,
+                ConversationState.PHONE_COLLECTION,
+                ConversationState.APPOINTMENT_OFFER,
+                ConversationState.CALENDAR_BOOKING,
+                ConversationState.APPOINTMENT_CONFIRMATION,
+            }
+            _Q_STARTERS = {
+                "what", "how", "why", "when", "where", "is", "does", "can", "do",
+                "are", "will", "would", "could", "should", "which", "who",
+                "tell", "explain", "describe",
+            }
+
+            def _looks_like_question(txt: str) -> bool:
+                t = (txt or "").strip()
+                if not t:
+                    return False
+                if t.endswith("?"):
+                    return True
+                first = t.lower().split()[0] if t.lower().split() else ""
+                return first in _Q_STARTERS
+
+            if (
+                flow_controller.state in _INTERJECTION_STATES
+                and not calendar_flow  # calendar flow has its own dedicated handler
+                and _looks_like_question(str(user_text))
+            ):
+                _rag_answer: Optional[str] = None
+                try:
+                    _rag_answer = await rag_service.answer_faq_question(
+                        str(user_text),
+                        profession=response_generator.profession,
+                        context_data=context,
+                    )
+                except Exception as _rag_err:
+                    logger.warning("interjection RAG answer failed: %s", _rag_err)
+                # Only intercept when we got a clean answer (not a JSON lead payload)
+                if _rag_answer and not _is_lead_json(_rag_answer):
+                    _pending_step = await response_generator._generate_state_response(
+                        flow_controller.state, "", conversation_history, context
+                    )
+                    _interject_reply = f"{_rag_answer}\n\n---\n\n{_pending_step}"
+                    logger.info(
+                        "interjection_detected state=%s interjection_answered_from_rag=True interjection_resumed_state=%s",
+                        flow_controller.state.value, flow_controller.state.value
+                    )
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": _interject_reply})
+                    await websocket.send_json({"type": "bot", "content": _interject_reply})
+                    continue
+                # No usable RAG answer → fall through to normal state-machine processing
 
             # Strict personal-info-first guard:
             # Once lead type is selected, enforce name -> email -> phone before
@@ -1453,6 +1588,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
+                        _integration = context.get("integration") or {}
+                        if _integration.get("googleReviewEnabled") and _integration.get("googleReviewUrl"):
+                            _review_url = str(_integration.get("googleReviewUrl") or "").strip()
+                            if _review_url:
+                                await websocket.send_json({
+                                    "type": "review_prompt",
+                                    "content": get_string("review_prompt", lang_code, _review_url),
+                                    "reviewUrl": _review_url,
+                                })
+                        await websocket.send_json({"type": "session_complete"})
                         widget_session_complete = True
                         if resume_key:
                             WIDGET_CHAT_RESUME.pop(resume_key, None)
@@ -2058,6 +2203,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
                 conversation_history.append({"role": "assistant", "content": final_msg})
+                await websocket.send_json({"type": "session_complete"})
                 widget_session_complete = True
                 if resume_key:
                     WIDGET_CHAT_RESUME.pop(resume_key, None)
@@ -2069,6 +2215,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 graceful_msg = get_string("final_fallback", lang_code)
                 conversation_history.append({"role": "assistant", "content": graceful_msg})
                 await websocket.send_json({"type": "bot", "content": graceful_msg})
+                await websocket.send_json({"type": "session_complete"})
                 widget_session_complete = True
                 if resume_key:
                     WIDGET_CHAT_RESUME.pop(resume_key, None)
@@ -2084,6 +2231,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "leadEmail": flow_controller.collected_data.get("leadEmail"),
                     "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
                     "leadTypeSwitchHistory": flow_controller.collected_data.get("leadTypeSwitchHistory"),
+                    "serviceSwitchHistory": flow_controller.collected_data.get("serviceSwitchHistory"),
                     "status": "in_progress"
                 }
                 if snapshot != last_snapshot:
