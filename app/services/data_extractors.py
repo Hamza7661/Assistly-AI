@@ -200,7 +200,6 @@ class DataExtractor:
             value = str(lt.get("value", "")).lower().strip()
  
             # Normalize both for better matching (remove punctuation, extra spaces)
-            import re
             text_normalized = re.sub(r'[^\w\s]', '', text)
             value_normalized = re.sub(r'[^\w\s]', '', value)
             user_input_normalized = re.sub(r'[^\w\s]', '', user_input_lower)
@@ -271,6 +270,120 @@ class DataExtractor:
             return best_match
         
         return None
+
+    @staticmethod
+    def _normalize_lead_match_phrase(s: str) -> str:
+        """Lowercase, strip punctuation/emoji noise, collapse whitespace — for strict equality only."""
+        t = (s or "").lower().strip()
+        t = re.sub(r"[^\w\s]", "", t)
+        return " ".join(t.split())
+
+    @staticmethod
+    def match_lead_type_strict(
+        user_input: str, lead_types: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        High-confidence lead-type match for mid-flow switches: exact synonym, exact
+        text/value, or normalized-exact against those. No substring containment,
+        word-overlap, or keyword scoring (avoids hijacking workflow answers).
+        """
+        if not user_input or not lead_types:
+            return None
+
+        user_input_lower = user_input.lower().strip()
+        user_stripped = user_input.strip()
+        user_norm = DataExtractor._normalize_lead_match_phrase(user_stripped)
+
+        # DB synonyms — exact or normalized-exact only
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            db_synonyms = lt.get("synonyms")
+            if not isinstance(db_synonyms, list):
+                continue
+            for syn in db_synonyms:
+                if not syn:
+                    continue
+                s = str(syn).strip()
+                if user_stripped == s or user_input_lower == s.lower():
+                    logger.info(
+                        "Strict matched lead type by DB synonym (exact): '%s' -> %s",
+                        user_stripped,
+                        lt.get("value"),
+                    )
+                    return lt
+                if user_norm and DataExtractor._normalize_lead_match_phrase(s) == user_norm:
+                    logger.info(
+                        "Strict matched lead type by DB synonym (normalized): '%s' -> %s",
+                        user_stripped,
+                        lt.get("value"),
+                    )
+                    return lt
+
+        # Fallback synonym map — exact or normalized-exact only
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            value = str(lt.get("value", "")).lower().strip()
+            text = str(lt.get("text", "")).lower().strip()
+            fallback = (
+                DataExtractor.LEAD_TYPE_SYNONYMS_FALLBACK.get(value)
+                or DataExtractor.LEAD_TYPE_SYNONYMS_FALLBACK.get(text)
+                or []
+            )
+            for syn in fallback:
+                syn_lower = str(syn).lower().strip()
+                if user_stripped == str(syn).strip() or user_input_lower == syn_lower:
+                    logger.info(
+                        "Strict matched lead type by fallback synonym (exact): -> %s",
+                        lt.get("value"),
+                    )
+                    return lt
+                if user_norm and DataExtractor._normalize_lead_match_phrase(str(syn)) == user_norm:
+                    logger.info(
+                        "Strict matched lead type by fallback synonym (normalized): -> %s",
+                        lt.get("value"),
+                    )
+                    return lt
+
+        # Exact text / value (display label or internal value)
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            text = str(lt.get("text", "")).lower().strip()
+            if text and text == user_input_lower:
+                logger.info("Strict matched lead type by exact text: %s", lt.get("text"))
+                return lt
+            value = str(lt.get("value", "")).lower().strip()
+            if value and value == user_input_lower:
+                logger.info("Strict matched lead type by exact value: %s", lt.get("value"))
+                return lt
+            if user_norm:
+                lt_text_raw = str(lt.get("text", "") or "")
+                lt_value_raw = str(lt.get("value", "") or "")
+                if lt_text_raw and DataExtractor._normalize_lead_match_phrase(lt_text_raw) == user_norm:
+                    logger.info("Strict matched lead type by normalized text: %s", lt.get("text"))
+                    return lt
+                if lt_value_raw and DataExtractor._normalize_lead_match_phrase(lt_value_raw) == user_norm:
+                    logger.info("Strict matched lead type by normalized value: %s", lt.get("value"))
+                    return lt
+
+        # Include configured emoji in label: compare "emoji + text" as shown on buttons
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            emoji = (lt.get("emoji") or "").strip()
+            base = str(lt.get("text", "") or lt.get("value", "") or "").strip()
+            if emoji and base:
+                combined = f"{emoji} {base}".strip()
+                if combined.lower() == user_input_lower:
+                    logger.info("Strict matched lead type by emoji+text: %s", lt.get("text"))
+                    return lt
+                if user_norm and DataExtractor._normalize_lead_match_phrase(combined) == user_norm:
+                    logger.info("Strict matched lead type by normalized emoji+text: %s", lt.get("text"))
+                    return lt
+
+        return None
     
     @staticmethod
     def match_service(user_input: str, services: List[Any]) -> Optional[str]:
@@ -280,7 +393,6 @@ class DataExtractor:
         
         user_input_lower = user_input.lower().strip()
         # Remove punctuation for better matching
-        import re
         user_input_normalized = re.sub(r'[^\w\s]', '', user_input_lower)
         
         # Common words to ignore

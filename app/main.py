@@ -28,6 +28,7 @@ from .services.calendar_service import CalendarService
 from .services.conversation_state import FlowController, ConversationState
 from .services.response_generator import ResponseGenerator
 from .services.data_extractors import DataExtractor
+from .services.lead_type_resolver import LeadTypeResolutionMode, resolve_lead_type
 from .utils.phone_utils import format_phone_number
 from .utils.language_utils import detect_language, get_language_name_for_prompt
 from .utils.response_strings import get_string
@@ -1241,27 +1242,25 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # If user selects a different lead type mid-flow, terminate current branch
             # (including calendar/workflow) and restart from the new lead type gracefully.
             lead_types_list = context.get("lead_types", [])
+            # Lead-type *switch* detection only when not in explicit lead-type selection
+            # (that path uses resolve_lead_type(..., LEAD_SELECTION) inside ResponseGenerator).
+            # MID_FLOW_SWITCH ignores plain digits and uses strict matching so workflow
+            # numeric answers are not mistaken for lead types.
             switched_lead_type = None
-            # IMPORTANT:
-            # - Numeric lead-type picks (1/2/3...) are only valid while user is in LEAD_TYPE_SELECTION.
-            # - Mid-flow override must be explicit lead-type text/button value to avoid hijacking
-            #   numeric workflow answers (e.g., selecting option "1" for a workflow question).
-            if (
-                flow_controller.state == ConversationState.LEAD_TYPE_SELECTION
-                and str(user_text).strip().isdigit()
-            ):
-                num = int(str(user_text).strip())
-                if 1 <= num <= len(lead_types_list):
-                    candidate = lead_types_list[num - 1]
-                    if isinstance(candidate, dict):
-                        switched_lead_type = candidate
-            if not switched_lead_type:
-                switched_lead_type = extractor.match_lead_type(str(user_text), lead_types_list)
+            if flow_controller.state != ConversationState.LEAD_TYPE_SELECTION:
+                switched_lead_type = resolve_lead_type(
+                    str(user_text), lead_types_list, LeadTypeResolutionMode.MID_FLOW_SWITCH
+                )
 
+            # Only treat as a mid-flow "switch" if we already had a lead type. Otherwise the
+            # first button/text selection (leadType still empty) wrongly hits this branch and
+            # resets the flow or logs a bogus switch from null.
+            _existing_lt = (flow_controller.collected_data.get("leadType") or "").strip()
             if (
                 switched_lead_type
+                and _existing_lt
                 and flow_controller.state != ConversationState.LEAD_TYPE_SELECTION
-                and (flow_controller.collected_data.get("leadType") or "").strip().lower()
+                and _existing_lt.lower()
                 != (switched_lead_type.get("value") or "").strip().lower()
             ):
                 previous_lead_type = flow_controller.collected_data.get("leadType")
