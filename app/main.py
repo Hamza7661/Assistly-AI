@@ -1107,8 +1107,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     calendar_pending_slot: Dict[str, Any] = {}
     user_timezone: str = "UTC"
 
-    # Build RAG vector store
-    rag_service.build_vector_store(context)
+    # Build RAG off the event loop so the client gets the first message(s) quickly.
+    # Blocking embeddings here previously stretched time-to-first-byte (~5s+), which
+    # triggered proxy/browser WebSocket closes (1006) before the greeting was sent.
+    rag_build_task = asyncio.create_task(
+        asyncio.to_thread(rag_service.build_vector_store, context)
+    )
 
     lead_id: Optional[str] = None
     last_snapshot: Dict[str, Any] = {}
@@ -1175,9 +1179,25 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
             conversation_history.append({"role": "assistant", "content": initial_reply})
             await websocket.send_json({"type": "bot", "content": initial_reply})
+    except WebSocketDisconnect:
+        logger.info(
+            "Client disconnected before/during initial WebSocket messages (user_id=%s)",
+            user_id,
+        )
     except Exception as greeting_exc:
         logger.exception("Failed to generate greeting: %s", greeting_exc)
-        await websocket.send_json({"type": "error", "content": "Failed to load greeting. Please try again."})
+        try:
+            await websocket.send_json(
+                {"type": "error", "content": "Failed to load greeting. Please try again."}
+            )
+        except Exception:
+            pass
+
+    # RAG must be ready before handling user turns (parallel with greeting/replay above).
+    try:
+        await rag_build_task
+    except Exception as rag_wait_exc:
+        logger.warning("RAG build task failed (non-fatal): %s", rag_wait_exc)
 
     try:
         while True:
