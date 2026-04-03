@@ -207,7 +207,7 @@ class WorkflowManager:
         """
         qtid = question.get("questionTypeId")
         try:
-            if int(qtid) == 2:
+            if int(float(qtid)) == 2:
                 return True
         except (TypeError, ValueError):
             pass

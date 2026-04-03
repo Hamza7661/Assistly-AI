@@ -550,19 +550,37 @@ Classify the intent:"""
                 logger.error(f"Error in OTP intent classification: {e}")
                 # Continue to normal flow if classification fails
         
+        # Lead-type menu (non-conversational): never treat input as an FAQ "question".
+        # The LLM classifier often marks button labels as questions; RAG then repeats the custom greeting.
+        lead_type_probe = None
+        if state == ConversationState.LEAD_TYPE_SELECTION:
+            _lts = context.get("lead_types") or []
+            lead_type_probe = resolve_lead_type(
+                user_message, _lts, LeadTypeResolutionMode.LEAD_SELECTION
+            )
+
         # Classify user intent (question detection using LLM)
-        try:
-            intent = await self._classify_intent(user_message)
-            has_question = intent.get("is_question", False)
-            question_type = intent.get("question_type", "not_question")
-            
-            logger.debug(f"Intent classification: is_question={has_question}, type={question_type}, confidence={intent.get('confidence', 0.0)}")
-        except Exception as e:
-            # If intent classification fails, log error and assume it's not a question
-            # This allows the flow to continue even if classification fails
-            logger.error(f"Intent classification failed: {e}, treating as non-question")
+        if state == ConversationState.LEAD_TYPE_SELECTION and not conversation_style_enabled:
             has_question = False
             question_type = "not_question"
+        elif lead_type_probe:
+            has_question = False
+            question_type = "not_question"
+        else:
+            try:
+                intent = await self._classify_intent(user_message)
+                has_question = intent.get("is_question", False)
+                question_type = intent.get("question_type", "not_question")
+
+                logger.debug(
+                    f"Intent classification: is_question={has_question}, type={question_type}, "
+                    f"confidence={intent.get('confidence', 0.0)}"
+                )
+            except Exception as e:
+                # If intent classification fails, log error and assume it's not a question
+                logger.error(f"Intent classification failed: {e}, treating as non-question")
+                has_question = False
+                question_type = "not_question"
 
         app_industry = str((context.get("app") or {}).get("industry") or "").strip()
 

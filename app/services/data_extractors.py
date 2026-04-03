@@ -144,6 +144,18 @@ class DataExtractor:
         return s.strip()
 
     @staticmethod
+    def _text_after_leading_emoji(s: str) -> str:
+        """First letter/digit onward (skips leading emoji/punctuation/spaces). Helps widget label vs DB emoji drift."""
+        if not s:
+            return ""
+        i = 0
+        while i < len(s):
+            if s[i].isalnum():
+                break
+            i += 1
+        return s[i:].strip()
+
+    @staticmethod
     def match_lead_type(user_input: str, lead_types: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Match user input to a lead type. Uses per-app synonyms from DB first; fallback map only for current lead types."""
         user_stripped = DataExtractor.normalize_lead_type_user_input(user_input)
@@ -151,6 +163,22 @@ class DataExtractor:
             return None
 
         user_input_lower = user_stripped.lower()
+
+        # Pass 0.5: same as button label but leading emoji/symbols differ from stored combined label
+        alt_user = DataExtractor._text_after_leading_emoji(user_stripped)
+        if alt_user and alt_user.lower() != user_input_lower:
+            alt_lower = alt_user.lower()
+            for lt in lead_types:
+                if not isinstance(lt, dict):
+                    continue
+                text = str(lt.get("text", "") or "").strip()
+                if text and text.lower() == alt_lower:
+                    logger.info("Matched lead type by text after leading symbols: %s", lt.get("value"))
+                    return lt
+                value = str(lt.get("value", "") or "").strip()
+                if value and value.lower() == alt_lower:
+                    logger.info("Matched lead type by value after leading symbols: %s", lt.get("value"))
+                    return lt
 
         # Pass 0: exact match to label as shown on web buttons (emoji + text from integration)
         for lt in lead_types:
