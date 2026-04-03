@@ -13,7 +13,9 @@ langchain-openai
 langchain-community
 langchain-text-splitters
 langchain-classic
-chromadb
+# Pin below 0.5: newer chromadb uses Rust bindings that break langchain_community.Chroma on Linux/Render
+# ("RustBindingsAPI has no attribute bindings", "ephemeral").
+chromadb==0.4.24
 tiktoken
 websockets
 deepgram-sdk
