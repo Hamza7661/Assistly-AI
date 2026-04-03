@@ -6,6 +6,7 @@ import json
 
 from app.services.conversation_state import FlowController, ConversationState
 from app.services.data_extractors import DataExtractor
+from app.services.lead_type_resolver import LeadTypeResolutionMode, resolve_lead_type
 from app.services.validators import Validator
 from app.services.workflow_manager import WorkflowManager
 
@@ -421,6 +422,11 @@ Classify the intent:"""
     ) -> str:
         """Generate response based on current state"""
         state = flow_controller.state
+        # Resume blobs may omit `state`; FlowController then stays on default GREETING even
+        # though the user already saw the greeting and should be picking a lead type.
+        if state == ConversationState.GREETING:
+            flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+            state = flow_controller.state
         conversation_style_enabled = self._conversation_style_enabled(context) and self.channel != "voice"
         extractor = DataExtractor()
         validator = Validator()
@@ -565,23 +571,20 @@ Classify the intent:"""
         # Handle data collection states - extract and validate before AI generation
         if state == ConversationState.LEAD_TYPE_SELECTION:
             lead_types_list = context.get("lead_types", [])
-            lead_type = None
-            # Numeric selection (same as WhatsApp): "1", "2", "3" = first, second, third option in displayed list
-            if user_message.strip().isdigit():
-                num = int(user_message.strip())
-                if 1 <= num <= len(lead_types_list):
-                    lead_type = lead_types_list[num - 1] if isinstance(lead_types_list[num - 1], dict) else None
-                    if lead_type:
-                        logger.info(f"Matched lead type by number #{num}: {lead_type.get('text')} (value: {lead_type.get('value')})")
-            if not lead_type:
-                lead_type = extractor.match_lead_type(user_message, lead_types_list)
+            lead_type = resolve_lead_type(
+                user_message, lead_types_list, LeadTypeResolutionMode.LEAD_SELECTION
+            )
             # If no match (e.g. user wrote in Urdu/other language), translate to English and retry
             if not lead_type and self.client and self.model and user_message.strip():
                 from ..utils.translation_utils import translate_to_english
                 try:
                     translated = await translate_to_english(self.client, self.model, user_message)
                     if translated and translated.strip().lower() != user_message.strip().lower():
-                        lead_type = extractor.match_lead_type(translated.strip(), lead_types_list)
+                        lead_type = resolve_lead_type(
+                            translated.strip(),
+                            lead_types_list,
+                            LeadTypeResolutionMode.LEAD_SELECTION,
+                        )
                 except Exception as e:
                     logger.debug("Translate-to-English for lead type match failed: %s", e)
             if lead_type:
