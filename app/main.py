@@ -1193,11 +1193,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         except Exception:
             pass
 
-    # RAG must be ready before handling user turns (parallel with greeting/replay above).
-    try:
-        await rag_build_task
-    except Exception as rag_wait_exc:
-        logger.warning("RAG build task failed (non-fatal): %s", rag_wait_exc)
+    # Lazily await RAG on first user turn so the receive loop can run while embeddings
+    # finish (important for skip_history_replay: client may send immediately with no prior bot frame).
+    rag_ready = False
+
+    async def ensure_rag_ready() -> None:
+        nonlocal rag_ready
+        if rag_ready:
+            return
+        try:
+            await rag_build_task
+        except Exception as rag_wait_exc:
+            logger.warning("RAG build task failed (non-fatal): %s", rag_wait_exc)
+        rag_ready = True
 
     try:
         while True:
@@ -1254,6 +1262,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         # Workflow done – move state forward (ConversationState is imported at top of module)
                         flow_controller.collected_data["workflowAnswers"] = wm.get_workflow_answers()
                         flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        await ensure_rag_ready()
                         next_reply = await response_generator.generate_response(
                             flow_controller, "[File uploaded]", conversation_history, context
                         )
@@ -1266,6 +1275,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
+
+            await ensure_rag_ready()
 
             # Bad or partial resume blobs may leave state on default GREETING while the client
             # already showed the greeting. The next user action is lead-type selection — not a
@@ -2211,8 +2222,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     WIDGET_CHAT_RESUME.pop(resume_key, None)
                 continue
             
-            # Regular conversation response
-            # Progressive lead updates while conversation is in progress.
+            # Regular conversation response — send the bot reply before PATCHing the lead so
+            # the client is not left idle during slow HTTP to the CRM API (avoids 1006 / user bounce).
+            conversation_history.append({"role": "assistant", "content": reply})
+            try:
+                await websocket.send_json({"type": "bot", "content": reply})
+                if _bot_requests_file_upload(reply):
+                    await websocket.send_json({"type": "enable_file_upload"})
+            except WebSocketDisconnect:
+                raise
+            except RuntimeError as send_exc:
+                if "send" in str(send_exc).lower() and "close" in str(send_exc).lower():
+                    logger.info(
+                        "Client socket closed before bot reply could be sent (user_id=%s)",
+                        user_id,
+                    )
+                    raise WebSocketDisconnect from send_exc
+                raise
+            # Progressive lead sync after the user-visible message
             if lead_id:
                 snapshot = {
                     "leadType": flow_controller.collected_data.get("leadType"),
@@ -2229,11 +2256,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         last_snapshot = dict(snapshot)
                     except Exception as sync_exc:
                         logger.warning("Lead progressive update failed: %s", sync_exc)
-            conversation_history.append({"role": "assistant", "content": reply})
-            await websocket.send_json({"type": "bot", "content": reply})
-            # Signal the frontend to show the file upload button if the bot is requesting a file
-            if _bot_requests_file_upload(reply):
-                await websocket.send_json({"type": "enable_file_upload"})
             
             # State transitions are handled in response_generator
             # Only update if we're still in the same state (no transition happened)
