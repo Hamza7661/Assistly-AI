@@ -152,7 +152,9 @@ class ResponseGenerator:
             if not isinstance(lt, dict):
                 continue
             if (lt.get("value") or "").strip().lower() == lead_value:
-                lead_text = (lt.get("text") or lt.get("value") or "").strip()
+                base = (lt.get("text") or lt.get("value") or "").strip()
+                emoji = str(lt.get("emoji") or "").strip()
+                lead_text = f"{emoji} {base}".strip() if emoji else base
                 break
         label = lead_text or (lead_type_value or "your request")
         fallback = f"Great choice - I am here to help with {label}."

@@ -180,6 +180,32 @@ _LEAD_TYPE_SWITCH_ALLOWED_STATES = frozenset(
     )
 )
 
+
+def _lead_type_display_label_from_dict(lt: Optional[Dict[str, Any]]) -> str:
+    """Human label for chat (emoji + text), same as widget lead-type buttons."""
+    if not lt or not isinstance(lt, dict):
+        return ""
+    text = str(lt.get("text") or lt.get("value") or "").strip()
+    emoji = str(lt.get("emoji") or "").strip()
+    if emoji and text:
+        return f"{emoji} {text}".strip()
+    return text or str(lt.get("value") or "").strip()
+
+
+def _lead_type_display_label_from_value(value: Any, lead_types: List[Dict[str, Any]]) -> str:
+    """Resolve stored leadType slug to the same display string as the menu."""
+    v = str(value or "").strip().lower()
+    if not v:
+        return ""
+    for lt in lead_types:
+        if not isinstance(lt, dict):
+            continue
+        lv = str(lt.get("value") or "").strip().lower()
+        if lv == v:
+            return _lead_type_display_label_from_dict(lt) or str(value or "").strip()
+    return str(value or "").strip()
+
+
 # Voice agent sessions
 voice_agent_service = VoiceAgentService(settings)
 
@@ -1388,19 +1414,36 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     else:
                         flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
 
-                # Polished switch confirmation using empathy prefix
+                # Polished switch confirmation: show full button-style labels (emoji + text) and from → to
+                _new_label = _lead_type_display_label_from_dict(switched_lead_type)
+                if not _new_label:
+                    _new_label = (
+                        switched_lead_type.get("text")
+                        or switched_lead_type.get("value")
+                        or "this option"
+                    )
+                _prev_label = _lead_type_display_label_from_value(previous_lead_type, lead_types_list)
+                _prev_val = str(previous_lead_type or "").strip().lower()
+                _new_val = str(switched_lead_type.get("value") or "").strip().lower()
                 try:
                     _lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
                         switched_lead_type.get("value"), context.get("lead_types", [])
                     )
                 except Exception:
                     _lt_empathy = ""
-                _lt_label = switched_lead_type.get("text") or switched_lead_type.get("value") or "the new option"
-                switch_msg = (
-                    f"{_lt_empathy} I've updated your request to **{_lt_label}**."
-                    if _lt_empathy
-                    else f"Got it — switched to **{_lt_label}**."
-                )
+                _lt_empathy = (_lt_empathy or "").strip()
+                if _prev_label and _prev_val and _prev_val != _new_val:
+                    switch_msg = (
+                        f"{_lt_empathy} I've switched you from **{_prev_label}** to **{_new_label}**."
+                        if _lt_empathy
+                        else f"Got it — switching from **{_prev_label}** to **{_new_label}**."
+                    )
+                else:
+                    switch_msg = (
+                        f"{_lt_empathy} I've updated your request to **{_new_label}**."
+                        if _lt_empathy
+                        else f"Got it — switched to **{_new_label}**."
+                    )
                 next_prompt = await response_generator._generate_state_response(
                     flow_controller.state, "", conversation_history, context
                 )
@@ -1615,6 +1658,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
+                        # Widget: marks flow complete after booking confirmation message (client resets on close/reload).
                         await websocket.send_json({"type": "session_complete"})
                         widget_session_complete = True
                         if resume_key:
@@ -2221,6 +2265,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
                 conversation_history.append({"role": "assistant", "content": final_msg})
+                # Non-booking path: all required data collected (e.g. workflow done); widget resets on close/reload.
                 await websocket.send_json({"type": "session_complete"})
                 widget_session_complete = True
                 if resume_key:
