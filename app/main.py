@@ -183,6 +183,22 @@ _LEAD_TYPE_SWITCH_ALLOWED_STATES = frozenset(
 # Voice agent sessions
 voice_agent_service = VoiceAgentService(settings)
 
+
+def _integration_google_review_url(integration: Any) -> Optional[str]:
+    """Return Google review URL when enabled; tolerates string booleans from APIs."""
+    if not isinstance(integration, dict):
+        return None
+    raw_en = integration.get("googleReviewEnabled")
+    if isinstance(raw_en, str):
+        enabled = raw_en.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        enabled = bool(raw_en)
+    if not enabled:
+        return None
+    url = str(integration.get("googleReviewUrl") or "").strip()
+    return url or None
+
+
 def get_or_create_session(user_phone: str) -> tuple[str, bool]:
     """Get existing session or create new one. Returns (session_id, is_new)"""
     current_time = time.time()
@@ -1551,6 +1567,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
                         if _post_booking_note_chat:
                             reply += f"\n\n📋 **Important Instructions**\n{_post_booking_note_chat}"
+                        _review_url_inline = _integration_google_review_url(integration)
+                        if _review_url_inline:
+                            reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
                         # Booking confirmation is the terminal step for this lead cycle.
                         try:
                             if lead_id:
@@ -1589,15 +1608,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
-                        _integration = context.get("integration") or {}
-                        if _integration.get("googleReviewEnabled") and _integration.get("googleReviewUrl"):
-                            _review_url = str(_integration.get("googleReviewUrl") or "").strip()
-                            if _review_url:
-                                await websocket.send_json({
-                                    "type": "review_prompt",
-                                    "content": get_string("review_prompt", lang_code, _review_url),
-                                    "reviewUrl": _review_url,
-                                })
                         await websocket.send_json({"type": "session_complete"})
                         widget_session_complete = True
                         if resume_key:
