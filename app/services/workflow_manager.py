@@ -198,6 +198,21 @@ class WorkflowManager:
             return None
         
         return f"{base}/chatbot-workflows/apps/{app_id}/{question_id}/attachment"
+
+    def _use_checkbox_input(self, question: Dict[str, Any]) -> bool:
+        """
+        True when the chat should show multi-select checkboxes (not tap buttons).
+        Seeded QuestionType id 2 is multiple_choice; those always use checkboxes so
+        legacy rows saved with choiceInputMode=button still render correctly.
+        """
+        qtid = question.get("questionTypeId")
+        try:
+            if int(qtid) == 2:
+                return True
+        except (TypeError, ValueError):
+            pass
+        mode = str(question.get("choiceInputMode") or "").strip().lower()
+        return mode == "checkbox"
     
     def format_question_with_options(self, question: Dict[str, Any]) -> str:
         """
@@ -221,11 +236,11 @@ class WorkflowManager:
         # Add option controls (disabled in conversational mode)
         if options and not self._conversation_style_enabled():
             sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
-            input_mode = str(question.get("choiceInputMode") or "button").strip().lower()
+            use_checkbox = self._use_checkbox_input(question)
             for opt in sorted_opts:
                 opt_text = opt.get("text", "").strip()
                 if opt_text:
-                    if input_mode == "checkbox":
+                    if use_checkbox:
                         parts.append(f'<checkbox value="{opt_text}">{opt_text}</checkbox>')
                     else:
                         parts.append(f"<button>{opt_text}</button>")

@@ -1018,6 +1018,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     resume_key = (websocket.query_params.get("resume") or "").strip()
     widget_session_complete = False
+    skip_history_replay = (websocket.query_params.get("skip_history_replay") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
     app_id: Optional[str] = websocket.query_params.get("app_id")
     user_id: Optional[str] = websocket.query_params.get("user_id")
@@ -1138,9 +1143,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         except Exception as lead_exc:
             logger.warning("WebSocket interaction lead creation failed: %s", lead_exc)
 
-    # Greeting for new sessions; resumed sessions replay transcript from snapshot
+    # Greeting for new sessions; resumed sessions replay transcript unless the client
+    # already has the thread (sessionStorage) and passes skip_history_replay=1.
     try:
-        if restored:
+        if restored and not skip_history_replay:
             for turn in conversation_history[-50:]:
                 role = turn.get("role")
                 content = str(turn.get("content") or "")
@@ -1150,6 +1156,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "bot", "content": content})
                 elif role == "user":
                     await websocket.send_json({"type": "user_replay", "content": content})
+        elif restored and skip_history_replay:
+            logger.info("WebSocket resume: skip_history_replay=1, not re-sending transcript")
         else:
             initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
             conversation_history.append({"role": "assistant", "content": initial_reply})
@@ -1321,69 +1329,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
                 continue
-
-            # ── Service-type switch interrupt ─────────────────────────────────────────
-            # Detects when user selects a different service while one is already active
-            # mid-flow (WORKFLOW_QUESTION / booking / calendar). Resets that branch
-            # cleanly and records the switch in serviceSwitchHistory.
-            _svc_switch_states = {
-                ConversationState.WORKFLOW_QUESTION,
-                ConversationState.APPOINTMENT_OFFER,
-                ConversationState.CALENDAR_BOOKING,
-                ConversationState.APPOINTMENT_CONFIRMATION,
-            }
-            _svc_pool = context.get("service_plans", []) or context.get("treatment_plans", [])
-            if (
-                _svc_pool
-                and flow_controller.collected_data.get("serviceType")
-                and flow_controller.state in _svc_switch_states
-            ):
-                _matched_svc = extractor.match_service(str(user_text), _svc_pool)
-                if (
-                    _matched_svc
-                    and _matched_svc.strip().lower()
-                    != (flow_controller.collected_data.get("serviceType") or "").strip().lower()
-                ):
-                    _prev_svc = flow_controller.collected_data.get("serviceType")
-                    # Clear all calendar state
-                    calendar_flow = None
-                    calendar_days = []
-                    calendar_slots = []
-                    calendar_free_slots = []
-                    calendar_selected_day = None
-                    calendar_pending_slot = {}
-                    # Reset workflow/booking data
-                    if flow_controller.workflow_manager:
-                        flow_controller.workflow_manager.reset()
-                    flow_controller.update_collected_data("serviceType", _matched_svc)
-                    flow_controller.update_collected_data("workflowAnswers", {})
-                    flow_controller.update_collected_data("appointmentSlot", None)
-                    # Record service switch history
-                    _existing_svc_hist = flow_controller.collected_data.get("serviceSwitchHistory") or []
-                    _svc_hist = list(_existing_svc_hist) if isinstance(_existing_svc_hist, list) else []
-                    _svc_hist.append({
-                        "from": _prev_svc,
-                        "to": _matched_svc,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    flow_controller.update_collected_data("serviceSwitchHistory", _svc_hist)
-                    # Transition to the first question of the new service
-                    flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
-                    _svc_switch_next = await response_generator._generate_state_response(
-                        flow_controller.state, "", conversation_history, context
-                    )
-                    _svc_reply = (
-                        f"Of course! I've switched you over to **{_matched_svc}**. "
-                        f"Let me continue from there.\n\n{_svc_switch_next}"
-                    )
-                    conversation_history.append({"role": "user", "content": user_text})
-                    conversation_history.append({"role": "assistant", "content": _svc_reply})
-                    await websocket.send_json({"type": "bot", "content": _svc_reply})
-                    logger.info(
-                        "service_switch from=%s to=%s state=%s",
-                        _prev_svc, _matched_svc, flow_controller.state.value
-                    )
-                    continue
 
             # ── Side-question interjection ─────────────────────────────────────────────
             # When a required step is pending and the user asks an in-industry question,
@@ -2231,7 +2176,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "leadEmail": flow_controller.collected_data.get("leadEmail"),
                     "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
                     "leadTypeSwitchHistory": flow_controller.collected_data.get("leadTypeSwitchHistory"),
-                    "serviceSwitchHistory": flow_controller.collected_data.get("serviceSwitchHistory"),
                     "status": "in_progress"
                 }
                 if snapshot != last_snapshot:
