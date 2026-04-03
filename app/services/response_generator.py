@@ -413,6 +413,49 @@ Classify the intent:"""
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse JSON response from LLM for OTP intent: {e}, content: {content}")
     
+    def _deterministic_lead_type_reprompt(self, context: Dict[str, Any]) -> str:
+        """
+        Short line + same <button> labels as the greeting. Avoids the LLM re-printing
+        the entire custom greeting when a click/tap failed fuzzy matching.
+        """
+        lead_types = context.get("lead_types") or []
+        parts: List[str] = []
+        for lt in lead_types:
+            if isinstance(lt, dict):
+                text = str(lt.get("text") or lt.get("value") or "").strip()
+                emoji = str(lt.get("emoji") or "").strip()
+                label = f"{emoji} {text}".strip() if emoji else text
+                if label:
+                    parts.append(f"<button>{label}</button>")
+        joined = " ".join(parts)
+        if not joined.strip():
+            return "Please reply with the number of your choice (1, 2, 3…) or tap an option again."
+        return (
+            "Please choose one of these options so we can continue. "
+            f"{joined}"
+        )
+
+    def _deterministic_lead_type_reprompt_conversation(self, context: Dict[str, Any]) -> str:
+        """Conversational mode: no <button> tags; list labels in plain language."""
+        lead_types = context.get("lead_types") or []
+        labels: List[str] = []
+        for lt in lead_types:
+            if isinstance(lt, dict):
+                text = str(lt.get("text") or lt.get("value") or "").strip()
+                emoji = str(lt.get("emoji") or "").strip()
+                label = f"{emoji} {text}".strip() if emoji else text
+                if label:
+                    labels.append(label)
+        if not labels:
+            return "Could you tell me briefly what you need—booking, feedback, or general information?"
+        if len(labels) == 1:
+            opts = labels[0]
+        elif len(labels) == 2:
+            opts = f"{labels[0]} or {labels[1]}"
+        else:
+            opts = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+        return f"Which do you mean—{opts}?"
+
     async def generate_response(
         self,
         flow_controller: FlowController,
@@ -740,14 +783,26 @@ Classify the intent:"""
                         )
             else:
                 logger.warning(f"No lead type matched for user input: '{user_message}'. Available lead types: {[lt.get('text') for lt in context.get('lead_types', [])]}")
-                # No match found: in conversational mode, keep asking for lead-type collection
+                # No match: avoid LLM _generate_state_response here — it often repeats the full custom greeting.
                 if conversation_style_enabled:
                     answer = await _answer_if_relevant_question(user_message)
-                    next_prompt = await self._generate_state_response(state, "", conversation_history, context)
+                    next_prompt = self._deterministic_lead_type_reprompt_conversation(context)
                     return f"{answer}\n\n{next_prompt}" if answer else next_prompt
-                # Otherwise, allow RAG to answer questions while staying in the lead-type phase.
-                rag_context = await self._get_rag_context(user_message if has_question else "lead type selection", context, is_question=has_question)
-                return await self._generate_state_response(state, rag_context, conversation_history, context)
+                if has_question and self.client:
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                    try:
+                        qa = await self._generate_question_response(
+                            user_message, rag_context or "", conversation_history, context
+                        )
+                        if qa and self.channel != "voice":
+                            return f"{qa}\n\n{self._deterministic_lead_type_reprompt(context)}"
+                        if qa:
+                            return f"{qa}\n\nPlease say which option you want, or reply with a number."
+                    except Exception as e:
+                        logger.warning("Lead-type phase: question response failed: %s", e)
+                if self.channel != "voice":
+                    return self._deterministic_lead_type_reprompt(context)
+                return await self._generate_state_response(state, "", conversation_history, context)
         
         if state == ConversationState.SERVICE_SELECTION:
             service_plans = context.get("service_plans", [])
