@@ -1191,6 +1191,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "user_replay", "content": content})
         elif restored and skip_history_replay:
             logger.info("WebSocket resume: skip_history_replay=1, not re-sending transcript")
+        elif (not restored) and skip_history_replay:
+            # Client still has the thread in sessionStorage (skip flag) but this worker has no
+            # resume blob (TTL, cold start, or new resume id). Sending greeting again duplicates UI.
+            logger.info(
+                "WebSocket: skip_history_replay=1 without server resume — skipping greeting "
+                "(client already showing transcript)"
+            )
         else:
             initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
             conversation_history.append({"role": "assistant", "content": initial_reply})
