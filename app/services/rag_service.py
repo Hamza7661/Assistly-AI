@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 import logging
 import json
+import tempfile
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -206,23 +207,17 @@ class RAGService:
             
             logger.info(f"Split {len(documents)} documents into {len(splits)} chunks")
             
-            # Use persist_directory from settings if not provided
+            # Chroma ephemeral default breaks on some pydantic/chromadb combos
+            # ("chroma_db_impl" / Rust client). Always use a directory (explicit or temp).
             persist_dir = persist_directory or self.rag_persist_directory
-            
-            # Create vector store (in-memory by default, or persistent if directory provided)
-            if persist_dir:
-                self.vector_store = Chroma.from_documents(
-                    documents=splits,
-                    embedding=self.embeddings,
-                    persist_directory=persist_dir
-                )
-                logger.info(f"Created persistent vector store at {persist_dir}")
-            else:
-                self.vector_store = Chroma.from_documents(
-                    documents=splits,
-                    embedding=self.embeddings
-                )
-                logger.info("Created in-memory vector store")
+            if not persist_dir:
+                persist_dir = tempfile.mkdtemp(prefix="assistly_chroma_")
+            self.vector_store = Chroma.from_documents(
+                documents=splits,
+                embedding=self.embeddings,
+                persist_directory=persist_dir,
+            )
+            logger.info("Created vector store at %s", persist_dir)
             
             # Create retriever with configured k value
             self.retriever = self.vector_store.as_retriever(

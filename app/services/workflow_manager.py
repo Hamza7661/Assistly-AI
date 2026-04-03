@@ -202,17 +202,22 @@ class WorkflowManager:
     def _use_checkbox_input(self, question: Dict[str, Any]) -> bool:
         """
         True when the chat should show multi-select checkboxes (not tap buttons).
-        Seeded QuestionType id 2 is multiple_choice; those always use checkboxes so
-        legacy rows saved with choiceInputMode=button still render correctly.
+        Prefer questionTypeCode from context (multiple_choice); do not assume id==2,
+        since QuestionType ids are database-defined.
         """
+        code = str(question.get("questionTypeCode") or "").strip().lower()
+        if code == "multiple_choice":
+            return True
+        mode = str(question.get("choiceInputMode") or "").strip().lower()
+        if mode == "checkbox":
+            return True
         qtid = question.get("questionTypeId")
         try:
             if int(float(qtid)) == 2:
                 return True
         except (TypeError, ValueError):
             pass
-        mode = str(question.get("choiceInputMode") or "").strip().lower()
-        return mode == "checkbox"
+        return False
     
     def format_question_with_options(self, question: Dict[str, Any]) -> str:
         """
