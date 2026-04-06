@@ -208,12 +208,16 @@ class WorkflowManager:
         code = str(question.get("questionTypeCode") or "").strip().lower()
         if code == "multiple_choice":
             return True
+        if code == "single_choice":
+            return False
         mode = str(question.get("choiceInputMode") or "").strip().lower()
         if mode == "checkbox":
             return True
         qtid = question.get("questionTypeId")
         try:
-            if int(float(qtid)) == 2:
+            # Legacy fallback only when code is missing.
+            # In default seed data, id=3 is multiple_choice and id=2 is single_choice.
+            if int(float(qtid)) == 3:
                 return True
         except (TypeError, ValueError):
             pass
