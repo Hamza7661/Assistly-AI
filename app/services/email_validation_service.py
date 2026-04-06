@@ -93,7 +93,8 @@ class EmailValidationService:
 
         payload = {
             "email": email,
-            "htmlTemplate": html_template
+            "htmlTemplate": html_template,
+            "customerName": customer_name,
         }
         if resolved_app_id:
             payload["appId"] = resolved_app_id
