@@ -1417,7 +1417,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     else:
                         # Workflow done – move state forward (ConversationState is imported at top of module)
                         flow_controller.collected_data["workflowAnswers"] = wm.get_workflow_answers()
-                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        # Respect capture flags (name/email/phone) when leaving workflow.
+                        flow_controller.transition_to(flow_controller.get_next_state())
                         await ensure_rag_ready()
                         next_reply = await response_generator.generate_response(
                             flow_controller, "[File uploaded]", conversation_history, context
@@ -1555,12 +1556,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 flow_controller.update_collected_data("leadTypeSwitchHistory", switch_history)
 
                 # Keep already collected name; continue from the right next step
-                if not flow_controller.collected_data.get("leadName"):
+                if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
                     flow_controller.transition_to(ConversationState.NAME_COLLECTION)
-                elif not flow_controller.collected_data.get("leadEmail"):
+                elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
                 elif (
-                    not flow_controller.skip_phone_collection
+                    flow_controller.capture_lead_phone
+                    and not flow_controller.skip_phone_collection
                     and not flow_controller.collected_data.get("leadPhoneNumber")
                 ):
                     flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -1678,12 +1680,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 ConversationState.APPOINTMENT_CONFIRMATION,
             ):
                 target_state = None
-                if not flow_controller.collected_data.get("leadName"):
+                if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
                     target_state = ConversationState.NAME_COLLECTION
-                elif not flow_controller.collected_data.get("leadEmail"):
+                elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
                     target_state = ConversationState.EMAIL_COLLECTION
                 elif (
-                    not flow_controller.skip_phone_collection
+                    flow_controller.capture_lead_phone
+                    and not flow_controller.skip_phone_collection
                     and not flow_controller.collected_data.get("leadPhoneNumber")
                 ):
                     target_state = ConversationState.PHONE_COLLECTION
