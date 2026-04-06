@@ -1067,6 +1067,48 @@ Classify the intent:"""
                 return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
         
         if state == ConversationState.WORKFLOW_QUESTION:
+            # Non-booking paths can reach WORKFLOW_QUESTION after personal info collection
+            # without passing through SERVICE_SELECTION. In that case, honor lead-type rules
+            # by resolving services first, then start the attached workflow.
+            if not flow_controller.collected_data.get("serviceType"):
+                service_plans = context.get("service_plans", [])
+                lead_types = context.get("lead_types", [])
+                collected_lead_type = flow_controller.collected_data.get("leadType")
+                filtered_names = self._filter_services_by_lead_type(
+                    service_plans, lead_types, collected_lead_type
+                )
+                if filtered_names is not None:
+                    all_service_options = filtered_names
+                else:
+                    all_service_options = []
+                    for plan in service_plans:
+                        if isinstance(plan, dict):
+                            plan_name = plan.get("question", plan.get("name", plan.get("title", "")))
+                            if plan_name:
+                                all_service_options.append(plan_name)
+                        else:
+                            all_service_options.append(str(plan))
+
+                if len(all_service_options) == 1:
+                    single_service = all_service_options[0]
+                    flow_controller.update_collected_data("serviceType", single_service)
+                    if workflow_manager.start_workflow_for_service(single_service):
+                        current_question = workflow_manager.get_current_question()
+                        if current_question:
+                            return workflow_manager.format_question_with_options(current_question) or ""
+                        workflow_manager.reset()
+                    logger.info(
+                        "WORKFLOW_QUESTION reached without active workflow; auto-selected single service '%s' but no workflow started",
+                        single_service,
+                    )
+                elif len(all_service_options) > 1:
+                    flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                    return await self._generate_service_selection_response(
+                        conversation_history,
+                        context,
+                        collected_lead_type=collected_lead_type,
+                    )
+
             # Graceful switch: if user selects another service while in workflow, restart service flow.
             service_plans = context.get("service_plans", [])
             all_services = []
@@ -1128,8 +1170,6 @@ Classify the intent:"""
                     workflow_manager.reset()
                     flow_controller.transition_to(flow_controller.get_next_state())
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                    if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
-                        flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
                     if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                         return "BOOK_APPOINTMENT_REQUESTED"
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
@@ -1139,8 +1179,6 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
-                    flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
                 if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                     return "BOOK_APPOINTMENT_REQUESTED"
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
