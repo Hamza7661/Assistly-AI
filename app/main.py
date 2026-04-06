@@ -1689,30 +1689,39 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 and not calendar_flow  # calendar flow has its own dedicated handler
                 and _looks_like_question(str(user_text))
             ):
-                _rag_answer: Optional[str] = None
-                try:
-                    _rag_answer = await rag_service.answer_faq_question(
-                        str(user_text),
-                        profession=response_generator.profession,
-                        context_data=context,
-                    )
-                except Exception as _rag_err:
-                    logger.warning("interjection RAG answer failed: %s", _rag_err)
-                # Only intercept when we got a clean answer (not a JSON lead payload)
-                if _rag_answer and not _looks_like_internal_lead_payload(_rag_answer):
-                    _pending_step = await response_generator._generate_state_response(
-                        flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
-                    )
-                    _interject_reply = f"{_rag_answer}\n\n---\n\n{_pending_step}"
+                # Booking-intent interjections should route to calendar flow directly
+                # instead of generic FAQ text + redirection.
+                if _is_availability_intent(str(user_text)):
+                    flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
                     logger.info(
-                        "interjection_detected state=%s interjection_answered_from_rag=True interjection_resumed_state=%s",
-                        flow_controller.state.value, flow_controller.state.value
+                        "interjection_detected booking_intent=True routing_to_calendar state=%s",
+                        flow_controller.state.value,
                     )
-                    conversation_history.append({"role": "user", "content": user_text})
-                    conversation_history.append({"role": "assistant", "content": _interject_reply})
-                    await websocket.send_json({"type": "bot", "content": _interject_reply})
-                    continue
-                # No usable RAG answer → fall through to normal state-machine processing
+                else:
+                    _rag_answer: Optional[str] = None
+                    try:
+                        _rag_answer = await rag_service.answer_faq_question(
+                            str(user_text),
+                            profession=response_generator.profession,
+                            context_data=context,
+                        )
+                    except Exception as _rag_err:
+                        logger.warning("interjection RAG answer failed: %s", _rag_err)
+                    # Only intercept when we got a clean answer (not a JSON lead payload)
+                    if _rag_answer and not _looks_like_internal_lead_payload(_rag_answer):
+                        _pending_step = await response_generator._generate_state_response(
+                            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                        )
+                        _interject_reply = f"{_rag_answer}\n\n---\n\n{_pending_step}"
+                        logger.info(
+                            "interjection_detected state=%s interjection_answered_from_rag=True interjection_resumed_state=%s",
+                            flow_controller.state.value, flow_controller.state.value
+                        )
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": _interject_reply})
+                        await websocket.send_json({"type": "bot", "content": _interject_reply})
+                        continue
+                    # No usable RAG answer → fall through to normal state-machine processing
 
             # Strict personal-info-first guard:
             # Once lead type is selected, enforce name -> email -> phone before
