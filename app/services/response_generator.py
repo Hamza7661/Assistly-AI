@@ -746,7 +746,28 @@ Classify the intent:"""
                         flow_controller.collected_data.get("leadType"),
                         context.get("lead_types", []),
                     )
-                    return f"{empathy_line} {name_prompt}"
+                    # Avoid stacked acknowledgements when both lines say the same thing.
+                    # Keep one concise message before asking for the name.
+                    name_prompt_l = (name_prompt or "").lower()
+                    empathy_l = (empathy_line or "").lower()
+                    overlap_markers = (
+                        "thank you for your interest",
+                        "we appreciate your interest",
+                        "i'd be happy to assist",
+                        "i would be happy to assist",
+                        "call back",
+                        "callback",
+                    )
+                    if (
+                        not empathy_line
+                        or any(m in name_prompt_l and m in empathy_l for m in overlap_markers)
+                        or (
+                            ("call back" in name_prompt_l or "callback" in name_prompt_l)
+                            and ("call back" in empathy_l or "callback" in empathy_l)
+                        )
+                    ):
+                        return name_prompt
+                    return f"{empathy_line} {name_prompt}".strip()
                 if flow_controller.state in (
                     ConversationState.EMAIL_COLLECTION,
                     ConversationState.PHONE_COLLECTION,
