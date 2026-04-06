@@ -1699,7 +1699,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 except Exception as _rag_err:
                     logger.warning("interjection RAG answer failed: %s", _rag_err)
                 # Only intercept when we got a clean answer (not a JSON lead payload)
-                if _rag_answer and not _is_lead_json(_rag_answer):
+                if _rag_answer and not _looks_like_internal_lead_payload(_rag_answer):
                     _pending_step = await response_generator._generate_state_response(
                         flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                     )
