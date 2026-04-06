@@ -1271,6 +1271,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     # For OTP, leads, etc.: use user id from context (app owner when app_id was used)
     user_id = str(context.get("user", {}).get("id") or identifier)
+    resolved_app_id = str((context.get("app") or {}).get("id") or app_id or "").strip()
+    resolved_company_name = str((context.get("integration") or {}).get("companyName") or "").strip()
+    email_validation_service.set_branding_context(
+        app_id=resolved_app_id or None,
+        company_name=resolved_company_name or None,
+    )
 
     # Initialize production-grade components
     flow_controller = FlowController(context)
@@ -2868,6 +2874,10 @@ async def whatsapp_webhook(request: Request):
         user_id = session["user_id"]
         app_id = session.get("app_id")  # Get app_id for lead creation
         twilio_phone = session.get("twilio_phone", twilio_phone)  # Get app's Twilio number from session
+        email_validation_service.set_branding_context(
+            app_id=str(app_id or "").strip() or None,
+            company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
+        )
         
         # Get flow controller and response generator from session (or create if missing)
         flow_controller = session.get("flow_controller")
@@ -4191,6 +4201,10 @@ async def messenger_webhook(request: Request):
         page_access_token = session.get("page_access_token")
         email_validation_state = session["email_state"]
         phone_validation_state = session["phone_state"]
+        email_validation_service.set_branding_context(
+            app_id=str(app_id or "").strip() or None,
+            company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
+        )
 
         if not flow_controller or not response_generator:
             logger.error("Messenger: flow_controller or response_generator missing in session")
@@ -5194,6 +5208,10 @@ async def instagram_webhook(request: Request):
         owner_id = session["user_id_owner"]
         app_id = session.get("app_id")
         instagram_access_token = session.get("instagram_access_token")
+        email_validation_service.set_branding_context(
+            app_id=str(app_id or "").strip() or None,
+            company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
+        )
 
         if not flow_controller or not response_generator:
             logger.error("Instagram: flow_controller or response_generator not initialized")
