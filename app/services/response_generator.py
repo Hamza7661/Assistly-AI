@@ -1173,6 +1173,8 @@ Classify the intent:"""
                     workflow_manager.reset()
                     flow_controller.transition_to(flow_controller.get_next_state())
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                    if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                        return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
                     if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                         return "BOOK_APPOINTMENT_REQUESTED"
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
@@ -1182,6 +1184,8 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                    return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
                 if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                     return "BOOK_APPOINTMENT_REQUESTED"
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
