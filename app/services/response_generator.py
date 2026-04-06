@@ -188,6 +188,84 @@ class ResponseGenerator:
             self._empathy_prefix_cache[cache_key] = fallback
             return fallback
 
+    def _display_label_for_lead_type_value(
+        self, lead_type_value: Optional[str], lead_types: List[Dict[str, Any]]
+    ) -> str:
+        """Human-facing label (emoji + text) for a lead type value, for LLM grounding."""
+        lead_value = (lead_type_value or "").strip().lower()
+        for lt in lead_types:
+            if not isinstance(lt, dict):
+                continue
+            if (lt.get("value") or "").strip().lower() == lead_value:
+                base = (lt.get("text") or lt.get("value") or "").strip()
+                emoji = str(lt.get("emoji") or "").strip()
+                return f"{emoji} {base}".strip() if emoji else base
+        return (lead_type_value or "").strip() or "their current request"
+
+    @staticmethod
+    def _is_booking_lead_value(lead_type_value: Optional[str]) -> bool:
+        lt = (lead_type_value or "").lower()
+        if not lt:
+            return False
+        return any(k in lt for k in ("book", "appointment", "treatment"))
+
+    def _resolve_session_lead_type_value(
+        self,
+        context: Dict[str, Any],
+        flow_controller: Optional[FlowController],
+    ) -> Optional[str]:
+        if flow_controller is not None:
+            v = flow_controller.collected_data.get("leadType")
+            if (v or "").strip():
+                return str(v).strip()
+        v = context.get("_session_lead_type_value")
+        return str(v).strip() if (v or "").strip() else None
+
+    def _lead_path_alignment_for_llm(
+        self,
+        context: Dict[str, Any],
+        flow_controller: Optional[FlowController],
+        *,
+        conversation_state: Optional[ConversationState] = None,
+        lead_type_value_override: Optional[str] = None,
+    ) -> str:
+        """
+        Ground the model on the CURRENT lead type so mid-flow switches do not leak prior-path
+        wording (e.g. 'booking process' after switching to feedback). Used for any LLM turn
+        after a lead type is known.
+        """
+        lt_val = (lead_type_value_override or "").strip() or self._resolve_session_lead_type_value(
+            context, flow_controller
+        )
+        if not lt_val:
+            return ""
+        if conversation_state is not None and conversation_state in (
+            ConversationState.GREETING,
+            ConversationState.LEAD_TYPE_SELECTION,
+        ):
+            return ""
+        lead_types = context.get("lead_types") or []
+        label = self._display_label_for_lead_type_value(lt_val, lead_types)
+        is_booking = self._is_booking_lead_value(lt_val)
+        if conversation_state in (
+            ConversationState.APPOINTMENT_OFFER,
+            ConversationState.CALENDAR_BOOKING,
+            ConversationState.APPOINTMENT_CONFIRMATION,
+        ):
+            is_booking = True
+        lines = [
+            "CRITICAL — CURRENT USER PATH (your entire reply must match this for this turn):",
+            f"The user is on: {label} (internal: {lt_val}).",
+            "Frame every sentence for THIS path only. Ignore earlier assistant/user lines that referred to a different path they already left.",
+        ]
+        if not is_booking:
+            lines.append(
+                "Do not mention booking, appointments, treatments, or a 'booking process' unless the CURRENT path above is clearly booking/scheduling."
+            )
+        else:
+            lines.append("Scheduling or booking language is appropriate when it matches this path.")
+        return "\n".join(lines)
+
     
     async def _classify_intent(self, user_message: str) -> Dict[str, Any]:
         """
@@ -472,6 +550,8 @@ Classify the intent:"""
         if state == ConversationState.GREETING:
             flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
             state = flow_controller.state
+        # Ground LLM replies on the active lead type (mid-flow switches update this every turn).
+        context["_session_lead_type_value"] = flow_controller.collected_data.get("leadType")
         conversation_style_enabled = self._conversation_style_enabled(context) and self.channel != "voice"
         extractor = DataExtractor()
         validator = Validator()
@@ -622,10 +702,14 @@ Classify the intent:"""
 
             if not has_domain_signal and question_type not in industry_question_types:
                 # Truly off-topic: no custom data and not an industry-type question — let the LLM redirect gracefully
-                answer = await self._generate_question_response(query, rag_context or "", conversation_history, context)
+                answer = await self._generate_question_response(
+                    query, rag_context or "", conversation_history, context, flow_controller=flow_controller
+                )
                 return answer if answer else None
 
-            answer = await self._generate_question_response(query, rag_context or "", conversation_history, context)
+            answer = await self._generate_question_response(
+                query, rag_context or "", conversation_history, context, flow_controller=flow_controller
+            )
             if not answer:
                 return None
 
@@ -657,7 +741,7 @@ Classify the intent:"""
                 logger.info(f"Transitioned to state: {flow_controller.state.value}")
                 # Personal info first: after lead type, immediately collect name/email/phone
                 if flow_controller.state == ConversationState.NAME_COLLECTION:
-                    name_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                    name_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
                     empathy_line = await self._generate_empathy_prefix_for_lead_type(
                         flow_controller.collected_data.get("leadType"),
                         context.get("lead_types", []),
@@ -667,7 +751,7 @@ Classify the intent:"""
                     ConversationState.EMAIL_COLLECTION,
                     ConversationState.PHONE_COLLECTION,
                 ):
-                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
                 
                 # Check if there's only one service for this lead type - if so, auto-select it
                 service_plans = context.get("service_plans", [])
@@ -767,16 +851,17 @@ Classify the intent:"""
                         if conversation_style_enabled:
                             # In conversational mode, answer only if relevant to app industry/context.
                             answer = await _answer_if_relevant_question(user_message)
-                            next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                            next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
                             return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                         rag_context = await self._get_rag_context(f"{single_service} {user_message}", context, is_question=True)
                         return await self._generate_data_collected_with_question_response(
                             "service", single_service, rag_context,
-                            "name", conversation_history, context
+                            "name", conversation_history, context,
+                            flow_controller=flow_controller,
                         )
                     elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                         # Just acknowledge and move to name collection
-                        return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                        return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
                 else:
                     # Multiple services - show selection as before
                     logger.info(f"Multiple services available ({len(all_services)}) - showing service selection")
@@ -793,7 +878,8 @@ Classify the intent:"""
                         return await self._generate_data_collected_with_question_response(
                             "lead type", lead_type.get("text"), rag_context, 
                             "service selection", conversation_history, context,
-                            collected_lead_type=lead_type.get("value")
+                            collected_lead_type=lead_type.get("value"),
+                            flow_controller=flow_controller,
                         )
                     else:
                         # Explicitly include services (filtered by lead type when configured)
@@ -812,7 +898,7 @@ Classify the intent:"""
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     try:
                         qa = await self._generate_question_response(
-                            user_message, rag_context or "", conversation_history, context
+                            user_message, rag_context or "", conversation_history, context, flow_controller=flow_controller
                         )
                         if qa and self.channel != "voice":
                             return f"{qa}\n\n{self._deterministic_lead_type_reprompt(context)}"
@@ -822,7 +908,7 @@ Classify the intent:"""
                         logger.warning("Lead-type phase: question response failed: %s", e)
                 if self.channel != "voice":
                     return self._deterministic_lead_type_reprompt(context)
-                return await self._generate_state_response(state, "", conversation_history, context)
+                return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
         
         if state == ConversationState.SERVICE_SELECTION:
             service_plans = context.get("service_plans", [])
@@ -880,7 +966,7 @@ Classify the intent:"""
                         )
                         return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
                 
                 # Accept user input as service type even if not in configured service options
                 service = user_message.strip()
@@ -959,7 +1045,7 @@ Classify the intent:"""
                             )
                         else:
                             next_prompt = await self._generate_state_response(
-                                flow_controller.state, "", conversation_history, context
+                                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                             )
                         return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                     # Get RAG context for the question (pricing, info about the service)
@@ -967,17 +1053,18 @@ Classify the intent:"""
                     # Generate response that answers question AND asks for next step
                     return await self._generate_data_collected_with_question_response(
                         "service", service, rag_context,
-                        "workflow", conversation_history, context
+                        "workflow", conversation_history, context,
+                        flow_controller=flow_controller,
                     )
                 elif flow_controller.state != ConversationState.WORKFLOW_QUESTION:
                     # Just acknowledge and move to name collection - no RAG needed
-                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 # This shouldn't happen now, but keep as fallback
                 logger.warning(f"Could not determine service from user input: '{user_message}'. Available service options: {all_service_options}")
                 # No match - use AI to handle questions, but ensure it stays in service selection
                 rag_context = await self._get_rag_context(user_message if has_question else "service selection", context, is_question=has_question)
-                return await self._generate_state_response(state, rag_context, conversation_history, context)
+                return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
         
         if state == ConversationState.WORKFLOW_QUESTION:
             # Graceful switch: if user selects another service while in workflow, restart service flow.
@@ -1006,7 +1093,7 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             
             # Check if user is asking a question instead of answering the workflow question
             if has_question:
@@ -1018,7 +1105,9 @@ Classify the intent:"""
                 rag_context = await self._get_rag_context(user_message, context, is_question=True)
                 if rag_context and self.client:
                     try:
-                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        answer = await self._generate_question_response(
+                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                        )
                         return f"{answer}\n\n{current_question_formatted}"
                     except Exception as e:
                         logger.warning(f"Failed to generate answer for question: {e}")
@@ -1043,7 +1132,7 @@ Classify the intent:"""
                         flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
                     if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                         return "BOOK_APPOINTMENT_REQUESTED"
-                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
@@ -1054,7 +1143,7 @@ Classify the intent:"""
                     flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
                 if flow_controller.state == ConversationState.CALENDAR_BOOKING:
                     return "BOOK_APPOINTMENT_REQUESTED"
-                return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
         
         if state == ConversationState.NAME_COLLECTION:
             if name and validator.is_valid_name(name):
@@ -1067,19 +1156,20 @@ Classify the intent:"""
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_data_collected_with_question_response(
                         "name", name, rag_context,
-                        "email", conversation_history, context
+                        "email", conversation_history, context,
+                        flow_controller=flow_controller,
                     )
                 else:
                     # No question - just move to email collection
-                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                    return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 # Name not extracted - check if user asked a question
                 if has_question:
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
                 else:
                     # Just ask for name again - no RAG needed
-                    return await self._generate_state_response(state, "", conversation_history, context)
+                    return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
         
         if state == ConversationState.EMAIL_COLLECTION:
             if email and validator.is_valid_email(email):
@@ -1091,7 +1181,9 @@ Classify the intent:"""
                     # Answer question and acknowledge email, then proceed
                     if flow_controller.validate_email:
                         # Answer question, acknowledge email, then trigger OTP sending
-                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        answer = await self._generate_question_response(
+                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                        )
                         # Return in format that main.py can handle: answer + SEND_EMAIL marker
                         # main.py will send answer first, then handle SEND_EMAIL
                         return f"{answer}|||SEND_EMAIL:{email}"
@@ -1100,13 +1192,16 @@ Classify the intent:"""
                         logger.info(f"Transitioned to state: {flow_controller.state.value}")
                         if flow_controller.can_generate_json():
                             # Answer question then generate JSON
-                            answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                            answer = await self._generate_question_response(
+                                user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                            )
                             json_data = await self._generate_json(flow_controller, conversation_history)
                             return f"{answer}\n\n{json_data}"
                         else:
                             return await self._generate_data_collected_with_question_response(
                                 "email", email, rag_context,
-                                "phone", conversation_history, context
+                                "phone", conversation_history, context,
+                                flow_controller=flow_controller,
                             )
                 else:
                     # No question, proceed normally
@@ -1119,15 +1214,15 @@ Classify the intent:"""
                             return await self._generate_json(flow_controller, conversation_history)
                         else:
                             # No RAG needed for standard phone collection prompt
-                            return await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                            return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 # Email not extracted - check if user asked a question
                 if has_question:
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
                 else:
                     # No RAG needed for standard email collection prompt
-                    return await self._generate_state_response(state, "", conversation_history, context)
+                    return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
         
         if state == ConversationState.PHONE_COLLECTION:
             # Graceful email correction during phone step:
@@ -1142,16 +1237,20 @@ Classify the intent:"""
                     flow_controller.otp_state["email_verified"] = False
                     if has_question:
                         rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        answer = await self._generate_question_response(
+                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                        )
                         return f"{answer}|||SEND_EMAIL:{email}"
                     return "SEND_EMAIL:" + email
 
                 # Email verification disabled: accept latest email and continue phone step
                 if has_question:
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                    answer = await self._generate_question_response(
+                        user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                    )
                     phone_prompt = await self._generate_state_response(
-                        ConversationState.PHONE_COLLECTION, "", conversation_history, context
+                        ConversationState.PHONE_COLLECTION, "", conversation_history, context, flow_controller=flow_controller
                     )
                     return f"{answer}\n\nThanks — I have updated your email to {email}.\n\n{phone_prompt}"
                 return f"Thanks — I have updated your email to {email}. Please share your phone number to continue."
@@ -1164,18 +1263,22 @@ Classify the intent:"""
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     if flow_controller.validate_phone:
                         # Answer question, acknowledge phone, then trigger OTP sending
-                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        answer = await self._generate_question_response(
+                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                        )
                         # Return in format that main.py can handle: answer + SEND_PHONE marker
                         return f"{answer}|||SEND_PHONE:{phone}"
                     else:
                         flow_controller.transition_to(flow_controller.get_next_state())
                         logger.info(f"Transitioned to state: {flow_controller.state.value}")
                         # Answer question and continue flow; only finalize when complete.
-                        answer = await self._generate_question_response(user_message, rag_context, conversation_history, context)
+                        answer = await self._generate_question_response(
+                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                        )
                         if flow_controller.can_generate_json():
                             json_data = await self._generate_json(flow_controller, conversation_history)
                             return f"{answer}\n\n{json_data}"
-                        next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context)
+                        next_prompt = await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
                         return f"{answer}\n\n{next_prompt}" if answer else next_prompt
                 else:
                     # No question, proceed normally
@@ -1195,16 +1298,16 @@ Classify the intent:"""
                                 collected_lead_type=flow_controller.collected_data.get("leadType"),
                             )
                         return await self._generate_state_response(
-                            flow_controller.state, "", conversation_history, context
+                            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                         )
             else:
                 # Phone not extracted - check if user asked a question
                 if has_question:
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context)
+                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
                 else:
                     # No RAG needed for standard phone collection prompt
-                    return await self._generate_state_response(state, "", conversation_history, context)
+                    return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
 
         if state == ConversationState.APPOINTMENT_OFFER:
             text = user_message.strip().lower()
@@ -1230,7 +1333,7 @@ Classify the intent:"""
             return await self._generate_json(flow_controller, conversation_history)
         
         # Generate natural response based on state - no RAG needed for standard prompts
-        return await self._generate_state_response(state, "", conversation_history, context)
+        return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
     
     async def _get_rag_context(self, query: str, context: Dict[str, Any], is_question: bool = False) -> str:
         """Get relevant context from RAG. Only retrieves FAQs when is_question=True."""
@@ -1367,7 +1470,9 @@ CRITICAL RULES:
         next_step: str,  # "service selection", "name", "email", "phone"
         conversation_history: List[Dict[str, str]],
         context: Dict[str, Any],
-        collected_lead_type: Optional[str] = None
+        collected_lead_type: Optional[str] = None,
+        *,
+        flow_controller: Optional[FlowController] = None,
     ) -> str:
         """Generate response when data is collected AND user asked a question"""
         conversation_style = bool((context.get("integration") or {}).get("conversationStyle"))
@@ -1431,6 +1536,17 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
             system_prompt += "\n\nDo NOT output <button> tags or numbered lists. Continue the conversation naturally."
         if self._language_instruction():
             system_prompt += "\n\n" + self._language_instruction()
+        _align_lt = (collected_lead_type or "").strip() or self._resolve_session_lead_type_value(
+            context, flow_controller
+        )
+        _path = self._lead_path_alignment_for_llm(
+            context,
+            flow_controller,
+            conversation_state=None,
+            lead_type_value_override=_align_lt or None,
+        )
+        if _path:
+            system_prompt += "\n\n" + _path
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -1480,7 +1596,9 @@ Format: [Answer to question]. Great! I've noted your {data_type}: {data_value}. 
         user_message: str,
         rag_context: str,
         conversation_history: List[Dict[str, str]],
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        *,
+        flow_controller: Optional[FlowController] = None,
     ) -> str:
         """Generate response to answer a user's question using RAG context"""
         # Helper to get fallback message using greeting utility
@@ -1508,6 +1626,9 @@ When answering the user's question, follow these guidelines:
             system_prompt += "\n\nDo NOT output <button> tags or numbered lists. Continue the conversation naturally."
         if self._language_instruction():
             system_prompt += "\n\n" + self._language_instruction()
+        _path = self._lead_path_alignment_for_llm(context, flow_controller, conversation_state=None)
+        if _path:
+            system_prompt += "\n\n" + _path
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -1537,7 +1658,9 @@ When answering the user's question, follow these guidelines:
         state: ConversationState,
         rag_context: str,
         conversation_history: List[Dict[str, str]],
-        context: Dict[str, Any]
+        context: Dict[str, Any],
+        *,
+        flow_controller: Optional[FlowController] = None,
     ) -> str:
         """Generate response using minimal prompt based on state"""
         if not self.client:
@@ -1765,6 +1888,11 @@ RULES:
         system_prompt = state_prompts.get(state, f"You are a {self.profession} assistant. Continue the conversation naturally.")
         if self._language_instruction():
             system_prompt += "\n\n" + self._language_instruction()
+        _path = self._lead_path_alignment_for_llm(
+            context, flow_controller, conversation_state=state
+        )
+        if _path:
+            system_prompt += "\n\n" + _path
         
         # Build messages
         messages = [{"role": "system", "content": system_prompt}]
