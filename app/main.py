@@ -488,9 +488,16 @@ async def _continue_after_otp_delivery_failed(
     else:
         flow_controller.skip_phone_verification_after_send_failure()
         prefix = get_string("otp_unavailable_skip_phone", lang_code)
-    next_prompt = await response_generator._generate_state_response(
-        flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
-    )
+    if flow_controller.state == ConversationState.SERVICE_SELECTION:
+        next_prompt = await response_generator._generate_service_selection_response(
+            conversation_history,
+            context,
+            collected_lead_type=flow_controller.collected_data.get("leadType"),
+        )
+    else:
+        next_prompt = await response_generator._generate_state_response(
+            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+        )
     body = (next_prompt or "").strip()
     return f"{prefix}\n\n{body}" if body else prefix
 
