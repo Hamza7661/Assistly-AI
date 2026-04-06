@@ -1154,13 +1154,25 @@ Classify the intent:"""
                 # Check if user asked a question along with name
                 if has_question:
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                    next_step = "service selection" if flow_controller.state == ConversationState.SERVICE_SELECTION else (
+                        "email" if flow_controller.state == ConversationState.EMAIL_COLLECTION else (
+                            "phone" if flow_controller.state == ConversationState.PHONE_COLLECTION else "name"
+                        )
+                    )
                     return await self._generate_data_collected_with_question_response(
                         "name", name, rag_context,
-                        "email", conversation_history, context,
+                        next_step, conversation_history, context,
+                        collected_lead_type=flow_controller.collected_data.get("leadType"),
                         flow_controller=flow_controller,
                     )
                 else:
                     # No question - just move to email collection
+                    if flow_controller.state == ConversationState.SERVICE_SELECTION:
+                        return await self._generate_service_selection_response(
+                            conversation_history,
+                            context,
+                            collected_lead_type=flow_controller.collected_data.get("leadType"),
+                        )
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 # Name not extracted - check if user asked a question
@@ -1198,9 +1210,13 @@ Classify the intent:"""
                             json_data = await self._generate_json(flow_controller, conversation_history)
                             return f"{answer}\n\n{json_data}"
                         else:
+                            next_step = "service selection" if flow_controller.state == ConversationState.SERVICE_SELECTION else (
+                                "phone" if flow_controller.state == ConversationState.PHONE_COLLECTION else "email"
+                            )
                             return await self._generate_data_collected_with_question_response(
                                 "email", email, rag_context,
-                                "phone", conversation_history, context,
+                                next_step, conversation_history, context,
+                                collected_lead_type=flow_controller.collected_data.get("leadType"),
                                 flow_controller=flow_controller,
                             )
                 else:
@@ -1213,7 +1229,13 @@ Classify the intent:"""
                         if flow_controller.can_generate_json():
                             return await self._generate_json(flow_controller, conversation_history)
                         else:
-                            # No RAG needed for standard phone collection prompt
+                            # Ensure service selection keeps button options in non-conversational channels.
+                            if flow_controller.state == ConversationState.SERVICE_SELECTION:
+                                return await self._generate_service_selection_response(
+                                    conversation_history,
+                                    context,
+                                    collected_lead_type=flow_controller.collected_data.get("leadType"),
+                                )
                             return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 # Email not extracted - check if user asked a question
