@@ -1274,6 +1274,12 @@ Classify the intent:"""
                                     context,
                                     collected_lead_type=flow_controller.collected_data.get("leadType"),
                                 )
+                            if flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+                                # Re-enter main flow so non-booking lead rules can auto-select
+                                # service and start attached workflow after contact capture.
+                                return await self.generate_response(
+                                    flow_controller, "", conversation_history, context
+                                )
                             return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
                 # Email not extracted - check if user asked a question
@@ -1356,6 +1362,12 @@ Classify the intent:"""
                                 conversation_history,
                                 context,
                                 collected_lead_type=flow_controller.collected_data.get("leadType"),
+                            )
+                        if flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+                            # Re-enter main flow so non-booking lead rules can auto-select
+                            # service and start attached workflow after contact capture.
+                            return await self.generate_response(
+                                flow_controller, "", conversation_history, context
                             )
                         return await self._generate_state_response(
                             flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
