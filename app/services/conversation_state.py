@@ -57,8 +57,11 @@ class FlowController:
         
         # Get validation flags
         integration = context.get("integration", {})
-        self.validate_email = integration.get("validateEmail", True)
-        self.validate_phone = integration.get("validatePhoneNumber", True)
+        self.capture_lead_name = integration.get("captureLeadName", True)
+        self.capture_lead_email = integration.get("captureLeadEmail", True)
+        self.capture_lead_phone = integration.get("captureLeadPhoneNumber", True)
+        self.validate_email = bool(integration.get("validateEmail", True) and self.capture_lead_email)
+        self.validate_phone = bool(integration.get("validatePhoneNumber", True) and self.capture_lead_phone)
         self.is_whatsapp = False  # Set externally
         self.channel: str = integration.get("channel", "web")
         self.skip_phone_collection: bool = False
@@ -119,7 +122,13 @@ class FlowController:
         
         elif self.state == ConversationState.LEAD_TYPE_SELECTION:
             if self.collected_data["leadType"]:
-                return ConversationState.NAME_COLLECTION
+                if self.capture_lead_name:
+                    return ConversationState.NAME_COLLECTION
+                if self.capture_lead_email:
+                    return ConversationState.EMAIL_COLLECTION
+                if self.capture_lead_phone and not (self.is_whatsapp or self.skip_phone_collection):
+                    return ConversationState.PHONE_COLLECTION
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.LEAD_TYPE_SELECTION
         
         elif self.state == ConversationState.SERVICE_SELECTION:
@@ -138,7 +147,11 @@ class FlowController:
         
         elif self.state == ConversationState.NAME_COLLECTION:
             if self.collected_data["leadName"]:
-                return ConversationState.EMAIL_COLLECTION
+                if self.capture_lead_email:
+                    return ConversationState.EMAIL_COLLECTION
+                if self.capture_lead_phone and not (self.is_whatsapp or self.skip_phone_collection):
+                    return ConversationState.PHONE_COLLECTION
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.NAME_COLLECTION
         
         elif self.state == ConversationState.EMAIL_COLLECTION:
@@ -147,7 +160,7 @@ class FlowController:
                     return ConversationState.EMAIL_OTP_SENT
                 else:
                     # Skip email OTP, go to phone or continue flow
-                    if self.is_whatsapp or self.skip_phone_collection:
+                    if (not self.capture_lead_phone) or self.is_whatsapp or self.skip_phone_collection:
                         return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
                     else:
                         return ConversationState.PHONE_COLLECTION
@@ -158,7 +171,7 @@ class FlowController:
         
         elif self.state == ConversationState.EMAIL_OTP_VERIFICATION:
             if self.otp_state["email_verified"]:
-                if self.is_whatsapp or self.skip_phone_collection:
+                if (not self.capture_lead_phone) or self.is_whatsapp or self.skip_phone_collection:
                     return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
                 else:
                     return ConversationState.PHONE_COLLECTION
@@ -229,11 +242,15 @@ class FlowController:
         
         # Check required fields
         for field in required_fields:
+            if field == "leadName" and not self.capture_lead_name:
+                continue
+            if field == "leadEmail" and not self.capture_lead_email:
+                continue
             if not self.collected_data.get(field):
                 return False
         
         # Check phone (if not skipping phone collection)
-        if not self.skip_phone_collection and not self.collected_data.get("leadPhoneNumber"):
+        if self.capture_lead_phone and (not self.skip_phone_collection) and not self.collected_data.get("leadPhoneNumber"):
             return False
         
         # Check OTP verification
@@ -250,12 +267,14 @@ class FlowController:
         data = {
             "leadType": self.collected_data["leadType"],
             "serviceType": self.collected_data["serviceType"],
-            "leadName": self.collected_data["leadName"],  # Customer name
-            "leadEmail": self.collected_data["leadEmail"],
             "title": self.collected_data.get("title", "")
         }
+        if self.capture_lead_name and self.collected_data.get("leadName"):
+            data["leadName"] = self.collected_data["leadName"]
+        if self.capture_lead_email and self.collected_data.get("leadEmail"):
+            data["leadEmail"] = self.collected_data["leadEmail"]
         
-        if self.collected_data.get("leadPhoneNumber"):
+        if self.capture_lead_phone and self.collected_data.get("leadPhoneNumber"):
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
 
         if self.collected_data.get("sourceChannel"):

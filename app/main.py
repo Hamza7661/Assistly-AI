@@ -489,7 +489,7 @@ async def _continue_after_otp_delivery_failed(
         flow_controller.skip_phone_verification_after_send_failure()
         prefix = get_string("otp_unavailable_skip_phone", lang_code)
     next_prompt = await response_generator._generate_state_response(
-        flow_controller.state, "", conversation_history, context
+        flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
     )
     body = (next_prompt or "").strip()
     return f"{prefix}\n\n{body}" if body else prefix
@@ -621,6 +621,109 @@ def _extract_index_choice(text: str) -> Optional[int]:
         return int(match.group(1))
     except ValueError:
         return None
+
+
+def _feedback_prompt_message() -> str:
+    return (
+        "Your feedback helps us improve every chat.\n"
+        "Please choose your experience:\n"
+        "<button value=\"exp:very_happy\">😄 Excellent</button>\n"
+        "<button value=\"exp:happy\">🙂 Good</button>\n"
+        "<button value=\"exp:neutral\">😐 Okay</button>\n"
+        "<button value=\"exp:sad\">🙁 Not good</button>\n"
+        "<button value=\"exp:very_sad\">😞 Poor</button>\n\n"
+        "Now rate your overall experience (1 to 5):\n"
+        "<button value=\"rating:1\">1</button> <button value=\"rating:2\">2</button> "
+        "<button value=\"rating:3\">3</button> <button value=\"rating:4\">4</button> "
+        "<button value=\"rating:5\">5</button>"
+    )
+
+
+def _extract_feedback_experience(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = str(text).strip().lower()
+    direct = re.search(r"\bexp:(very_happy|happy|neutral|sad|very_sad)\b", t)
+    if direct:
+        return direct.group(1)
+    phrase_map = {
+        "very happy": "very_happy",
+        "happy": "happy",
+        "neutral": "neutral",
+        "sad": "sad",
+        "very sad": "very_sad",
+    }
+    for phrase, key in phrase_map.items():
+        if phrase in t:
+            return key
+    emoji_map = {
+        "😄": "very_happy",
+        "😀": "very_happy",
+        "🙂": "happy",
+        "😐": "neutral",
+        "🙁": "sad",
+        "☹": "sad",
+        "😞": "very_sad",
+    }
+    for emoji, key in emoji_map.items():
+        if emoji in text:
+            return key
+    return None
+
+
+def _extract_feedback_rating(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = str(text).strip().lower()
+    match = re.search(r"\brating:(\d)\b", t)
+    if match:
+        value = int(match.group(1))
+        return value if 1 <= value <= 5 else None
+    match = re.search(r"\b([1-5])\b", t)
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if 1 <= value <= 5 else None
+
+
+def _capture_feedback_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("captureFeedbackEnabled"))
+
+
+def _capture_email_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("captureLeadEmail", True))
+
+
+def _capture_phone_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("captureLeadPhoneNumber", True))
+
+
+def _validate_email_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("validateEmail", True) and integration.get("captureLeadEmail", True))
+
+
+def _validate_phone_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("validatePhoneNumber", True) and integration.get("captureLeadPhoneNumber", True))
+
+
+def _extract_lead_id_from_create_response(resp: Any) -> Optional[str]:
+    if not isinstance(resp, dict):
+        return None
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return None
+    lead = data.get("lead")
+    if not isinstance(lead, dict):
+        return None
+    lead_id = lead.get("_id") or lead.get("id")
+    if lead_id:
+        return str(lead_id)
+    return None
 
 
 def _format_slot_time_local(iso_str: str, iana_timezone: str) -> str:
@@ -1157,6 +1260,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     )
 
     lead_id: Optional[str] = None
+    feedback_collection_active = False
+    feedback_data: Dict[str, Any] = {}
     last_snapshot: Dict[str, Any] = {}
     restored = False
     if resume_key and app_id:
@@ -1176,6 +1281,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             calendar_selected_day = resume_blob.get("calendar_selected_day")
             calendar_pending_slot = dict(resume_blob.get("calendar_pending_slot") or {})
             user_timezone = str(resume_blob.get("user_timezone") or "UTC")
+            feedback_collection_active = bool(resume_blob.get("feedback_collection_active"))
+            feedback_data = dict(resume_blob.get("feedback_data") or {})
             _restore_flow_controller_from_resume(flow_controller, resume_blob.get("flow"))
             lid = resume_blob.get("lead_id")
             if lid:
@@ -1325,6 +1432,55 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
 
+            if feedback_collection_active:
+                user_raw = str(user_text).strip()
+                conversation_history.append({"role": "user", "content": user_raw})
+                exp = _extract_feedback_experience(user_raw)
+                rating = _extract_feedback_rating(user_raw)
+                if exp:
+                    feedback_data["experience"] = exp
+                if rating:
+                    feedback_data["rating"] = rating
+                if feedback_data.get("experience") and feedback_data.get("rating"):
+                    saved = False
+                    if lead_id:
+                        try:
+                            feedback_payload = {
+                                "userFeedback": {
+                                    "experience": feedback_data.get("experience"),
+                                    "rating": feedback_data.get("rating"),
+                                    "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                                }
+                            }
+                            saved, _ = await lead_service.update_lead(user_id, lead_id, feedback_payload)
+                        except Exception as feedback_exc:
+                            logger.warning("Failed to persist user feedback: %s", feedback_exc)
+                    thank_you = "Thank you for your feedback!"
+                    if not saved and lead_id:
+                        thank_you = "Thank you for your feedback! We could not save it right now."
+                    conversation_history.append({"role": "assistant", "content": thank_you})
+                    await websocket.send_json({"type": "bot", "content": thank_you})
+                    await websocket.send_json({"type": "session_complete"})
+                    widget_session_complete = True
+                    feedback_collection_active = False
+                    if resume_key:
+                        WIDGET_CHAT_RESUME.pop(resume_key, None)
+                    continue
+                missing_parts: List[str] = []
+                if not feedback_data.get("experience"):
+                    missing_parts.append("experience")
+                if not feedback_data.get("rating"):
+                    missing_parts.append("rating (1-5)")
+                followup = (
+                    "Thanks! Please also share your "
+                    + " and ".join(missing_parts)
+                    + ".\n"
+                    + _feedback_prompt_message()
+                )
+                conversation_history.append({"role": "assistant", "content": followup})
+                await websocket.send_json({"type": "bot", "content": followup})
+                continue
+
             await ensure_rag_ready()
 
             # Bad or partial resume blobs may leave state on default GREETING while the client
@@ -1445,7 +1601,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         else f"Got it — switched to **{_new_label}**."
                     )
                 next_prompt = await response_generator._generate_state_response(
-                    flow_controller.state, "", conversation_history, context
+                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                 )
                 reply = f"{switch_msg}\n\n{next_prompt}"
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -1498,7 +1654,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # Only intercept when we got a clean answer (not a JSON lead payload)
                 if _rag_answer and not _is_lead_json(_rag_answer):
                     _pending_step = await response_generator._generate_state_response(
-                        flow_controller.state, "", conversation_history, context
+                        flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                     )
                     _interject_reply = f"{_rag_answer}\n\n---\n\n{_pending_step}"
                     logger.info(
@@ -1535,7 +1691,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if target_state is not None:
                     flow_controller.transition_to(target_state)
                     enforced_prompt = await response_generator._generate_state_response(
-                        flow_controller.state, "", conversation_history, context
+                        flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                     )
                     conversation_history.append({"role": "assistant", "content": enforced_prompt})
                     await websocket.send_json({"type": "bot", "content": enforced_prompt})
@@ -1658,11 +1814,17 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
-                        # Widget: marks flow complete after booking confirmation message (client resets on close/reload).
-                        await websocket.send_json({"type": "session_complete"})
-                        widget_session_complete = True
-                        if resume_key:
-                            WIDGET_CHAT_RESUME.pop(resume_key, None)
+                        if _capture_feedback_enabled(context):
+                            feedback_prompt = _feedback_prompt_message()
+                            feedback_collection_active = True
+                            feedback_data = {}
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            await websocket.send_json({"type": "bot", "content": feedback_prompt})
+                        else:
+                            await websocket.send_json({"type": "session_complete"})
+                            widget_session_complete = True
+                            if resume_key:
+                                WIDGET_CHAT_RESUME.pop(resume_key, None)
                     continue
                 try:
                     num = _extract_index_choice(str(user_text))
@@ -2265,11 +2427,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
                 conversation_history.append({"role": "assistant", "content": final_msg})
-                # Non-booking path: all required data collected (e.g. workflow done); widget resets on close/reload.
-                await websocket.send_json({"type": "session_complete"})
-                widget_session_complete = True
-                if resume_key:
-                    WIDGET_CHAT_RESUME.pop(resume_key, None)
+                if _capture_feedback_enabled(context):
+                    feedback_prompt = _feedback_prompt_message()
+                    feedback_collection_active = True
+                    feedback_data = {}
+                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                    await websocket.send_json({"type": "bot", "content": feedback_prompt})
+                else:
+                    # Non-booking path: all required data collected.
+                    await websocket.send_json({"type": "session_complete"})
+                    widget_session_complete = True
+                    if resume_key:
+                        WIDGET_CHAT_RESUME.pop(resume_key, None)
                 continue
 
             # Hard safety guard: never expose internal JSON/payloads in chat bubbles.
@@ -2356,6 +2525,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "calendar_selected_day": calendar_selected_day,
                     "calendar_pending_slot": calendar_pending_slot,
                     "user_timezone": user_timezone,
+                    "feedback_collection_active": feedback_collection_active,
+                    "feedback_data": feedback_data,
                     "flow": _snapshot_flow_controller_for_resume(flow_controller),
                     "lead_id": lead_id,
                 }
@@ -2684,6 +2855,57 @@ async def whatsapp_webhook(request: Request):
         elif list_id:
             # Handle list response
             user_text = list_id
+
+        if session.get("feedback_collection_active"):
+            user_raw = str(user_text or "").strip()
+            if user_raw:
+                conversation_history.append({"role": "user", "content": user_raw})
+            feedback_data = dict(session.get("feedback_data") or {})
+            exp = _extract_feedback_experience(user_raw)
+            rating = _extract_feedback_rating(user_raw)
+            if exp:
+                feedback_data["experience"] = exp
+            if rating:
+                feedback_data["rating"] = rating
+            if feedback_data.get("experience") and feedback_data.get("rating"):
+                lead_id_for_feedback = str(session.get("feedback_lead_id") or "").strip()
+                saved = False
+                if lead_id_for_feedback:
+                    try:
+                        payload = {
+                            "userFeedback": {
+                                "experience": feedback_data.get("experience"),
+                                "rating": feedback_data.get("rating"),
+                                "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                            }
+                        }
+                        saved, _ = await lead_service.update_lead(user_id, lead_id_for_feedback, payload)
+                    except Exception as feedback_exc:
+                        logger.warning("WhatsApp feedback save failed: %s", feedback_exc)
+                thanks = "Thank you for your feedback!"
+                if not saved and lead_id_for_feedback:
+                    thanks = "Thank you for your feedback! We could not save it right now."
+                conversation_history.append({"role": "assistant", "content": thanks})
+                await whatsapp_service.send_message(user_phone, thanks, from_phone=twilio_phone)
+                del whatsapp_sessions[session_id]
+                if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
+                    del phone_to_session[user_phone]
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            missing_parts: List[str] = []
+            if not feedback_data.get("experience"):
+                missing_parts.append("experience")
+            if not feedback_data.get("rating"):
+                missing_parts.append("rating (1-5)")
+            followup = (
+                "Thanks! Please also share your "
+                + " and ".join(missing_parts)
+                + ".\n"
+                + _feedback_prompt_message()
+            )
+            session["feedback_data"] = feedback_data
+            conversation_history.append({"role": "assistant", "content": followup})
+            await whatsapp_service.send_message(user_phone, followup, from_phone=twilio_phone)
+            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Convert numbered responses to actual values for better context
         enhanced_user_text = user_text
@@ -2970,7 +3192,7 @@ async def whatsapp_webhook(request: Request):
         response_generator.set_response_language(lang_name)
         
         # Check if we need to handle email validation (similar to WebSocket flow)
-        validate_email = context.get("integration", {}).get("validateEmail", True)
+        validate_email = _validate_email_enabled(context)
         logger.info(f"WhatsApp: Email validation check - validate_email: {validate_email}, otp_sent: {email_validation_state['otp_sent']}, history_length: {len(conversation_history)}")
         
         if validate_email and not email_validation_state["otp_sent"] and len(conversation_history) > 1:
@@ -3182,8 +3404,10 @@ async def whatsapp_webhook(request: Request):
                             parsed_json["appId"] = app_id
                         
                         # Create lead and send friendly message
+                        created_lead_resp = None
+                        ok_lead = False
                         try:
-                            ok_lead, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                            ok_lead, created_lead_resp = await lead_service.create_public_lead(user_id, parsed_json)
                             if ok_lead:
                                 final_msg = get_string("final_success", session.get("response_language_code", "en"))
                             else:
@@ -3199,8 +3423,15 @@ async def whatsapp_webhook(request: Request):
                             await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                         conversation_history.append({"role": "assistant", "content": final_msg})
                         await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
-                        
-                        # Clean up session after lead creation
+                        if _capture_feedback_enabled(context) and ok_lead:
+                            feedback_prompt = _feedback_prompt_message()
+                            session["feedback_collection_active"] = True
+                            session["feedback_data"] = {}
+                            session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
+                            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
                         del whatsapp_sessions[session_id]
                         if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
                             del phone_to_session[user_phone]
@@ -3377,7 +3608,7 @@ async def whatsapp_webhook(request: Request):
             
             # Check email verification only if enabled
             email_valid = True
-            if context.get("integration", {}).get("validateEmail", True):
+            if _validate_email_enabled(context):
                 email_valid = _validate_email_verification(email_validation_state)
             
             # Phone is already verified by WhatsApp
@@ -3388,8 +3619,10 @@ async def whatsapp_webhook(request: Request):
                 if app_id:
                     parsed_json["appId"] = app_id
                 # Create lead
+                created_lead_resp = None
+                ok = False
                 try:
-                    ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                    ok, created_lead_resp = await lead_service.create_public_lead(user_id, parsed_json)
                     if ok:
                         final_msg = get_string("final_success", session.get("response_language_code", "en"))
                     else:
@@ -3403,12 +3636,18 @@ async def whatsapp_webhook(request: Request):
                     review_msg = get_string("review_prompt", session.get("response_language_code", "en"), review_url)
                     await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                 await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
-                
-                # Clean up session after lead creation
+                if _capture_feedback_enabled(context) and ok:
+                    feedback_prompt = _feedback_prompt_message()
+                    session["feedback_collection_active"] = True
+                    session["feedback_data"] = {}
+                    session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                    await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
                 del whatsapp_sessions[session_id]
                 if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
                     del phone_to_session[user_phone]
-                
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Check for retry requests from GPT response
@@ -3559,7 +3798,7 @@ async def whatsapp_webhook(request: Request):
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             elif retry_type == 'send_email' and extracted_value:
                 # Check if email validation is enabled
-                validate_email = context.get("integration", {}).get("validateEmail", True)
+                validate_email = _validate_email_enabled(context)
                 if not validate_email:
                     # Email validation is disabled - store email and let AI respond naturally
                     email = extracted_value
@@ -3609,7 +3848,7 @@ async def whatsapp_webhook(request: Request):
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             elif retry_type == 'send_phone' and extracted_value:
                 # Check if phone validation is enabled (for WhatsApp, phone is already verified, so skip)
-                validate_phone = context.get("integration", {}).get("validatePhoneNumber", True)
+                validate_phone = _validate_phone_enabled(context)
                 if not validate_phone:
                     # Phone validation is disabled - store phone and let AI respond naturally
                     # Format phone with GPT for consistent storage
@@ -3917,6 +4156,59 @@ async def messenger_webhook(request: Request):
             return {"status": "error"}
         flow_controller.update_collected_data("sourceChannel", "facebook")
 
+        if session.get("feedback_collection_active"):
+            user_raw = str(message_text or "").strip()
+            if user_raw:
+                conversation_history.append({"role": "user", "content": user_raw})
+            feedback_data = dict(session.get("feedback_data") or {})
+            exp = _extract_feedback_experience(user_raw)
+            rating = _extract_feedback_rating(user_raw)
+            if exp:
+                feedback_data["experience"] = exp
+            if rating:
+                feedback_data["rating"] = rating
+            if feedback_data.get("experience") and feedback_data.get("rating"):
+                lead_id_for_feedback = str(session.get("feedback_lead_id") or "").strip()
+                saved = False
+                if lead_id_for_feedback:
+                    try:
+                        payload = {
+                            "userFeedback": {
+                                "experience": feedback_data.get("experience"),
+                                "rating": feedback_data.get("rating"),
+                                "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                            }
+                        }
+                        saved, _ = await lead_service.update_lead(owner_id, lead_id_for_feedback, payload)
+                    except Exception as feedback_exc:
+                        logger.warning("Messenger feedback save failed: %s", feedback_exc)
+                thanks = "Thank you for your feedback!"
+                if not saved and lead_id_for_feedback:
+                    thanks = "Thank you for your feedback! We could not save it right now."
+                conversation_history.append({"role": "assistant", "content": thanks})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, thanks, page_access_token)
+                key = f"messenger_{recipient_id}_{sender_id}"
+                messenger_key_to_session.pop(key, None)
+                messenger_sessions.pop(session_id, None)
+                return {"status": "ok"}
+            missing_parts: List[str] = []
+            if not feedback_data.get("experience"):
+                missing_parts.append("experience")
+            if not feedback_data.get("rating"):
+                missing_parts.append("rating (1-5)")
+            followup = (
+                "Thanks! Please also share your "
+                + " and ".join(missing_parts)
+                + ".\n"
+                + _feedback_prompt_message()
+            )
+            session["feedback_data"] = feedback_data
+            conversation_history.append({"role": "assistant", "content": followup})
+            session["history"] = conversation_history
+            await messenger_service.send_message(sender_id, followup, page_access_token)
+            return {"status": "ok"}
+
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
         calendar_slots = session.get("calendar_slots") or []
@@ -4089,7 +4381,7 @@ async def messenger_webhook(request: Request):
 
         try:
             # ── PRE-CHECK: detect email when last bot message asked for it ────────
-            validate_email = context.get("integration", {}).get("validateEmail", True)
+            validate_email = _validate_email_enabled(context)
             logger.info(
                 "Messenger: email validation check – validate_email=%s otp_sent=%s history_len=%d",
                 validate_email, email_validation_state["otp_sent"], len(conversation_history),
@@ -4268,8 +4560,10 @@ async def messenger_webhook(request: Request):
                             if email_valid:
                                 if app_id:
                                     parsed_json["appId"] = app_id
+                                created_lead_resp = None
+                                ok_lead = False
                                 try:
-                                    ok_lead, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                                     final_msg = (
                                         get_string("final_success", lang_code)
                                         if ok_lead
@@ -4285,6 +4579,15 @@ async def messenger_webhook(request: Request):
                                         page_access_token,
                                     )
                                 await messenger_service.send_message(sender_id, final_msg, page_access_token)
+                                if _capture_feedback_enabled(context) and ok_lead:
+                                    feedback_prompt = _feedback_prompt_message()
+                                    session["feedback_collection_active"] = True
+                                    session["feedback_data"] = {}
+                                    session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                                    session["history"] = conversation_history
+                                    await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                                    return {"status": "ok"}
                                 key = f"messenger_{recipient_id}_{sender_id}"
                                 messenger_key_to_session.pop(key, None)
                                 messenger_sessions.pop(session_id, None)
@@ -4435,8 +4738,10 @@ async def messenger_webhook(request: Request):
                 if email_valid:
                     if app_id:
                         parsed_json["appId"] = app_id
+                    created_lead_resp = None
+                    ok = False
                     try:
-                        ok, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                        ok, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                         final_msg = (
                             get_string("final_success", lang_code)
                             if ok
@@ -4454,6 +4759,15 @@ async def messenger_webhook(request: Request):
                             page_access_token,
                         )
                     await messenger_service.send_message(sender_id, final_msg, page_access_token)
+                    if _capture_feedback_enabled(context) and ok:
+                        feedback_prompt = _feedback_prompt_message()
+                        session["feedback_collection_active"] = True
+                        session["feedback_data"] = {}
+                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                        conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                        return {"status": "ok"}
                     key = f"messenger_{recipient_id}_{sender_id}"
                     messenger_key_to_session.pop(key, None)
                     messenger_sessions.pop(session_id, None)
@@ -4846,6 +5160,59 @@ async def instagram_webhook(request: Request):
             return {"status": "error"}
         flow_controller.update_collected_data("sourceChannel", "instagram")
 
+        if session.get("feedback_collection_active"):
+            user_raw = str(message_text or "").strip()
+            if user_raw:
+                conversation_history.append({"role": "user", "content": user_raw})
+            feedback_data = dict(session.get("feedback_data") or {})
+            exp = _extract_feedback_experience(user_raw)
+            rating = _extract_feedback_rating(user_raw)
+            if exp:
+                feedback_data["experience"] = exp
+            if rating:
+                feedback_data["rating"] = rating
+            if feedback_data.get("experience") and feedback_data.get("rating"):
+                lead_id_for_feedback = str(session.get("feedback_lead_id") or "").strip()
+                saved = False
+                if lead_id_for_feedback:
+                    try:
+                        payload = {
+                            "userFeedback": {
+                                "experience": feedback_data.get("experience"),
+                                "rating": feedback_data.get("rating"),
+                                "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                            }
+                        }
+                        saved, _ = await lead_service.update_lead(owner_id, lead_id_for_feedback, payload)
+                    except Exception as feedback_exc:
+                        logger.warning("Instagram feedback save failed: %s", feedback_exc)
+                thanks = "Thank you for your feedback!"
+                if not saved and lead_id_for_feedback:
+                    thanks = "Thank you for your feedback! We could not save it right now."
+                conversation_history.append({"role": "assistant", "content": thanks})
+                session["history"] = conversation_history
+                await instagram_service.send_message(sender_id, thanks, instagram_access_token)
+                key = f"instagram_{recipient_id}_{sender_id}"
+                instagram_key_to_session.pop(key, None)
+                instagram_sessions.pop(session_id, None)
+                return {"status": "ok"}
+            missing_parts: List[str] = []
+            if not feedback_data.get("experience"):
+                missing_parts.append("experience")
+            if not feedback_data.get("rating"):
+                missing_parts.append("rating (1-5)")
+            followup = (
+                "Thanks! Please also share your "
+                + " and ".join(missing_parts)
+                + ".\n"
+                + _feedback_prompt_message()
+            )
+            session["feedback_data"] = feedback_data
+            conversation_history.append({"role": "assistant", "content": followup})
+            session["history"] = conversation_history
+            await instagram_service.send_message(sender_id, followup, instagram_access_token)
+            return {"status": "ok"}
+
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
         calendar_slots = session.get("calendar_slots") or []
@@ -5018,7 +5385,7 @@ async def instagram_webhook(request: Request):
 
         try:
             # ── PRE-CHECK: detect email when last bot message asked for it ────────
-            validate_email = context.get("integration", {}).get("validateEmail", True)
+            validate_email = _validate_email_enabled(context)
             logger.info(
                 "Instagram: email validation check – validate_email=%s otp_sent=%s history_len=%d",
                 validate_email, email_validation_state["otp_sent"], len(conversation_history),
@@ -5190,8 +5557,10 @@ async def instagram_webhook(request: Request):
                             if email_valid:
                                 if app_id:
                                     parsed_json["appId"] = app_id
+                                created_lead_resp = None
+                                ok_lead = False
                                 try:
-                                    ok_lead, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                                     final_msg = (
                                         get_string("final_success", lang_code)
                                         if ok_lead
@@ -5207,6 +5576,15 @@ async def instagram_webhook(request: Request):
                                         instagram_access_token,
                                     )
                                 await instagram_service.send_message(sender_id, final_msg, instagram_access_token)
+                                if _capture_feedback_enabled(context) and ok_lead:
+                                    feedback_prompt = _feedback_prompt_message()
+                                    session["feedback_collection_active"] = True
+                                    session["feedback_data"] = {}
+                                    session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                                    session["history"] = conversation_history
+                                    await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                                    return {"status": "ok"}
                                 key = f"instagram_{recipient_id}_{sender_id}"
                                 instagram_key_to_session.pop(key, None)
                                 instagram_sessions.pop(session_id, None)
@@ -5354,8 +5732,10 @@ async def instagram_webhook(request: Request):
                 if email_valid:
                     if app_id:
                         parsed_json["appId"] = app_id
+                    created_lead_resp = None
+                    ok = False
                     try:
-                        ok, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                        ok, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                         final_msg = (
                             get_string("final_success", lang_code)
                             if ok
@@ -5373,6 +5753,15 @@ async def instagram_webhook(request: Request):
                             instagram_access_token,
                         )
                     await instagram_service.send_message(sender_id, final_msg, instagram_access_token)
+                    if _capture_feedback_enabled(context) and ok:
+                        feedback_prompt = _feedback_prompt_message()
+                        session["feedback_collection_active"] = True
+                        session["feedback_data"] = {}
+                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                        conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                        session["history"] = conversation_history
+                        await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                        return {"status": "ok"}
                     key = f"instagram_{recipient_id}_{sender_id}"
                     instagram_key_to_session.pop(key, None)
                     instagram_sessions.pop(session_id, None)
