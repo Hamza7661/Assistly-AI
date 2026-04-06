@@ -1129,24 +1129,6 @@ Classify the intent:"""
                         context,
                         collected_lead_type=collected_lead_type,
                     )
-
-            # Graceful switch: if user selects another service while in workflow, restart service flow.
-            service_plans = context.get("service_plans", [])
-            all_services = []
-            for plan in service_plans:
-                if isinstance(plan, dict):
-                    nm = plan.get("question", plan.get("name", plan.get("title", "")))
-                    if nm:
-                        all_services.append(nm)
-                else:
-                    all_services.append(str(plan))
-            switched_service = extractor.match_service(user_message, all_services)
-            if switched_service and (flow_controller.collected_data.get("serviceType") or "").lower() != switched_service.lower():
-                flow_controller.update_collected_data("serviceType", switched_service)
-                flow_controller.reset_service_flow()
-                return f"Switching to {switched_service}. " + await self._generate_service_selection_response(
-                    conversation_history, context, collected_lead_type=flow_controller.collected_data.get("leadType")
-                )
             # Handle workflow question
             current_question = workflow_manager.get_current_question()
             if not current_question:
