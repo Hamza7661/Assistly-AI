@@ -626,16 +626,12 @@ def _extract_index_choice(text: str) -> Optional[int]:
 def _feedback_prompt_message() -> str:
     return (
         "Your feedback helps us improve every chat.\n"
-        "Please choose your experience:\n"
-        "<button value=\"exp:very_happy\">😄 Excellent</button>\n"
-        "<button value=\"exp:happy\">🙂 Good</button>\n"
-        "<button value=\"exp:neutral\">😐 Okay</button>\n"
-        "<button value=\"exp:sad\">🙁 Not good</button>\n"
-        "<button value=\"exp:very_sad\">😞 Poor</button>\n\n"
-        "Now rate your overall experience (1 to 5):\n"
-        "<button value=\"rating:1\">1</button> <button value=\"rating:2\">2</button> "
-        "<button value=\"rating:3\">3</button> <button value=\"rating:4\">4</button> "
-        "<button value=\"rating:5\">5</button>"
+        "Please choose your experience and rating in one tap:\n"
+        "<button value=\"feedback:very_happy:5\">😄 Excellent (5/5)</button>\n"
+        "<button value=\"feedback:happy:4\">🙂 Good (4/5)</button>\n"
+        "<button value=\"feedback:neutral:3\">😐 Okay (3/5)</button>\n"
+        "<button value=\"feedback:sad:2\">🙁 Not good (2/5)</button>\n"
+        "<button value=\"feedback:very_sad:1\">😞 Poor (1/5)</button>"
     )
 
 
@@ -684,6 +680,43 @@ def _extract_feedback_rating(text: str) -> Optional[int]:
         return None
     value = int(match.group(1))
     return value if 1 <= value <= 5 else None
+
+
+def _extract_feedback_submission(text: str) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Normalize feedback input so one response can contain both values.
+    Supports values like `feedback:happy:4`, old split values, and plain text.
+    """
+    if not text:
+        return None, None
+    t = str(text).strip().lower()
+    combined = re.search(r"\bfeedback:(very_happy|happy|neutral|sad|very_sad):([1-5])\b", t)
+    if combined:
+        return combined.group(1), int(combined.group(2))
+
+    exp = _extract_feedback_experience(text)
+    rating = _extract_feedback_rating(text)
+
+    exp_to_rating = {
+        "very_happy": 5,
+        "happy": 4,
+        "neutral": 3,
+        "sad": 2,
+        "very_sad": 1,
+    }
+    rating_to_exp = {
+        5: "very_happy",
+        4: "happy",
+        3: "neutral",
+        2: "sad",
+        1: "very_sad",
+    }
+
+    if exp and not rating:
+        rating = exp_to_rating.get(exp)
+    if rating and not exp:
+        exp = rating_to_exp.get(rating)
+    return exp, rating
 
 
 def _capture_feedback_enabled(context: Dict[str, Any]) -> bool:
@@ -1436,8 +1469,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if feedback_collection_active:
                 user_raw = str(user_text).strip()
                 conversation_history.append({"role": "user", "content": user_raw})
-                exp = _extract_feedback_experience(user_raw)
-                rating = _extract_feedback_rating(user_raw)
+                exp, rating = _extract_feedback_submission(user_raw)
                 if exp:
                     feedback_data["experience"] = exp
                 if rating:
@@ -2864,8 +2896,7 @@ async def whatsapp_webhook(request: Request):
             if user_raw:
                 conversation_history.append({"role": "user", "content": user_raw})
             feedback_data = dict(session.get("feedback_data") or {})
-            exp = _extract_feedback_experience(user_raw)
-            rating = _extract_feedback_rating(user_raw)
+            exp, rating = _extract_feedback_submission(user_raw)
             if exp:
                 feedback_data["experience"] = exp
             if rating:
@@ -4164,8 +4195,7 @@ async def messenger_webhook(request: Request):
             if user_raw:
                 conversation_history.append({"role": "user", "content": user_raw})
             feedback_data = dict(session.get("feedback_data") or {})
-            exp = _extract_feedback_experience(user_raw)
-            rating = _extract_feedback_rating(user_raw)
+            exp, rating = _extract_feedback_submission(user_raw)
             if exp:
                 feedback_data["experience"] = exp
             if rating:
@@ -5168,8 +5198,7 @@ async def instagram_webhook(request: Request):
             if user_raw:
                 conversation_history.append({"role": "user", "content": user_raw})
             feedback_data = dict(session.get("feedback_data") or {})
-            exp = _extract_feedback_experience(user_raw)
-            rating = _extract_feedback_rating(user_raw)
+            exp, rating = _extract_feedback_submission(user_raw)
             if exp:
                 feedback_data["experience"] = exp
             if rating:
