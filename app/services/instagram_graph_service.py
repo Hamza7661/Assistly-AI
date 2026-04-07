@@ -133,6 +133,19 @@ class InstagramGraphService:
         if not access_token:
             raise ValueError("Instagram access token is required")
 
+        # Keep numbered fallback text for clients where chips are hidden.
+        fallback_lines = [f"{i}. {qr.get('title', '')}".strip() for i, qr in enumerate(quick_replies[:13], 1)]
+        fallback_lines = [ln for ln in fallback_lines if ln and not ln.endswith(".")]
+        if fallback_lines:
+            fallback_text = "\n".join(fallback_lines)
+            if fallback_text:
+                message_text = (
+                    f"{message_text}\n\n{fallback_text}\n\n"
+                    "If buttons are not visible, reply with the number of your choice."
+                )
+        if len(message_text) > 2000:
+            message_text = message_text[:1997] + "..."
+
         url = f"{self.base_url}/me/messages"
         payload = {
             "recipient": {"id": recipient_id},

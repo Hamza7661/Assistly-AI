@@ -980,7 +980,15 @@ def _find_post_booking_note(service_plans: List[Any], service_title: str) -> str
     for sp in service_plans or []:
         if not isinstance(sp, dict):
             continue
-        q = _normalize_service_title_for_plan_match(str(sp.get("question", "")))
+        candidate_titles = [
+            sp.get("question", ""),
+            sp.get("title", ""),
+            sp.get("name", ""),
+            sp.get("serviceName", ""),
+        ]
+        q = _normalize_service_title_for_plan_match(
+            next((str(v) for v in candidate_titles if str(v).strip()), "")
+        )
         # Prefer exact match, but allow contains-based fallback for minor title variations
         # (e.g. numbering/punctuation differences across channels).
         if q == target or (q and target in q) or (q and q in target):
