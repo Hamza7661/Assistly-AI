@@ -997,6 +997,33 @@ def _find_post_booking_note(service_plans: List[Any], service_title: str) -> str
     return ""
 
 
+async def _resolve_post_booking_note(
+    context: Dict[str, Any],
+    app_id: Optional[str],
+    service_title: str,
+    context_service: Optional[Any] = None,
+) -> str:
+    """
+    Resolve post-booking note with a fresh-context fallback for social channels.
+    This avoids stale in-memory context causing missing notes.
+    """
+    service_plans_ctx = context.get("service_plans", []) if isinstance(context, dict) else []
+    note = _find_post_booking_note(service_plans_ctx, service_title)
+    if note:
+        return note
+    if not app_id or context_service is None:
+        return ""
+    try:
+        refreshed = await context_service.fetch_context_by_app(str(app_id))
+        refreshed_plans = refreshed.get("service_plans", []) if isinstance(refreshed, dict) else []
+        if isinstance(context, dict):
+            context["service_plans"] = refreshed_plans
+        return _find_post_booking_note(refreshed_plans, service_title)
+    except Exception as note_exc:
+        logger.warning("Post-booking note refresh failed (app_id=%s): %s", app_id, note_exc)
+        return ""
+
+
 def _html_post_booking_to_chat_text(html: str) -> str:
     from html import unescape
 
@@ -4558,8 +4585,12 @@ async def messenger_webhook(request: Request):
                         customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
                         customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
                         customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
-                        _service_plans_ctx = context.get("service_plans", [])
-                        _post_booking_note_raw = _find_post_booking_note(_service_plans_ctx, service_title)
+                        _post_booking_note_raw = await _resolve_post_booking_note(
+                            context=context,
+                            app_id=app_id,
+                            service_title=service_title,
+                            context_service=context_service,
+                        )
                         _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
                         calendar_service = CalendarService(settings)
                         book_result = await calendar_service.book_appointment(
@@ -5722,8 +5753,12 @@ async def instagram_webhook(request: Request):
                         customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
                         customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
                         customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
-                        _service_plans_ctx = context.get("service_plans", [])
-                        _post_booking_note_raw = _find_post_booking_note(_service_plans_ctx, service_title)
+                        _post_booking_note_raw = await _resolve_post_booking_note(
+                            context=context,
+                            app_id=app_id,
+                            service_title=service_title,
+                            context_service=context_service,
+                        )
                         _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
                         calendar_service = CalendarService(settings)
                         book_result = await calendar_service.book_appointment(
