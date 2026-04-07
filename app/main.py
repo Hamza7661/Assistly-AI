@@ -4535,7 +4535,7 @@ async def messenger_webhook(request: Request):
                     pending_slot = session.get("calendar_pending_slot") or {}
                     if not pending_slot:
                         raise ValueError("Missing pending slot")
-                    if raw_lower in ("confirm", "yes", "book", "book now"):
+                    if raw_lower in ("confirm", "confirm booking", "yes", "book", "book now"):
                         start_iso = pending_slot.get("start", "")
                         end_iso = pending_slot.get("end", "")
                         slot_timezone = pending_slot.get("timezone")
@@ -4630,7 +4630,7 @@ async def messenger_webhook(request: Request):
                             session["history"] = conversation_history
                             await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
                         return {"status": "ok"}
-                    if raw_lower in ("cancel", "no"):
+                    if raw_lower in ("cancel", "cancel booking", "no"):
                         session["calendar_flow"] = "slots"
                         session["calendar_pending_slot"] = None
                         lines = ["No problem. Please choose another time slot:"]
@@ -4715,7 +4715,12 @@ async def messenger_webhook(request: Request):
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                    else:
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
                     return {"status": "ok"}
             except ValueError:
                 pass
@@ -4791,7 +4796,12 @@ async def messenger_webhook(request: Request):
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
-                await messenger_service.send_message(sender_id, reply, page_access_token)
+                cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                if buttons:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                else:
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
             except Exception as cal_exc:
                 logger.exception("Messenger: Calendar availability error: %s", cal_exc)
@@ -5683,7 +5693,7 @@ async def instagram_webhook(request: Request):
                     pending_slot = session.get("calendar_pending_slot") or {}
                     if not pending_slot:
                         raise ValueError("Missing pending slot")
-                    if raw_lower in ("confirm", "yes", "book", "book now"):
+                    if raw_lower in ("confirm", "confirm booking", "yes", "book", "book now"):
                         start_iso = pending_slot.get("start", "")
                         end_iso = pending_slot.get("end", "")
                         slot_timezone = pending_slot.get("timezone")
@@ -5778,7 +5788,7 @@ async def instagram_webhook(request: Request):
                             session["history"] = conversation_history
                             await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
                         return {"status": "ok"}
-                    if raw_lower in ("cancel", "no"):
+                    if raw_lower in ("cancel", "cancel booking", "no"):
                         session["calendar_flow"] = "slots"
                         session["calendar_pending_slot"] = None
                         lines = ["No problem. Please choose another time slot:"]
@@ -5863,7 +5873,12 @@ async def instagram_webhook(request: Request):
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                    else:
+                        await instagram_service.send_message(sender_id, reply, instagram_access_token)
                     return {"status": "ok"}
             except ValueError:
                 pass
@@ -5939,7 +5954,12 @@ async def instagram_webhook(request: Request):
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
-                await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                if buttons:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                else:
+                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
             except Exception as cal_exc:
                 logger.exception("Instagram: Calendar availability error: %s", cal_exc)
