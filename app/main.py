@@ -975,11 +975,15 @@ def _normalize_service_title_for_plan_match(title: str) -> str:
 
 def _find_post_booking_note(service_plans: List[Any], service_title: str) -> str:
     target = _normalize_service_title_for_plan_match(service_title)
+    if not target:
+        return ""
     for sp in service_plans or []:
         if not isinstance(sp, dict):
             continue
         q = _normalize_service_title_for_plan_match(str(sp.get("question", "")))
-        if q == target:
+        # Prefer exact match, but allow contains-based fallback for minor title variations
+        # (e.g. numbering/punctuation differences across channels).
+        if q == target or (q and target in q) or (q and q in target):
             raw = sp.get("postBookingNote")
             return (str(raw).strip() if raw is not None else "")
     return ""
@@ -4573,6 +4577,9 @@ async def messenger_webhook(request: Request):
                                 reply = f"Booked! Your {service_title} appointment is confirmed for {time_str}."
                             except Exception:
                                 reply = f"Booked! Your {service_title} appointment is confirmed."
+                            if not _post_booking_note_chat:
+                                _fallback_note = str(book_result.get("postBookingNote") or book_result.get("post_booking_note") or "").strip()
+                                _post_booking_note_chat = _format_post_booking_note_for_chat(_fallback_note)
                             if _post_booking_note_chat:
                                 reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
                             _review_url_inline = _integration_google_review_url(integration)
@@ -5731,6 +5738,9 @@ async def instagram_webhook(request: Request):
                                 reply = f"Booked! Your {service_title} appointment is confirmed for {time_str}."
                             except Exception:
                                 reply = f"Booked! Your {service_title} appointment is confirmed."
+                            if not _post_booking_note_chat:
+                                _fallback_note = str(book_result.get("postBookingNote") or book_result.get("post_booking_note") or "").strip()
+                                _post_booking_note_chat = _format_post_booking_note_for_chat(_fallback_note)
                             if _post_booking_note_chat:
                                 reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
                             _review_url_inline = _integration_google_review_url(integration)
