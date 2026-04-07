@@ -1800,9 +1800,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         logger.warning("interjection RAG answer failed: %s", _rag_err)
                     # Only intercept when we got a clean answer (not a JSON lead payload)
                     if _rag_answer and not _looks_like_internal_lead_payload(_rag_answer):
-                        _pending_step = await response_generator._generate_state_response(
-                            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
-                        )
+                        # Re-prompt deterministically to avoid LLM drift after an interjection.
+                        if flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+                            _wm = flow_controller.workflow_manager
+                            _current_q = _wm.get_current_question() if _wm and _wm.is_active else None
+                            if _current_q:
+                                _pending_step = _wm.format_question_with_options(_current_q) or ""
+                            else:
+                                _pending_step = await response_generator._generate_state_response(
+                                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                                )
+                        elif flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                            _pending_step = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
+                        elif flow_controller.state == ConversationState.CALENDAR_BOOKING:
+                            _pending_step = "BOOK_APPOINTMENT_REQUESTED"
+                        else:
+                            _pending_step = await response_generator._generate_state_response(
+                                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                            )
                         _interject_reply = f"{_rag_answer}\n\n---\n\n{_pending_step}"
                         logger.info(
                             "interjection_detected state=%s interjection_answered_from_rag=True interjection_resumed_state=%s",
