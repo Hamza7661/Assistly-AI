@@ -1160,6 +1160,90 @@ Classify the intent:"""
                 else:
                     return current_question_formatted
             
+            current_options = current_question.get("options", []) or []
+
+            # Guard option-based questions: if user types a random/off-route value (e.g. from channels
+            # where UI constraints aren't enforced), do not advance. Re-show the same question.
+            if current_options and not conversation_style_enabled and (user_message or "").strip():
+                sorted_opts = sorted(current_options, key=lambda o: o.get("order", 0))
+                allowed = {(str(o.get("text") or "").strip().lower()) for o in sorted_opts if str(o.get("text") or "").strip()}
+                provided_parts = [p.strip().lower() for p in user_message.strip().split(",") if p.strip()]
+                if user_message.strip().isdigit():
+                    number = int(user_message.strip())
+                    is_valid = 1 <= number <= len(sorted_opts)
+                else:
+                    is_valid = bool(provided_parts) and all(p in allowed for p in provided_parts)
+                if not is_valid:
+                    current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
+                    return (
+                        "Please choose from the provided options so I can continue.\n\n"
+                        f"{current_question_formatted}"
+                    )
+
+            # Non-booking open text/voice workflow question:
+            # 1) Try FAQ/RAG first.
+            # 2) If not found but still industry-related, answer via LLM.
+            # 3) If off-industry/off-route, apologize and repeat same question (no progression).
+            if (
+                not current_options
+                and not flow_controller.is_booking_lead_type()
+                and (user_message or "").strip()
+            ):
+                try:
+                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                    context_l = (rag_context or "").lower()
+                    relevance_markers = (
+                        "[source: faq",
+                        "[source: service",
+                        "[source: lead_type",
+                        "faq",
+                        "service",
+                        "workflow",
+                        "lead type",
+                    )
+                    has_domain_signal = any(marker in context_l for marker in relevance_markers)
+                    industry_question_types = {"pricing", "general_info", "procedure_info", "location_hours", "other"}
+                    is_industry_related = question_type in industry_question_types
+
+                    if has_domain_signal or is_industry_related:
+                        answer = await self._generate_question_response(
+                            user_message,
+                            rag_context or "",
+                            conversation_history,
+                            context,
+                            flow_controller=flow_controller,
+                        )
+                        has_more = workflow_manager.record_answer(user_message)
+                        if has_more:
+                            next_question = workflow_manager.get_current_question()
+                            next_prompt = workflow_manager.format_question_with_options(next_question) if next_question else ""
+                        else:
+                            workflow_answers = workflow_manager.get_workflow_answers()
+                            flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                            workflow_manager.reset()
+                            flow_controller.transition_to(flow_controller.get_next_state())
+                            logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                            if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                                next_prompt = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
+                            elif flow_controller.state == ConversationState.CALENDAR_BOOKING:
+                                next_prompt = "BOOK_APPOINTMENT_REQUESTED"
+                            else:
+                                next_prompt = await self._generate_state_response(
+                                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                                )
+                        if answer and next_prompt:
+                            return f"{answer}\n\n{next_prompt}"
+                        if answer:
+                            return answer
+
+                    current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
+                    return (
+                        "Sorry, I can only help with questions related to our services and industry here.\n\n"
+                        f"{current_question_formatted}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed open workflow query handling: {e}")
+
             # Not a question - treat as workflow answer
             has_more = workflow_manager.record_answer(user_message)
             

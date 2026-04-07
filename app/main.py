@@ -225,6 +225,97 @@ def _integration_google_review_url(integration: Any) -> Optional[str]:
     return url or None
 
 
+def _is_review_or_feedback_lead_type(flow_controller: Any, context: Dict[str, Any]) -> bool:
+    """
+    True when current lead type is explicitly review/feedback oriented.
+    In that case, do not inject extra global review/feedback prompts at completion
+    to avoid asking the same thing twice.
+    """
+    try:
+        lead_type_value = str((flow_controller.collected_data or {}).get("leadType") or "").strip().lower()
+    except Exception:
+        lead_type_value = ""
+    if not lead_type_value:
+        return False
+
+    lead_types = context.get("lead_types") or []
+    lead_type_text = ""
+    for lt in lead_types:
+        if not isinstance(lt, dict):
+            continue
+        if str(lt.get("value") or "").strip().lower() == lead_type_value:
+            lead_type_text = str(lt.get("text") or "").strip().lower()
+            break
+
+    haystack = f"{lead_type_value} {lead_type_text}".strip()
+    keywords = tuple(_review_feedback_keywords(context))
+    return any(k in haystack for k in keywords)
+
+
+def _review_feedback_keywords(context: Dict[str, Any]) -> List[str]:
+    """
+    Configurable keyword list for review/feedback detection.
+    Integration can provide:
+      - reviewFeedbackKeywords: list[str] or comma-separated string
+      - reviewFeedbackKeywordList: list[str] or comma-separated string
+    """
+    defaults = ["review", "feedback", "rating", "testimonial"]
+    integration = context.get("integration") or {}
+    raw = integration.get("reviewFeedbackKeywords")
+    if raw is None:
+        raw = integration.get("reviewFeedbackKeywordList")
+
+    parsed: List[str] = []
+    if isinstance(raw, str):
+        parsed = [p.strip().lower() for p in re.split(r"[,\n;|]+", raw) if p and p.strip()]
+    elif isinstance(raw, list):
+        parsed = [str(p).strip().lower() for p in raw if str(p).strip()]
+
+    cleaned = [k for k in parsed if len(k) >= 3]
+    return cleaned if cleaned else defaults
+
+
+def _workflow_has_review_feedback_question(flow_controller: Any, context: Dict[str, Any]) -> bool:
+    """Detect whether current/answered workflow questions already include review/feedback intent."""
+    keywords = _review_feedback_keywords(context)
+
+    def _matches(text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        return any(k in t for k in keywords)
+
+    try:
+        answers = (flow_controller.collected_data or {}).get("workflowAnswers") or {}
+        if isinstance(answers, dict):
+            for item in answers.values():
+                if isinstance(item, dict) and _matches(item.get("question", "")):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        wm = getattr(flow_controller, "workflow_manager", None)
+        cw = getattr(wm, "current_workflow", None) if wm else None
+        if isinstance(cw, dict):
+            for q in (cw.get("questions") or []):
+                if isinstance(q, dict) and _matches(q.get("question", "")):
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _should_skip_global_review_feedback_prompts(flow_controller: Any, context: Dict[str, Any]) -> bool:
+    """
+    Skip global review/feedback prompts only when:
+    1) user is in review/feedback lead type, AND
+    2) workflow already has a review/feedback question.
+    """
+    return _is_review_or_feedback_lead_type(flow_controller, context) and _workflow_has_review_feedback_question(flow_controller, context)
+
+
 def get_or_create_session(user_phone: str) -> tuple[str, bool]:
     """Get existing session or create new one. Returns (session_id, is_new)"""
     current_time = time.time()
@@ -1831,7 +1922,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if _post_booking_note_chat:
                             reply += f"\n\n📋 **Important Instructions**\n{_post_booking_note_chat}"
                         _review_url_inline = _integration_google_review_url(integration)
-                        if _review_url_inline:
+                        if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                             reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
                         # Booking confirmation is the terminal step for this lead cycle.
                         try:
@@ -1871,7 +1962,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
-                        if _capture_feedback_enabled(context):
+                        if _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                             feedback_prompt = _feedback_prompt_message()
                             feedback_collection_active = True
                             feedback_data = {}
@@ -2158,7 +2249,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     final_msg = get_string("final_fallback", lang_code)
                                 
                                 integration = context.get("integration") or {}
-                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     review_url_ws = integration["googleReviewUrl"].strip()
                                     await websocket.send_json({
                                         "type": "review_prompt",
@@ -2475,7 +2566,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     final_msg = get_string("final_fallback", lang_code)
                 
                 integration = context.get("integration") or {}
-                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                     review_url = integration["googleReviewUrl"].strip()
                     await websocket.send_json({
                         "type": "review_prompt",
@@ -2484,7 +2575,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
                 conversation_history.append({"role": "assistant", "content": final_msg})
-                if _capture_feedback_enabled(context):
+                if _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                     feedback_prompt = _feedback_prompt_message()
                     feedback_collection_active = True
                     feedback_data = {}
@@ -3476,14 +3567,14 @@ async def whatsapp_webhook(request: Request):
                             final_msg = get_string("final_fallback", session.get("response_language_code", "en"))
                         
                         integration = context.get("integration") or {}
-                        if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                        if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                             review_url = integration["googleReviewUrl"].strip()
                             review_msg = get_string("review_prompt", session.get("response_language_code", "en"), review_url)
                             conversation_history.append({"role": "assistant", "content": review_msg})
                             await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                         conversation_history.append({"role": "assistant", "content": final_msg})
                         await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
-                        if _capture_feedback_enabled(context) and ok_lead:
+                        if _capture_feedback_enabled(context) and ok_lead and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                             feedback_prompt = _feedback_prompt_message()
                             session["feedback_collection_active"] = True
                             session["feedback_data"] = {}
@@ -3691,12 +3782,12 @@ async def whatsapp_webhook(request: Request):
                     final_msg = get_string("final_fallback", session.get("response_language_code", "en"))
                 
                 integration = context.get("integration") or {}
-                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                     review_url = integration["googleReviewUrl"].strip()
                     review_msg = get_string("review_prompt", session.get("response_language_code", "en"), review_url)
                     await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                 await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
-                if _capture_feedback_enabled(context) and ok:
+                if _capture_feedback_enabled(context) and ok and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                     feedback_prompt = _feedback_prompt_message()
                     session["feedback_collection_active"] = True
                     session["feedback_data"] = {}
@@ -4635,14 +4726,14 @@ async def messenger_webhook(request: Request):
                                 except Exception:
                                     final_msg = get_string("final_fallback", lang_code)
                                 integration = context.get("integration") or {}
-                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     await messenger_service.send_message(
                                         sender_id,
                                         get_string("review_prompt", lang_code, integration["googleReviewUrl"].strip()),
                                         page_access_token,
                                     )
                                 await messenger_service.send_message(sender_id, final_msg, page_access_token)
-                                if _capture_feedback_enabled(context) and ok_lead:
+                                if _capture_feedback_enabled(context) and ok_lead and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     feedback_prompt = _feedback_prompt_message()
                                     session["feedback_collection_active"] = True
                                     session["feedback_data"] = {}
@@ -4814,7 +4905,7 @@ async def messenger_webhook(request: Request):
                         final_msg = get_string("final_fallback", lang_code)
 
                     integration = context.get("integration") or {}
-                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                         review_url = integration["googleReviewUrl"].strip()
                         await messenger_service.send_message(
                             sender_id,
@@ -4822,7 +4913,7 @@ async def messenger_webhook(request: Request):
                             page_access_token,
                         )
                     await messenger_service.send_message(sender_id, final_msg, page_access_token)
-                    if _capture_feedback_enabled(context) and ok:
+                    if _capture_feedback_enabled(context) and ok and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                         feedback_prompt = _feedback_prompt_message()
                         session["feedback_collection_active"] = True
                         session["feedback_data"] = {}
@@ -5635,14 +5726,14 @@ async def instagram_webhook(request: Request):
                                 except Exception:
                                     final_msg = get_string("final_fallback", lang_code)
                                 integration = context.get("integration") or {}
-                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     await instagram_service.send_message(
                                         sender_id,
                                         get_string("review_prompt", lang_code, integration["googleReviewUrl"].strip()),
                                         instagram_access_token,
                                     )
                                 await instagram_service.send_message(sender_id, final_msg, instagram_access_token)
-                                if _capture_feedback_enabled(context) and ok_lead:
+                                if _capture_feedback_enabled(context) and ok_lead and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     feedback_prompt = _feedback_prompt_message()
                                     session["feedback_collection_active"] = True
                                     session["feedback_data"] = {}
@@ -5811,7 +5902,7 @@ async def instagram_webhook(request: Request):
                         final_msg = get_string("final_fallback", lang_code)
 
                     integration = context.get("integration") or {}
-                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                         review_url = integration["googleReviewUrl"].strip()
                         await instagram_service.send_message(
                             sender_id,
@@ -5819,7 +5910,7 @@ async def instagram_webhook(request: Request):
                             instagram_access_token,
                         )
                     await instagram_service.send_message(sender_id, final_msg, instagram_access_token)
-                    if _capture_feedback_enabled(context) and ok:
+                    if _capture_feedback_enabled(context) and ok and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                         feedback_prompt = _feedback_prompt_message()
                         session["feedback_collection_active"] = True
                         session["feedback_data"] = {}
