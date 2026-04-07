@@ -1150,10 +1150,12 @@ def _extract_phone_from_text(text: str) -> str:
     return None
 
 def _extract_buttons_from_response(response: str) -> Tuple[str, List[Dict[str, str]]]:
-    """Extract buttons from response and return cleaned text + button data"""
+    """Extract button/checkbox options from response and return cleaned text + option data."""
     buttons = []
-    button_pattern = r'<\s*button[^>]*>\s*([^<]+?)\s*</\s*button[^>]*>'
-    button_matches = re.findall(button_pattern, response, re.IGNORECASE | re.DOTALL)
+    # Messenger/Instagram can't render custom XML tags directly.
+    # Accept both <button> and <checkbox> so workflow options become quick replies.
+    option_pattern = r'<\s*(?:button|checkbox)[^>]*>\s*([^<]+?)\s*</\s*(?:button|checkbox)[^>]*>'
+    button_matches = re.findall(option_pattern, response, re.IGNORECASE | re.DOTALL)
     
     seen_buttons = set()
     for button_text in button_matches:
@@ -1165,12 +1167,104 @@ def _extract_buttons_from_response(response: str) -> Tuple[str, List[Dict[str, s
                 "title": clean_text
             })
     
-    cleaned_response = re.sub(button_pattern, '', response, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_response = re.sub(r'<\s*button[^>]*>.*?</\s*button[^>]*>', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_response = re.sub(r'<\s*button[^>]*>.*?$', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_response = re.sub(option_pattern, '', response, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_response = re.sub(
+        r'<\s*(?:button|checkbox)[^>]*>.*?</\s*(?:button|checkbox)[^>]*>',
+        '',
+        cleaned_response,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    cleaned_response = re.sub(
+        r'<\s*(?:button|checkbox)[^>]*>.*?$',
+        '',
+        cleaned_response,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     cleaned_response = cleaned_response.strip()
     
     return cleaned_response, buttons
+
+
+async def _expand_booking_request_reply_for_social_channel(
+    reply: str,
+    integration: Dict[str, Any],
+    app_id: Optional[str],
+    flow_controller: Any,
+    session: Dict[str, Any],
+) -> str:
+    """
+    Convert BOOK_APPOINTMENT_REQUESTED into actual day-selection buttons for social channels.
+    This mirrors the web widget behavior so Messenger/Instagram don't show raw internal tokens.
+    """
+    if str(reply).strip() != "BOOK_APPOINTMENT_REQUESTED":
+        return reply
+    if not app_id:
+        return "I'd love to help you book. Please share which service you'd like, and I'll suggest available times."
+
+    from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
+    slot_minutes = integration.get("calendarSlotMinutes", 30)
+    if slot_minutes not in (15, 30, 60):
+        slot_minutes = 30
+
+    try:
+        calendar_service = CalendarService(settings)
+        result = await calendar_service.get_availability(app_id, from_date, to_date, slot_minutes=slot_minutes)
+        if result.get("error"):
+            return "I couldn't fetch availability right now. Please try again later."
+
+        cal_tz = _calendar_tz_from_integration(integration)
+        now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        free_slots = [
+            s for s in (result.get("freeSlots") or [])
+            if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > now_utc
+        ]
+        free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz)
+        if not free_slots:
+            if not result.get("calendarConnected"):
+                return "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
+            return "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+
+        by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for slot in free_slots:
+            start = slot.get("start") or ""
+            if not start:
+                continue
+            try:
+                from zoneinfo import ZoneInfo
+                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                date_key = dt_utc.astimezone(ZoneInfo(cal_tz)).strftime("%Y-%m-%d")
+            except Exception:
+                date_key = start[:10]
+            by_date.setdefault(date_key, []).append(slot)
+
+        days_order = sorted(by_date.keys())
+        calendar_days_list = []
+        for d in days_order:
+            try:
+                from zoneinfo import ZoneInfo
+                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
+                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
+            except Exception:
+                calendar_days_list.append({"date": d, "label": d})
+
+        session["calendar_flow"] = "days"
+        session["calendar_days"] = calendar_days_list
+        session["calendar_free_slots"] = free_slots
+        session["calendar_slots"] = None
+        session["calendar_selected_day"] = None
+
+        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+        if service_title:
+            intro = f"Great! Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+        else:
+            intro = "Great! Here are the available dates for your appointment. Please choose a day:"
+        lines = [intro]
+        for i, day in enumerate(calendar_days_list[:14], 1):
+            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+        return "\n".join(lines)
+    except Exception as cal_exc:
+        logger.exception("Social channel: Calendar availability error: %s", cal_exc)
+        return "I couldn't fetch availability right now. Please try again later."
 
 def _convert_lead_types_to_whatsapp_buttons(lead_types: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """Convert lead types to WhatsApp button format"""
@@ -5110,6 +5204,15 @@ async def messenger_webhook(request: Request):
                     await messenger_service.send_message(sender_id, reply, page_access_token)
                     return {"status": "ok"}
 
+            # Expand booking token to real calendar choices for Messenger.
+            reply = await _expand_booking_request_reply_for_social_channel(
+                reply=reply,
+                integration=integration,
+                app_id=app_id,
+                flow_controller=flow_controller,
+                session=session,
+            )
+
             # ── Regular reply ─────────────────────────────────────────────────────
             conversation_history.append({"role": "assistant", "content": reply})
             session["history"] = conversation_history
@@ -6104,6 +6207,15 @@ async def instagram_webhook(request: Request):
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
                     return {"status": "ok"}
+
+            # Expand booking token to real calendar choices for Instagram.
+            reply = await _expand_booking_request_reply_for_social_channel(
+                reply=reply,
+                integration=integration,
+                app_id=app_id,
+                flow_controller=flow_controller,
+                session=session,
+            )
 
             # ── Regular reply ─────────────────────────────────────────────────────
             conversation_history.append({"role": "assistant", "content": reply})
