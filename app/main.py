@@ -4547,7 +4547,10 @@ async def messenger_webhook(request: Request):
                     pending_slot = session.get("calendar_pending_slot") or {}
                     if not pending_slot:
                         raise ValueError("Missing pending slot")
-                    if raw_lower in ("confirm", "confirm booking", "yes", "book", "book now"):
+                    confirm_num = _extract_index_choice(message_text)
+                    is_confirm_choice = raw_lower in ("confirm", "confirm booking", "yes", "book", "book now") or confirm_num == 1
+                    is_cancel_choice = raw_lower in ("cancel", "cancel booking", "no") or confirm_num == 2
+                    if is_confirm_choice:
                         start_iso = pending_slot.get("start", "")
                         end_iso = pending_slot.get("end", "")
                         slot_timezone = pending_slot.get("timezone")
@@ -4645,7 +4648,7 @@ async def messenger_webhook(request: Request):
                             session["history"] = conversation_history
                             await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
                         return {"status": "ok"}
-                    if raw_lower in ("cancel", "cancel booking", "no"):
+                    if is_cancel_choice:
                         session["calendar_flow"] = "slots"
                         session["calendar_pending_slot"] = None
                         lines = ["No problem. Please choose another time slot:"]
@@ -5708,7 +5711,10 @@ async def instagram_webhook(request: Request):
                     pending_slot = session.get("calendar_pending_slot") or {}
                     if not pending_slot:
                         raise ValueError("Missing pending slot")
-                    if raw_lower in ("confirm", "confirm booking", "yes", "book", "book now"):
+                    confirm_num = _extract_index_choice(message_text)
+                    is_confirm_choice = raw_lower in ("confirm", "confirm booking", "yes", "book", "book now") or confirm_num == 1
+                    is_cancel_choice = raw_lower in ("cancel", "cancel booking", "no") or confirm_num == 2
+                    if is_confirm_choice:
                         start_iso = pending_slot.get("start", "")
                         end_iso = pending_slot.get("end", "")
                         slot_timezone = pending_slot.get("timezone")
@@ -5806,7 +5812,7 @@ async def instagram_webhook(request: Request):
                             session["history"] = conversation_history
                             await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
                         return {"status": "ok"}
-                    if raw_lower in ("cancel", "cancel booking", "no"):
+                    if is_cancel_choice:
                         session["calendar_flow"] = "slots"
                         session["calendar_pending_slot"] = None
                         lines = ["No problem. Please choose another time slot:"]
