@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Optional
 import logging
 import json
 import tempfile
+import re
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -937,6 +938,44 @@ Generate the initial greeting with lead type buttons. Use EXACT format: <button>
                 str((context_data or {}).get("profession") or profession or "").strip()
                 or "Business"
             )
+            context_payload = context_data or {}
+
+            # 1) FAQ-first shortcut for side questions:
+            # Prefer exact/near-exact FAQ answers before mixed RAG retrieval.
+            def _tokens(text: str) -> set:
+                return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+            def _faq_match_score(user_q: str, faq_q: str) -> float:
+                uq = _tokens(user_q)
+                fq = _tokens(faq_q)
+                if not uq or not fq:
+                    return 0.0
+                # Jaccard overlap + substring bonus for near-exact phrasing.
+                overlap = len(uq.intersection(fq)) / max(1, len(uq.union(fq)))
+                if faq_q and faq_q.lower() in (user_q or "").lower():
+                    overlap += 0.35
+                return overlap
+
+            faqs = context_payload.get("faqs", [])
+            best_answer = None
+            best_score = 0.0
+            if isinstance(faqs, list):
+                for faq in faqs:
+                    if not isinstance(faq, dict):
+                        continue
+                    faq_q = str(faq.get("question") or "").strip()
+                    faq_a = str(faq.get("answer") or faq.get("response") or "").strip()
+                    if not faq_q or not faq_a:
+                        continue
+                    score = _faq_match_score(query, faq_q)
+                    if score > best_score:
+                        best_score = score
+                        best_answer = faq_a
+
+            # Conservative threshold to avoid unrelated FAQ leakage.
+            if best_answer and best_score >= 0.18:
+                return best_answer
+
             context_str = await self.get_relevant_context(query) if self.retriever else ""
             prompt = (
                 f"You are a knowledgeable {active_profession} assistant. "
