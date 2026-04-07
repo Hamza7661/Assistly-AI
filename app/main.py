@@ -709,16 +709,37 @@ def _is_availability_intent(text: str) -> bool:
 
 
 def _extract_index_choice(text: str) -> Optional[int]:
-    """Extract numeric choice from text like '2', '2. Fri', or '2 - 10:00 AM'."""
+    """Extract numeric choice from text like '2', '2. Fri', or '📅 2. Fri'."""
     if not text or not isinstance(text, str):
         return None
-    match = re.match(r"^\s*(\d{1,2})\b", text.strip())
+    raw = text.strip()
+    # Fast path: plain numeric start.
+    match = re.match(r"^\s*(\d{1,2})\b", raw)
     if not match:
-        return None
+        # Messenger quick replies often include a leading emoji, e.g. "📅 2. Thu 09/04/2026".
+        match = re.search(r"(?<!\d)(\d{1,2})(?=\s*[\.\-\)])", raw)
+        if not match:
+            return None
     try:
         return int(match.group(1))
     except ValueError:
         return None
+
+
+def _slot_matches_local_date(slot: Dict[str, Any], selected_date: str, calendar_tz: str) -> bool:
+    """Match slot start date against selected local calendar date."""
+    if not selected_date:
+        return False
+    start = str(slot.get("start") or "").strip()
+    if not start:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        local_date = dt_utc.astimezone(ZoneInfo(calendar_tz or "UTC")).strftime("%Y-%m-%d")
+        return local_date == selected_date
+    except Exception:
+        return start[:10] == selected_date
 
 
 def _feedback_prompt_message() -> str:
@@ -1153,21 +1174,32 @@ def _extract_buttons_from_response(response: str) -> Tuple[str, List[Dict[str, s
     """Extract button/checkbox options from response and return cleaned text + option data."""
     buttons = []
     # Messenger/Instagram can't render custom XML tags directly.
-    # Accept both <button> and <checkbox> so workflow options become quick replies.
-    option_pattern = r'<\s*(?:button|checkbox)[^>]*>\s*([^<]+?)\s*</\s*(?:button|checkbox)[^>]*>'
-    button_matches = re.findall(option_pattern, response, re.IGNORECASE | re.DOTALL)
-    
+    # Accept both <button> and <checkbox> and preserve optional value="" as payload.
+    option_tag_pattern = re.compile(
+        r'<\s*(button|checkbox)([^>]*)>\s*([\s\S]*?)\s*</\s*\1[^>]*>',
+        re.IGNORECASE,
+    )
+
     seen_buttons = set()
-    for button_text in button_matches:
-        clean_text = button_text.strip().lstrip('>').strip()
-        if clean_text and clean_text.lower() not in seen_buttons:
-            seen_buttons.add(clean_text.lower())
-            buttons.append({
-                "id": f"button_{len(buttons) + 1}",
-                "title": clean_text
-            })
+    for m in option_tag_pattern.finditer(response):
+        attrs = m.group(2) or ""
+        label_raw = m.group(3) or ""
+        clean_text = label_raw.strip().lstrip('>').strip()
+        if not clean_text:
+            continue
+        key = clean_text.lower()
+        if key in seen_buttons:
+            continue
+        seen_buttons.add(key)
+        value_match = re.search(r'value\s*=\s*["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        payload = (value_match.group(1).strip() if value_match else clean_text)[:1000]
+        buttons.append({
+            "id": f"button_{len(buttons) + 1}",
+            "title": clean_text,
+            "payload": payload,
+        })
     
-    cleaned_response = re.sub(option_pattern, '', response, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_response = option_tag_pattern.sub('', response)
     cleaned_response = re.sub(
         r'<\s*(?:button|checkbox)[^>]*>.*?</\s*(?:button|checkbox)[^>]*>',
         '',
@@ -3329,7 +3361,11 @@ async def whatsapp_webhook(request: Request):
                     day_info = calendar_days[num - 1]
                     selected_date = day_info.get("date", "")
                     free_slots_all = session.get("calendar_free_slots") or []
-                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                    slots_for_day = [
+                        s for s in free_slots_all
+                        if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                    ]
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
@@ -4333,6 +4369,7 @@ async def messenger_webhook(request: Request):
                 "flow_controller": None,
                 "response_generator": None,
                 "page_access_token": page_access_token,
+                "calendar_pending_slot": None,
             }
 
             flow_controller = FlowController(context)
@@ -4486,6 +4523,7 @@ async def messenger_webhook(request: Request):
                 session["calendar_slots"] = None
                 session["calendar_free_slots"] = None
                 session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
                 reply = "Cancelled. How can I help?"
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -4493,41 +4531,171 @@ async def messenger_webhook(request: Request):
                 await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
             try:
+                if calendar_flow == "confirm":
+                    pending_slot = session.get("calendar_pending_slot") or {}
+                    if not pending_slot:
+                        raise ValueError("Missing pending slot")
+                    if raw_lower in ("confirm", "yes", "book", "book now"):
+                        start_iso = pending_slot.get("start", "")
+                        end_iso = pending_slot.get("end", "")
+                        slot_timezone = pending_slot.get("timezone")
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                        customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                        customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                        customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                        _service_plans_ctx = context.get("service_plans", [])
+                        _post_booking_note_raw = _find_post_booking_note(_service_plans_ctx, service_title)
+                        _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
+                        calendar_service = CalendarService(settings)
+                        book_result = await calendar_service.book_appointment(
+                            app_id,
+                            start_iso,
+                            end_iso,
+                            service_title,
+                            time_zone=slot_timezone,
+                            attendee_email=customer_email,
+                            customer_name=customer_name,
+                            customer_phone=customer_phone,
+                            lead_id=str(session.get("feedback_lead_id") or "").strip() or None,
+                            post_booking_note=_post_booking_note_raw,
+                        )
+                        session["calendar_flow"] = None
+                        session["calendar_days"] = None
+                        session["calendar_slots"] = None
+                        session["calendar_free_slots"] = None
+                        session["calendar_selected_day"] = None
+                        session["calendar_pending_slot"] = None
+                        if book_result.get("success"):
+                            try:
+                                from zoneinfo import ZoneInfo
+                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                                time_str = dt.strftime("%a %d/%m/%Y, %H:%M")
+                                reply = f"Booked! Your {service_title} appointment is confirmed for {time_str}."
+                            except Exception:
+                                reply = f"Booked! Your {service_title} appointment is confirmed."
+                            if _post_booking_note_chat:
+                                reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
+                            _review_url_inline = _integration_google_review_url(integration)
+                            if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                                reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
+                            # Ensure social-channel bookings are persisted as leads.
+                            try:
+                                full_history = conversation_history + [
+                                    {"role": "user", "content": message_text},
+                                    {"role": "assistant", "content": reply},
+                                ]
+                                customer_name = flow_controller.collected_data.get("leadName") or "Customer"
+                                lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                                completion_payload = {
+                                    "status": "confirmed",
+                                    "title": f"{service_title} – {customer_name}",
+                                    "serviceType": flow_controller.collected_data.get("serviceType") or service_title,
+                                    "leadType": flow_controller.collected_data.get("leadType"),
+                                    "leadName": flow_controller.collected_data.get("leadName"),
+                                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                                    "sourceChannel": "facebook",
+                                    "appId": app_id,
+                                    "appointmentDetails": {
+                                        "eventId": book_result.get("eventId"),
+                                        "start": book_result.get("start") or start_iso,
+                                        "end": book_result.get("end") or end_iso,
+                                        "link": book_result.get("link"),
+                                        "confirmed": True,
+                                    },
+                                    "summary": f"{customer_name} booked a {service_title} appointment.",
+                                    "description": f"{customer_name} ({lead_type_val}) booked {service_title}.",
+                                    "history": full_history,
+                                }
+                                existing_lead_id = str(session.get("feedback_lead_id") or "").strip()
+                                if existing_lead_id:
+                                    await lead_service.update_lead(owner_id, existing_lead_id, completion_payload)
+                                else:
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, completion_payload)
+                                    if ok_lead:
+                                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                            except Exception as lead_exc:
+                                logger.warning("Messenger booking lead persistence failed: %s", lead_exc)
+                        else:
+                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
+                        if book_result.get("success") and _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            feedback_prompt = _feedback_prompt_message()
+                            session["feedback_collection_active"] = True
+                            session["feedback_data"] = {}
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            session["history"] = conversation_history
+                            await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                        return {"status": "ok"}
+                    if raw_lower in ("cancel", "no"):
+                        session["calendar_flow"] = "slots"
+                        session["calendar_pending_slot"] = None
+                        lines = ["No problem. Please choose another time slot:"]
+                        for i, s in enumerate(calendar_slots[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                try:
+                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                except Exception:
+                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                        if buttons:
+                            qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                            await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                        else:
+                            await messenger_service.send_message(sender_id, reply, page_access_token)
+                        return {"status": "ok"}
+                    raise ValueError("Invalid confirm choice")
                 num = _extract_index_choice(message_text)
                 if num is None:
                     raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
-                    start_iso = slot.get("start", "")
-                    end_iso = slot.get("end", "")
+                    session["calendar_pending_slot"] = slot
+                    session["calendar_flow"] = "confirm"
                     slot_timezone = slot.get("timezone")
-                    title = "Appointment"
-                    calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title, time_zone=slot_timezone)
-                    session["calendar_flow"] = None
-                    session["calendar_days"] = None
-                    session["calendar_slots"] = None
-                    session["calendar_free_slots"] = None
-                    session["calendar_selected_day"] = None
-                    if book_result.get("success"):
-                        try:
-                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            time_str = dt.strftime("%H:%M")
-                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
-                        except Exception:
-                            reply = "Appointment booked. Reply with anything to continue."
-                    else:
-                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    try:
+                        from zoneinfo import ZoneInfo
+                        dt_s = datetime.fromisoformat((slot.get("start") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        dt_e = datetime.fromisoformat((slot.get("end") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        slot_label = f"{dt_s.strftime('%a %d/%m/%Y, %H:%M')}–{dt_e.strftime('%H:%M')}"
+                    except Exception:
+                        slot_label = f"{slot.get('start', '')}–{slot.get('end', '')}"
+                    reply = (
+                        f"You selected: {slot_label}\n"
+                        "Please confirm your booking:\n"
+                        "<button value=\"confirm\">Confirm booking</button> "
+                        "<button value=\"cancel\">Cancel</button>"
+                    )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                    else:
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
                     return {"status": "ok"}
                 if calendar_flow == "days" and 1 <= num <= len(calendar_days):
                     day_info = calendar_days[num - 1]
                     selected_date = day_info.get("date", "")
                     free_slots_all = session.get("calendar_free_slots") or []
-                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                    slots_for_day = [
+                        s for s in free_slots_all
+                        if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                    ]
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
@@ -5219,7 +5387,7 @@ async def messenger_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                qrs = [{"title": btn["title"], "payload": btn["title"]} for btn in buttons]
+                qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
                 await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
             else:
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -5353,6 +5521,7 @@ async def instagram_webhook(request: Request):
                 "flow_controller": None,
                 "response_generator": None,
                 "instagram_access_token": instagram_access_token,
+                "calendar_pending_slot": None,
             }
             
             # Initialize flow controller and response generator
@@ -5502,6 +5671,7 @@ async def instagram_webhook(request: Request):
                 session["calendar_slots"] = None
                 session["calendar_free_slots"] = None
                 session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
                 reply = "Cancelled. How can I help?"
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -5509,41 +5679,171 @@ async def instagram_webhook(request: Request):
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
             try:
+                if calendar_flow == "confirm":
+                    pending_slot = session.get("calendar_pending_slot") or {}
+                    if not pending_slot:
+                        raise ValueError("Missing pending slot")
+                    if raw_lower in ("confirm", "yes", "book", "book now"):
+                        start_iso = pending_slot.get("start", "")
+                        end_iso = pending_slot.get("end", "")
+                        slot_timezone = pending_slot.get("timezone")
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                        customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                        customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                        customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                        _service_plans_ctx = context.get("service_plans", [])
+                        _post_booking_note_raw = _find_post_booking_note(_service_plans_ctx, service_title)
+                        _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
+                        calendar_service = CalendarService(settings)
+                        book_result = await calendar_service.book_appointment(
+                            app_id,
+                            start_iso,
+                            end_iso,
+                            service_title,
+                            time_zone=slot_timezone,
+                            attendee_email=customer_email,
+                            customer_name=customer_name,
+                            customer_phone=customer_phone,
+                            lead_id=str(session.get("feedback_lead_id") or "").strip() or None,
+                            post_booking_note=_post_booking_note_raw,
+                        )
+                        session["calendar_flow"] = None
+                        session["calendar_days"] = None
+                        session["calendar_slots"] = None
+                        session["calendar_free_slots"] = None
+                        session["calendar_selected_day"] = None
+                        session["calendar_pending_slot"] = None
+                        if book_result.get("success"):
+                            try:
+                                from zoneinfo import ZoneInfo
+                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                                time_str = dt.strftime("%a %d/%m/%Y, %H:%M")
+                                reply = f"Booked! Your {service_title} appointment is confirmed for {time_str}."
+                            except Exception:
+                                reply = f"Booked! Your {service_title} appointment is confirmed."
+                            if _post_booking_note_chat:
+                                reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
+                            _review_url_inline = _integration_google_review_url(integration)
+                            if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                                reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
+                            # Ensure social-channel bookings are persisted as leads.
+                            try:
+                                full_history = conversation_history + [
+                                    {"role": "user", "content": message_text},
+                                    {"role": "assistant", "content": reply},
+                                ]
+                                customer_name = flow_controller.collected_data.get("leadName") or "Customer"
+                                lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                                completion_payload = {
+                                    "status": "confirmed",
+                                    "title": f"{service_title} – {customer_name}",
+                                    "serviceType": flow_controller.collected_data.get("serviceType") or service_title,
+                                    "leadType": flow_controller.collected_data.get("leadType"),
+                                    "leadName": flow_controller.collected_data.get("leadName"),
+                                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                                    "sourceChannel": "instagram",
+                                    "appId": app_id,
+                                    "appointmentDetails": {
+                                        "eventId": book_result.get("eventId"),
+                                        "start": book_result.get("start") or start_iso,
+                                        "end": book_result.get("end") or end_iso,
+                                        "link": book_result.get("link"),
+                                        "confirmed": True,
+                                    },
+                                    "summary": f"{customer_name} booked a {service_title} appointment.",
+                                    "description": f"{customer_name} ({lead_type_val}) booked {service_title}.",
+                                    "history": full_history,
+                                }
+                                existing_lead_id = str(session.get("feedback_lead_id") or "").strip()
+                                if existing_lead_id:
+                                    await lead_service.update_lead(owner_id, existing_lead_id, completion_payload)
+                                else:
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, completion_payload)
+                                    if ok_lead:
+                                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                            except Exception as lead_exc:
+                                logger.warning("Instagram booking lead persistence failed: %s", lead_exc)
+                        else:
+                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                        if book_result.get("success") and _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            feedback_prompt = _feedback_prompt_message()
+                            session["feedback_collection_active"] = True
+                            session["feedback_data"] = {}
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            session["history"] = conversation_history
+                            await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                        return {"status": "ok"}
+                    if raw_lower in ("cancel", "no"):
+                        session["calendar_flow"] = "slots"
+                        session["calendar_pending_slot"] = None
+                        lines = ["No problem. Please choose another time slot:"]
+                        for i, s in enumerate(calendar_slots[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                try:
+                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                except Exception:
+                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                        if buttons:
+                            qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                            await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                        else:
+                            await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                        return {"status": "ok"}
+                    raise ValueError("Invalid confirm choice")
                 num = _extract_index_choice(message_text)
                 if num is None:
                     raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
-                    start_iso = slot.get("start", "")
-                    end_iso = slot.get("end", "")
+                    session["calendar_pending_slot"] = slot
+                    session["calendar_flow"] = "confirm"
                     slot_timezone = slot.get("timezone")
-                    title = "Appointment"
-                    calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title, time_zone=slot_timezone)
-                    session["calendar_flow"] = None
-                    session["calendar_days"] = None
-                    session["calendar_slots"] = None
-                    session["calendar_free_slots"] = None
-                    session["calendar_selected_day"] = None
-                    if book_result.get("success"):
-                        try:
-                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            time_str = dt.strftime("%H:%M")
-                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
-                        except Exception:
-                            reply = "Appointment booked. Reply with anything to continue."
-                    else:
-                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    try:
+                        from zoneinfo import ZoneInfo
+                        dt_s = datetime.fromisoformat((slot.get("start") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        dt_e = datetime.fromisoformat((slot.get("end") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        slot_label = f"{dt_s.strftime('%a %d/%m/%Y, %H:%M')}–{dt_e.strftime('%H:%M')}"
+                    except Exception:
+                        slot_label = f"{slot.get('start', '')}–{slot.get('end', '')}"
+                    reply = (
+                        f"You selected: {slot_label}\n"
+                        "Please confirm your booking:\n"
+                        "<button value=\"confirm\">Confirm booking</button> "
+                        "<button value=\"cancel\">Cancel</button>"
+                    )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                    else:
+                        await instagram_service.send_message(sender_id, reply, instagram_access_token)
                     return {"status": "ok"}
                 if calendar_flow == "days" and 1 <= num <= len(calendar_days):
                     day_info = calendar_days[num - 1]
                     selected_date = day_info.get("date", "")
                     free_slots_all = session.get("calendar_free_slots") or []
-                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                    slots_for_day = [
+                        s for s in free_slots_all
+                        if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                    ]
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
@@ -6223,7 +6523,7 @@ async def instagram_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                qrs = [{"title": btn["title"], "payload": btn["title"]} for btn in buttons]
+                qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
                 await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
             else:
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
