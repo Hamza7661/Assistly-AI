@@ -990,8 +990,18 @@ Classify the intent:"""
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
                     return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
                 
+                # Reject comma/semicolon-separated input — service selection is single-choice.
+                # If configured services exist, comma input is definitely a mis-selection attempt.
+                _stripped_svc = user_message.strip()
+                if all_service_options and re.search(r"[,;]", _stripped_svc):
+                    logger.info(f"SERVICE_SELECTION: Rejected multi-token input '{_stripped_svc}' for single-select service list")
+                    next_prompt = await self._generate_service_selection_response(
+                        conversation_history, context, collected_lead_type=collected_lead_type
+                    )
+                    return f"Please choose a single service from the list.\n\n{next_prompt}"
+
                 # Accept user input as service type even if not in configured service options
-                service = user_message.strip()
+                service = _stripped_svc
                 logger.info(f"Accepted user input as service type (not in configured service options): '{service}'")
             
             if service:
@@ -1168,8 +1178,21 @@ Classify the intent:"""
             if current_options and not conversation_style_enabled and (user_message or "").strip():
                 sorted_opts = sorted(current_options, key=lambda o: o.get("order", 0))
                 allowed = {(str(o.get("text") or "").strip().lower()) for o in sorted_opts if str(o.get("text") or "").strip()}
+                # Determine if this question allows multiple selections.
+                q_type_code = str(current_question.get("questionTypeCode") or "").strip().lower()
+                q_input_mode = str(current_question.get("choiceInputMode") or "").strip().lower()
+                try:
+                    _qtid_int = int(float(current_question.get("questionTypeId") or 0))
+                except (TypeError, ValueError):
+                    _qtid_int = 0
+                is_multi_select_q = (q_type_code == "multiple_choice" or q_input_mode == "checkbox" or _qtid_int == 3)
+
                 provided_parts = [p.strip().lower() for p in re.split(r"[,;\n]+", user_message.strip()) if p.strip()]
-                if user_message.strip().isdigit():
+
+                # Single-select: reject any comma/multi-token input upfront.
+                if not is_multi_select_q and len(provided_parts) > 1:
+                    is_valid = False
+                elif user_message.strip().isdigit():
                     number = int(user_message.strip())
                     is_valid = 1 <= number <= len(sorted_opts)
                 else:

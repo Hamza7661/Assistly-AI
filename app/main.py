@@ -780,6 +780,11 @@ def _normalize_workflow_choice_input(
     if not tokens:
         return None
 
+    # For single-select questions, reject comma-separated multi-token input immediately.
+    is_multi_select = _is_checkbox_style_question(current_q)
+    if not is_multi_select and len(tokens) > 1:
+        return None
+
     resolved: List[str] = []
     for token in tokens:
         t = token.strip()
