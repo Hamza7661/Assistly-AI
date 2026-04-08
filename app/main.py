@@ -3668,9 +3668,9 @@ async def whatsapp_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -3741,7 +3741,10 @@ async def whatsapp_webhook(request: Request):
                     if post_booking_note_chat:
                         reply += f"\n\n📋 Important Instructions\n{post_booking_note_chat}"
                     review_url = _integration_google_review_url(integration)
-                    if review_url and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                    skip_global_prompts = _should_skip_global_review_feedback_prompts(flow_controller, context)
+                    should_send_review_prompt = bool(review_url) and not skip_global_prompts
+                    should_collect_feedback = _capture_feedback_enabled(context) and not skip_global_prompts
+                    if should_send_review_prompt:
                         reply += "\n\n" + get_string("review_prompt", session.get("response_language_code", "en"), review_url)
 
                     try:
@@ -3782,24 +3785,31 @@ async def whatsapp_webhook(request: Request):
                     except Exception as lead_exc:
                         logger.warning("WhatsApp booking lead persistence failed: %s", lead_exc)
                 else:
-                    reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    raw_booking_error = str(book_result.get("error") or "").strip()
+                    if "invalid_grant" in raw_booking_error.lower():
+                        reply = "Booking is temporarily unavailable due to calendar authorization. Please try again shortly or contact us."
+                    else:
+                        reply = raw_booking_error or "Booking failed. Please try again or contact us."
                 conversation_history.append({"role": "user", "content": user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 whatsapp_sessions[session_id]["history"] = conversation_history
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
-                if book_result.get("success") and _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                if book_result.get("success") and should_collect_feedback:
                     feedback_prompt = _feedback_prompt_message()
                     session["feedback_collection_active"] = True
                     session["feedback_data"] = {}
                     conversation_history.append({"role": "assistant", "content": feedback_prompt})
                     whatsapp_sessions[session_id]["history"] = conversation_history
                     await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
+                elif book_result.get("success"):
+                    whatsapp_sessions.pop(session_id, None)
+                    if phone_to_session.get(user_phone) == session_id:
+                        phone_to_session.pop(user_phone, None)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             try:
                 num = _extract_index_choice(user_text)
-                if num is None:
-                    raise ValueError("No numeric choice parsed")
-                if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                raw_choice = str(user_text or "").strip().lower()
+                if calendar_flow == "slots" and num is not None and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
                     # Save slot and ask for explicit booking confirmation
                     session["calendar_pending_slot"] = slot
@@ -3816,15 +3826,52 @@ async def whatsapp_webhook(request: Request):
                     reply = (
                         f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
                         "Please confirm your booking:\n"
-                        "<button value=\"confirm\">1. Confirm booking</button> "
-                        "<button value=\"cancel\">2. Cancel</button>"
+                        "<button value=\"confirm\">Confirm booking</button> "
+                        "<button value=\"cancel\">Cancel</button>"
                     )
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
                     await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
-                if calendar_flow == "days" and 1 <= num <= len(calendar_days):
+                if calendar_flow == "slots" and num is None and calendar_slots:
+                    slot_tz_match = integration.get("calendarTimezone") or (calendar_slots[0].get("timezone") if calendar_slots else None) or "UTC"
+                    for idx, s in enumerate(calendar_slots, 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if not start or not end:
+                            continue
+                        t_start = _format_slot_time_local(start, slot_tz_match)
+                        t_end = _format_slot_time_local(end, slot_tz_match)
+                        display = f"{t_start}–{t_end}".lower()
+                        if raw_choice == display or raw_choice in display:
+                            num = idx
+                            break
+                    if num is not None and 1 <= num <= len(calendar_slots):
+                        slot = calendar_slots[num - 1]
+                        session["calendar_pending_slot"] = slot
+                        session["calendar_flow"] = "confirm"
+                        _wa_tz = integration.get("calendarTimezone") or "UTC"
+                        _wa_t_start = _format_slot_time_local(slot.get("start", ""), _wa_tz)
+                        _wa_t_end = _format_slot_time_local(slot.get("end", ""), _wa_tz)
+                        try:
+                            from zoneinfo import ZoneInfo
+                            _wa_dt = datetime.fromisoformat(slot.get("start", "").replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
+                            _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
+                        except Exception:
+                            _wa_date = slot.get("start", "")[:10]
+                        reply = (
+                            f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
+                            "Please confirm your booking:\n"
+                            "<button value=\"confirm\">Confirm booking</button> "
+                            "<button value=\"cancel\">Cancel</button>"
+                        )
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        whatsapp_sessions[session_id]["history"] = conversation_history
+                        await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                if calendar_flow == "days" and num is not None and 1 <= num <= len(calendar_days):
                     day_info = calendar_days[num - 1]
                     selected_date = day_info.get("date", "")
                     free_slots_all = session.get("calendar_free_slots") or []
@@ -3847,13 +3894,49 @@ async def whatsapp_webhook(request: Request):
                         if start and end:
                             t_start = _format_slot_time_local(start, slot_tz)
                             t_end = _format_slot_time_local(end, slot_tz)
-                            lines.append(f"<button value=\"{i}\">🕒 {i}. {t_start}–{t_end}</button>")
+                            lines.append(f"<button value=\"{i}\">🕒 {t_start}–{t_end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
                     await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                if calendar_flow == "days" and num is None and calendar_days:
+                    for idx, d in enumerate(calendar_days, 1):
+                        label = str(d.get("label", "")).strip().lower()
+                        if raw_choice == label or raw_choice in label:
+                            num = idx
+                            break
+                    if num is not None and 1 <= num <= len(calendar_days):
+                        day_info = calendar_days[num - 1]
+                        selected_date = day_info.get("date", "")
+                        free_slots_all = session.get("calendar_free_slots") or []
+                        cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                        slots_for_day = [
+                            s for s in free_slots_all
+                            if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                        ]
+                        session["calendar_flow"] = "slots"
+                        session["calendar_slots"] = slots_for_day
+                        session["calendar_selected_day"] = selected_date
+                        slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        tz_label = _get_tz_label(slot_tz)
+                        lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        lines.append(f"🌐 All times in {tz_label}")
+                        lines.append("Choose a time slot:")
+                        for i, s in enumerate(slots_for_day[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                t_start = _format_slot_time_local(start, slot_tz)
+                                t_end = _format_slot_time_local(end, slot_tz)
+                                lines.append(f"<button value=\"{i}\">🕒 {t_start}–{t_end}</button>")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        whatsapp_sessions[session_id]["history"] = conversation_history
+                        await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             except ValueError:
                 pass
 
@@ -3923,7 +4006,7 @@ async def whatsapp_webhook(request: Request):
                             intro = "Here are the available dates for your appointment. Please choose a day:"
                         lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -5135,9 +5218,9 @@ async def messenger_webhook(request: Request):
                                 try:
                                     dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                     dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                    lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                                 except Exception:
-                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                                    lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": message_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -5168,8 +5251,8 @@ async def messenger_webhook(request: Request):
                     reply = (
                         f"You selected: {slot_label}\n"
                         "Please confirm your booking:\n"
-                        "<button value=\"confirm\">Confirm booking</button> "
-                        "<button value=\"cancel\">Cancel</button>"
+                        "<button value=\"confirm\">1. Confirm booking</button>\n"
+                        "<button value=\"cancel\">2. Cancel</button>"
                     )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -5202,9 +5285,9 @@ async def messenger_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -5285,7 +5368,7 @@ async def messenger_webhook(request: Request):
                             intro = "Here are the available dates for your appointment. Please choose a day:"
                         lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -6321,9 +6404,9 @@ async def instagram_webhook(request: Request):
                                 try:
                                     dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                     dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                    lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                                 except Exception:
-                                    lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                                    lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": message_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -6354,8 +6437,8 @@ async def instagram_webhook(request: Request):
                     reply = (
                         f"You selected: {slot_label}\n"
                         "Please confirm your booking:\n"
-                        "<button value=\"confirm\">Confirm booking</button> "
-                        "<button value=\"cancel\">Cancel</button>"
+                        "<button value=\"confirm\">1. Confirm booking</button>\n"
+                        "<button value=\"cancel\">2. Cancel</button>"
                     )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -6388,9 +6471,9 @@ async def instagram_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                                lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -6471,7 +6554,7 @@ async def instagram_webhook(request: Request):
                             intro = "Here are the available dates for your appointment. Please choose a day:"
                         lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
