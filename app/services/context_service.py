@@ -438,6 +438,22 @@ class ContextService:
             None,
         )
 
+        twilio_account_sid = first_present(
+            [
+                "twilioAccountSid",
+                "twilio_account_sid",
+            ],
+            None,
+        )
+
+        twilio_auth_token = first_present(
+            [
+                "twilioAuthToken",
+                "twilio_auth_token",
+            ],
+            None,
+        )
+
         return {
             "lead_types": lead_types,
             "service_plans": service_plans,
@@ -450,4 +466,6 @@ class ContextService:
             "workflows": workflows,  # Preserve workflows for workflow questions
             "messengerAccessToken": messenger_access_token,  # Facebook Page Access Token
             "instagramAccessToken": instagram_access_token,  # Instagram Access Token
+            "twilioAccountSid": twilio_account_sid,
+            "twilioAuthToken": twilio_auth_token,
         }

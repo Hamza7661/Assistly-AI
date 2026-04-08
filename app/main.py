@@ -3057,6 +3057,10 @@ async def whatsapp_webhook(request: Request):
             except Exception as exc:
                 logger.exception("Failed to fetch user context for Twilio number %s: %s", twilio_phone, exc)
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I'm having trouble accessing your information. Please try again later."), media_type="text/xml")
+
+            runtime_twilio_sid = str(context.get("twilioAccountSid") or "").strip() or None
+            runtime_twilio_token = str(context.get("twilioAuthToken") or "").strip() or None
+            whatsapp_service.set_runtime_credentials(runtime_twilio_sid, runtime_twilio_token)
             
             # Extract user_id and app_id from context for lead creation
             user_data = context.get("user", {})
@@ -3097,6 +3101,8 @@ async def whatsapp_webhook(request: Request):
                 "context": context,
                 "user_id": user_id,
                 "app_id": app_id,  # Store app_id for lead creation
+                "twilio_account_sid": runtime_twilio_sid,
+                "twilio_auth_token": runtime_twilio_token,
                 "created_at": current_time,
                 "last_activity": current_time,
                 "is_whatsapp": True  # Flag to identify WhatsApp conversations
@@ -3154,6 +3160,11 @@ async def whatsapp_webhook(request: Request):
         user_id = session["user_id"]
         app_id = session.get("app_id")  # Get app_id for lead creation
         twilio_phone = session.get("twilio_phone", twilio_phone)  # Get app's Twilio number from session
+        runtime_twilio_sid = str(session.get("twilio_account_sid") or context.get("twilioAccountSid") or "").strip() or None
+        runtime_twilio_token = str(session.get("twilio_auth_token") or context.get("twilioAuthToken") or "").strip() or None
+        whatsapp_service.set_runtime_credentials(runtime_twilio_sid, runtime_twilio_token)
+        session["twilio_account_sid"] = runtime_twilio_sid
+        session["twilio_auth_token"] = runtime_twilio_token
         email_validation_service.set_branding_context(
             app_id=str(app_id or "").strip() or None,
             company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
