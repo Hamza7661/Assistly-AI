@@ -726,6 +726,155 @@ def _extract_index_choice(text: str) -> Optional[int]:
         return None
 
 
+def _split_choice_tokens(text: str) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    return [p.strip() for p in re.split(r"[,;\n]+", raw) if p.strip()]
+
+
+def _is_checkbox_style_question(question: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(question, dict):
+        return False
+    code = str(question.get("questionTypeCode") or "").strip().lower()
+    if code == "multiple_choice":
+        return True
+    if code == "single_choice":
+        return False
+    mode = str(question.get("choiceInputMode") or "").strip().lower()
+    if mode == "checkbox":
+        return True
+    qtid = question.get("questionTypeId")
+    try:
+        return int(float(qtid)) == 3
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalize_workflow_choice_input(
+    raw_input: str,
+    flow_controller: Optional[Any],
+) -> Optional[str]:
+    """Normalize workflow answer to canonical option labels, including mixed numeric/text comma input."""
+    if not flow_controller or flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+        return None
+    wm = getattr(flow_controller, "workflow_manager", None)
+    if not wm or not getattr(wm, "is_active", False):
+        return None
+    current_q = wm.get_current_question()
+    if not current_q:
+        return None
+    options = current_q.get("options", []) or []
+    if not options:
+        return None
+    sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
+    by_text: Dict[str, str] = {}
+    for opt in sorted_opts:
+        opt_text = (opt.get("text") or "").strip()
+        if opt_text:
+            by_text[opt_text.lower()] = opt_text
+
+    tokens = _split_choice_tokens(raw_input)
+    if not tokens:
+        tokens = [str(raw_input or "").strip()] if str(raw_input or "").strip() else []
+    if not tokens:
+        return None
+
+    resolved: List[str] = []
+    for token in tokens:
+        t = token.strip()
+        if not t:
+            continue
+        if t.isdigit():
+            number = int(t)
+            if 1 <= number <= len(sorted_opts):
+                selected_text = (sorted_opts[number - 1].get("text") or "").strip()
+                if selected_text:
+                    resolved.append(selected_text)
+                    continue
+            return None
+        mapped = by_text.get(t.lower())
+        if mapped:
+            resolved.append(mapped)
+            continue
+        return None
+
+    if not resolved:
+        return None
+
+    # Keep first-seen order while removing duplicates.
+    seen = set()
+    unique_resolved = []
+    for val in resolved:
+        key = val.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_resolved.append(val)
+    return ", ".join(unique_resolved) if unique_resolved else None
+
+
+def _normalize_whatsapp_interactive_selection(
+    raw_text: str,
+    message_data: Dict[str, Any],
+    flow_controller: Optional[Any],
+    session: Dict[str, Any],
+) -> str:
+    """
+    Resolve WhatsApp interactive replies to human-readable labels/payloads.
+    Prefers titles; falls back to previous-choice map and workflow option index map.
+    """
+    resolved = str(raw_text or "").strip()
+    button_id = str(message_data.get("button_id") or "").strip()
+    button_title = str(message_data.get("button_title") or "").strip()
+    list_id = str(message_data.get("list_id") or "").strip()
+    list_title = str(message_data.get("list_title") or "").strip()
+
+    if button_title:
+        return button_title
+    if list_title:
+        return list_title
+
+    selected_id = button_id or list_id
+    if not selected_id:
+        return resolved
+
+    # First try explicit map from last outgoing choice set.
+    choice_map = session.get("last_whatsapp_choice_map") or {}
+    if isinstance(choice_map, dict):
+        mapped = choice_map.get(selected_id)
+        if isinstance(mapped, str) and mapped.strip():
+            return mapped.strip()
+
+    # Fallback: map btn_N to current workflow options.
+    id_match = re.match(r"^(?:btn_|button_)?(\d+)$", selected_id, flags=re.IGNORECASE)
+    if id_match and flow_controller and flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+        wm = getattr(flow_controller, "workflow_manager", None)
+        if wm and getattr(wm, "is_active", False):
+            current_q = wm.get_current_question()
+            if current_q:
+                opts = current_q.get("options", []) or []
+                sorted_opts = sorted(opts, key=lambda o: o.get("order", 0))
+                number = int(id_match.group(1))
+                if 1 <= number <= len(sorted_opts):
+                    opt_text = (sorted_opts[number - 1].get("text") or "").strip()
+                    if opt_text:
+                        return opt_text
+
+    return selected_id or resolved
+
+
+def _format_whatsapp_option_prompt(base_text: str, options: List[Dict[str, str]], multi_select: bool) -> str:
+    numbered = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(options, 1)])
+    if multi_select:
+        guidance = (
+            "\n\nYou can choose multiple. Reply with numbers separated by commas "
+            "(e.g. 1,2) or option names."
+        )
+    else:
+        guidance = "\n\nPlease reply with the number of your choice."
+    return f"{base_text}{numbered}{guidance}"
+
 def _slot_matches_local_date(slot: Dict[str, Any], selected_date: str, calendar_tz: str) -> bool:
     """Match slot start date against selected local calendar date."""
     if not selected_date:
@@ -3143,8 +3292,10 @@ async def whatsapp_webhook(request: Request):
             # Extract buttons and send
             cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
             if buttons:
-                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                choice_map = {f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)}
+                choice_map.update({f"button_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)})
+                whatsapp_sessions[session_id]["last_whatsapp_choice_map"] = choice_map
+                full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
                 await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             else:
                 await whatsapp_service.send_message(user_phone, initial_reply, from_phone=twilio_phone)
@@ -3189,15 +3340,12 @@ async def whatsapp_webhook(request: Request):
         
         # Handle button/list responses
         user_text = message_data.get("body", "")
-        button_id = message_data.get("button_id", "")
-        list_id = message_data.get("list_id", "")
-        
-        if button_id:
-            # Handle button response
-            user_text = button_id
-        elif list_id:
-            # Handle list response
-            user_text = list_id
+        user_text = _normalize_whatsapp_interactive_selection(
+            raw_text=user_text,
+            message_data=message_data,
+            flow_controller=flow_controller,
+            session=session,
+        )
 
         if session.get("feedback_collection_active"):
             user_raw = str(user_text or "").strip()
@@ -3251,6 +3399,11 @@ async def whatsapp_webhook(request: Request):
         
         # Convert numbered responses to actual values for better context
         enhanced_user_text = user_text
+        normalized_workflow_text = _normalize_workflow_choice_input(user_text, flow_controller)
+        if normalized_workflow_text:
+            enhanced_user_text = normalized_workflow_text
+            logger.info("WhatsApp: normalized workflow input '%s' -> '%s'", user_text, enhanced_user_text)
+
         if user_text.strip().isdigit():
             number = int(user_text.strip())
             
@@ -3327,6 +3480,139 @@ async def whatsapp_webhook(request: Request):
                     logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but workflow manager not active")
             else:
                 logger.info(f"WhatsApp: Number {number} - context unclear, treating as raw input")
+
+        # Global lead-type switch interrupt (parity with webchat):
+        # if user selects a different lead type mid-flow, reset branch context and continue.
+        lead_types_list = context.get("lead_types", [])
+        switched_lead_type = None
+        if flow_controller.state != ConversationState.LEAD_TYPE_SELECTION:
+            switched_lead_type = resolve_lead_type(
+                str(enhanced_user_text), lead_types_list, LeadTypeResolutionMode.MID_FLOW_SWITCH
+            )
+        existing_lt = (flow_controller.collected_data.get("leadType") or "").strip()
+        if (
+            switched_lead_type
+            and existing_lt
+            and flow_controller.state in _LEAD_TYPE_SWITCH_ALLOWED_STATES
+            and existing_lt.lower()
+            != (switched_lead_type.get("value") or "").strip().lower()
+        ):
+            previous_lead_type = flow_controller.collected_data.get("leadType")
+            # Reset ongoing calendar branch in session.
+            session["calendar_flow"] = None
+            session["calendar_days"] = None
+            session["calendar_slots"] = None
+            session["calendar_free_slots"] = None
+            session["calendar_selected_day"] = None
+            session["calendar_pending_slot"] = None
+
+            if flow_controller.workflow_manager:
+                flow_controller.workflow_manager.reset()
+            flow_controller.update_collected_data("leadType", switched_lead_type.get("value"))
+            flow_controller.update_collected_data("serviceType", None)
+            flow_controller.update_collected_data("workflowAnswers", {})
+            flow_controller.update_collected_data("appointmentSlot", None)
+
+            existing_switch_history = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
+            switch_history = list(existing_switch_history) if isinstance(existing_switch_history, list) else []
+            switch_history.append({
+                "from": previous_lead_type,
+                "to": switched_lead_type.get("value"),
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            flow_controller.update_collected_data("leadTypeSwitchHistory", switch_history)
+
+            if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+            elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+            elif (
+                flow_controller.capture_lead_phone
+                and not flow_controller.skip_phone_collection
+                and not flow_controller.collected_data.get("leadPhoneNumber")
+            ):
+                flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+            else:
+                if flow_controller.is_booking_lead_type():
+                    flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                else:
+                    flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+
+            new_label = _lead_type_display_label_from_dict(switched_lead_type)
+            if not new_label:
+                new_label = (
+                    switched_lead_type.get("text")
+                    or switched_lead_type.get("value")
+                    or "this option"
+                )
+            prev_label = _lead_type_display_label_from_value(previous_lead_type, lead_types_list)
+            prev_val = str(previous_lead_type or "").strip().lower()
+            new_val = str(switched_lead_type.get("value") or "").strip().lower()
+            try:
+                lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
+                    switched_lead_type.get("value"), context.get("lead_types", [])
+                )
+            except Exception:
+                lt_empathy = ""
+            lt_empathy = (lt_empathy or "").strip()
+            if prev_label and prev_val and prev_val != new_val:
+                switch_msg = (
+                    f"{lt_empathy} I've switched you from **{prev_label}** to **{new_label}**."
+                    if lt_empathy
+                    else f"Got it — switching from **{prev_label}** to **{new_label}**."
+                )
+            else:
+                switch_msg = (
+                    f"{lt_empathy} I've updated your request to **{new_label}**."
+                    if lt_empathy
+                    else f"Got it — switched to **{new_label}**."
+                )
+            next_prompt = await response_generator._generate_state_response(
+                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+            )
+            next_prompt = await _expand_booking_request_reply_for_social_channel(
+                next_prompt,
+                context.get("integration") or {},
+                app_id,
+                flow_controller,
+                session,
+            )
+            reply = f"{switch_msg}\n\n{next_prompt}"
+            conversation_history.append({"role": "user", "content": enhanced_user_text})
+            conversation_history.append({"role": "assistant", "content": reply})
+            whatsapp_sessions[session_id]["history"] = conversation_history
+            await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
+        # Strict personal-info-first guard (parity with webchat).
+        if flow_controller.collected_data.get("leadType") and flow_controller.state in (
+            ConversationState.SERVICE_SELECTION,
+            ConversationState.WORKFLOW_QUESTION,
+            ConversationState.APPOINTMENT_OFFER,
+            ConversationState.CALENDAR_BOOKING,
+            ConversationState.APPOINTMENT_CONFIRMATION,
+        ):
+            target_state = None
+            if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                target_state = ConversationState.NAME_COLLECTION
+            elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                target_state = ConversationState.EMAIL_COLLECTION
+            elif (
+                flow_controller.capture_lead_phone
+                and not flow_controller.skip_phone_collection
+                and not flow_controller.collected_data.get("leadPhoneNumber")
+            ):
+                target_state = ConversationState.PHONE_COLLECTION
+            if target_state is not None:
+                flow_controller.transition_to(target_state)
+                enforced_prompt = await response_generator._generate_state_response(
+                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                )
+                conversation_history.append({"role": "user", "content": enhanced_user_text})
+                conversation_history.append({"role": "assistant", "content": enforced_prompt})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, enforced_prompt, from_phone=twilio_phone)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
@@ -3349,15 +3635,75 @@ async def whatsapp_webhook(request: Request):
                 whatsapp_sessions[session_id]["history"] = conversation_history
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
-            # ── Confirm step: user replied with service/reason — book with that title ──
+            # ── Confirm step: explicit confirm/cancel ──
             if calendar_flow == "confirm":
                 pending_slot = session.get("calendar_pending_slot") or {}
-                service_title = user_text.strip() or "Appointment"
+                if not pending_slot:
+                    raise ValueError("Missing pending slot")
+                raw_confirm = user_text.strip().lower()
+                confirm_num = _extract_index_choice(user_text)
+                is_confirm_choice = raw_confirm in ("confirm", "confirm booking", "yes", "book", "book now") or confirm_num == 1
+                is_cancel_choice = raw_confirm in ("cancel", "cancel booking", "no") or confirm_num == 2
+
+                if is_cancel_choice:
+                    session["calendar_flow"] = "slots"
+                    session["calendar_pending_slot"] = None
+                    lines = ["No problem. Please choose another time slot:"]
+                    for i, s in enumerate(calendar_slots[:15], 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if start and end:
+                            try:
+                                dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                            except Exception:
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {start}–{end}</button>")
+                    reply = "\n".join(lines)
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
+                    await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
+                if not is_confirm_choice:
+                    reply = "Please confirm your booking:\n1. Confirm booking\n2. Cancel"
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
                 start_iso = pending_slot.get("start", "")
                 end_iso = pending_slot.get("end", "")
                 slot_timezone = pending_slot.get("timezone")
+                service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                post_booking_note_raw = await _resolve_post_booking_note(
+                    context=context,
+                    app_id=app_id,
+                    service_title=service_title,
+                    context_service=context_service,
+                )
+                post_booking_note_chat = _format_post_booking_note_for_chat(post_booking_note_raw)
+
                 calendar_service = CalendarService(settings)
-                book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, service_title, time_zone=slot_timezone)
+                book_result = await calendar_service.book_appointment(
+                    app_id,
+                    start_iso,
+                    end_iso,
+                    service_title,
+                    time_zone=slot_timezone,
+                    attendee_email=customer_email,
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    lead_id=str(session.get("feedback_lead_id") or "").strip() or None,
+                    post_booking_note=post_booking_note_raw,
+                )
                 session["calendar_flow"] = None
                 session["calendar_days"] = None
                 session["calendar_slots"] = None
@@ -3370,18 +3716,72 @@ async def whatsapp_webhook(request: Request):
                     _wa_end = _format_slot_time_local(end_iso, _wa_tz)
                     try:
                         from zoneinfo import ZoneInfo
+
                         _wa_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
                         _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
                     except Exception:
                         _wa_date = start_iso[:10]
                     time_str = f"{_wa_date}, {_wa_start} – {_wa_end}"
                     reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
+                    if not post_booking_note_chat:
+                        fallback_note = str(book_result.get("postBookingNote") or book_result.get("post_booking_note") or "").strip()
+                        post_booking_note_chat = _format_post_booking_note_for_chat(fallback_note)
+                    if post_booking_note_chat:
+                        reply += f"\n\n📋 Important Instructions\n{post_booking_note_chat}"
+                    review_url = _integration_google_review_url(integration)
+                    if review_url and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        reply += "\n\n" + get_string("review_prompt", session.get("response_language_code", "en"), review_url)
+
+                    try:
+                        full_history = conversation_history + [
+                            {"role": "user", "content": user_text},
+                            {"role": "assistant", "content": reply},
+                        ]
+                        customer_name_val = flow_controller.collected_data.get("leadName") or "Customer"
+                        lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                        completion_payload = {
+                            "status": "confirmed",
+                            "title": f"{service_title} – {customer_name_val}",
+                            "serviceType": flow_controller.collected_data.get("serviceType") or service_title,
+                            "leadType": flow_controller.collected_data.get("leadType"),
+                            "leadName": flow_controller.collected_data.get("leadName"),
+                            "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                            "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                            "sourceChannel": "whatsapp",
+                            "appId": app_id,
+                            "appointmentDetails": {
+                                "eventId": book_result.get("eventId"),
+                                "start": book_result.get("start") or start_iso,
+                                "end": book_result.get("end") or end_iso,
+                                "link": book_result.get("link"),
+                                "confirmed": True,
+                            },
+                            "summary": f"{customer_name_val} booked a {service_title} appointment.",
+                            "description": f"{customer_name_val} ({lead_type_val}) booked {service_title}.",
+                            "history": full_history,
+                        }
+                        existing_lead_id = str(session.get("feedback_lead_id") or "").strip()
+                        if existing_lead_id:
+                            await lead_service.update_lead(user_id, existing_lead_id, completion_payload)
+                        else:
+                            ok_lead, created_lead_resp = await lead_service.create_public_lead(user_id, completion_payload)
+                            if ok_lead:
+                                session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                    except Exception as lead_exc:
+                        logger.warning("WhatsApp booking lead persistence failed: %s", lead_exc)
                 else:
                     reply = book_result.get("error") or "Booking failed. Please try again or contact us."
                 conversation_history.append({"role": "user", "content": user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 whatsapp_sessions[session_id]["history"] = conversation_history
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                if book_result.get("success") and _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                    feedback_prompt = _feedback_prompt_message()
+                    session["feedback_collection_active"] = True
+                    session["feedback_data"] = {}
+                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             try:
                 num = _extract_index_choice(user_text)
@@ -3389,7 +3789,7 @@ async def whatsapp_webhook(request: Request):
                     raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
-                    # Save slot and ask for service/reason before booking
+                    # Save slot and ask for explicit booking confirmation
                     session["calendar_pending_slot"] = slot
                     session["calendar_flow"] = "confirm"
                     _wa_tz = integration.get("calendarTimezone") or "UTC"
@@ -3401,7 +3801,12 @@ async def whatsapp_webhook(request: Request):
                         _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
                     except Exception:
                         _wa_date = slot.get("start", "")[:10]
-                    reply = f"What service or treatment is this appointment for?\n(e.g. Enzyme Facial, Consultation, Follow-up)\n\nSelected time: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}"
+                    reply = (
+                        f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
+                        "Please confirm your booking:\n"
+                        "<button value=\"confirm\">1. Confirm booking</button> "
+                        "<button value=\"cancel\">2. Cancel</button>"
+                    )
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
@@ -3797,6 +4202,13 @@ async def whatsapp_webhook(request: Request):
         
         # Generate response using production-grade state machine
         reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
+        reply = await _expand_booking_request_reply_for_social_channel(
+            reply,
+            integration,
+            app_id,
+            flow_controller,
+            session,
+        )
         
         # Handle special responses from response generator (SEND_EMAIL, SEND_PHONE)
         # Check for answer + SEND_EMAIL/PHONE format (when user asks question while providing email/phone)
@@ -4246,21 +4658,26 @@ async def whatsapp_webhook(request: Request):
             cleaned_reply = cleaned_reply.strip()
         
         # Send appropriate WhatsApp message
-        if buttons and len(buttons) <= 3:
+        is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
+        if buttons and len(buttons) <= 3 and not is_multi_select_prompt:
             # Try native interactive buttons first; fall back to numbered list on failure
             wa_buttons = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
             success, message = await whatsapp_service.send_interactive_buttons(user_phone, cleaned_reply, wa_buttons, from_phone=twilio_phone)
+            session["last_whatsapp_choice_map"] = {
+                f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)
+            }
             if not success:
                 logger.info("Interactive buttons failed (%s), falling back to numbered list", message)
-                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+                full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
                 success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp message: %s", message)
         elif buttons:
-            # 4+ options — use numbered list
-            button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-            full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+            # 4+ options or checkbox prompts — use numbered list
+            session["last_whatsapp_choice_map"] = {
+                f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)
+            }
+            full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=is_multi_select_prompt)
             success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
