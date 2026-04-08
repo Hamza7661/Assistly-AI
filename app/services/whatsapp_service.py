@@ -56,11 +56,33 @@ class WhatsAppService:
         self.account_sid = settings.twilio_account_sid
         self.auth_token = settings.twilio_auth_token
         self.whatsapp_from = settings.twilio_whatsapp_from
+        self.runtime_account_sid: Optional[str] = None
+        self.runtime_auth_token: Optional[str] = None
+        self._clients_by_sid: Dict[str, Client] = {}
         
         # Initialize Twilio client if credentials are provided
         self.client: Optional[Client] = None
         if self.account_sid and self.auth_token:
             self.client = Client(self.account_sid, self.auth_token)
+            self._clients_by_sid[self.account_sid] = self.client
+
+    def set_runtime_credentials(self, account_sid: Optional[str], auth_token: Optional[str]) -> None:
+        """Set request-scoped credentials (e.g., per app/subaccount)."""
+        self.runtime_account_sid = (account_sid or "").strip() or None
+        self.runtime_auth_token = (auth_token or "").strip() or None
+
+    def _get_client(self) -> Optional[Client]:
+        """Return the active Twilio client, preferring runtime credentials."""
+        active_sid = self.runtime_account_sid or self.account_sid
+        active_token = self.runtime_auth_token or self.auth_token
+        if not active_sid or not active_token:
+            return None
+        cached = self._clients_by_sid.get(active_sid)
+        if cached:
+            return cached
+        client = Client(active_sid, active_token)
+        self._clients_by_sid[active_sid] = client
+        return client
     
     async def send_message(self, to_phone: str, message: str, from_phone: Optional[str] = None) -> Tuple[bool, str]:
         """Send a simple text message via WhatsApp
@@ -70,7 +92,8 @@ class WhatsAppService:
             message: Text message to send
             from_phone: Sender phone number (for multi-app support). If not provided, uses default from settings (if available).
         """
-        if not self.client:
+        client = self._get_client()
+        if not client:
             logger.warning("Twilio client not initialized - WhatsApp message not sent")
             return False, "WhatsApp service not configured"
         
@@ -91,7 +114,7 @@ class WhatsAppService:
             logger.info("Sending WhatsApp message at %s to %s", 
                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), to_phone)
             
-            message_obj = self.client.messages.create(
+            message_obj = client.messages.create(
                 body=message,
                 from_=whatsapp_from,
                 to=whatsapp_to
@@ -117,7 +140,8 @@ class WhatsAppService:
             buttons: List of button dictionaries
             from_phone: Sender phone number (for multi-app support). If not provided, uses default from settings (if available).
         """
-        if not self.client:
+        client = self._get_client()
+        if not client:
             logger.warning("Twilio client not initialized - WhatsApp interactive message not sent")
             return False, "WhatsApp service not configured"
         
@@ -161,7 +185,7 @@ class WhatsAppService:
             # Twilio supports interactive buttons via the Content Templates API.
             # Attempt to send using persistent_action with the interactive JSON payload;
             # this works on verified WhatsApp Business Accounts.
-            message_obj = self.client.messages.create(
+            message_obj = client.messages.create(
                 from_=whatsapp_from,
                 to=whatsapp_to,
                 body=body_text,
@@ -181,7 +205,8 @@ class WhatsAppService:
     
     async def send_interactive_list(self, to_phone: str, body_text: str, button_text: str, sections: List[Dict[str, Any]]) -> Tuple[bool, str]:
         """Send an interactive list message via WhatsApp"""
-        if not self.client:
+        client = self._get_client()
+        if not client:
             logger.warning("Twilio client not initialized - WhatsApp list message not sent")
             return False, "WhatsApp service not configured"
         
@@ -205,7 +230,7 @@ class WhatsAppService:
             logger.info("Sending WhatsApp list message at %s to %s", 
                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), formatted_phone)
             
-            message_obj = self.client.messages.create(
+            message_obj = client.messages.create(
                 from_=whatsapp_from,
                 to=whatsapp_to,
                 content_sid=None,
