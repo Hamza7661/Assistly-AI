@@ -1492,7 +1492,7 @@ async def _expand_booking_request_reply_for_social_channel(
             intro = "Great! Here are the available dates for your appointment. Please choose a day:"
         lines = [intro]
         for i, day in enumerate(calendar_days_list[:14], 1):
-            lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
         return "\n".join(lines)
     except Exception as cal_exc:
         logger.exception("Social channel: Calendar availability error: %s", cal_exc)
@@ -3307,8 +3307,16 @@ async def whatsapp_webhook(request: Request):
                 choice_map = {f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)}
                 choice_map.update({f"button_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)})
                 whatsapp_sessions[session_id]["last_whatsapp_choice_map"] = choice_map
-                full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
-                await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                _is_initial_multi = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                if len(buttons) <= 3 and not _is_initial_multi:
+                    _wa_btns = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
+                    _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, cleaned_reply, _wa_btns, from_phone=twilio_phone)
+                    if not _ok:
+                        full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
+                        await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                else:
+                    full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=_is_initial_multi)
+                    await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             else:
                 await whatsapp_service.send_message(user_phone, initial_reply, from_phone=twilio_phone)
             
@@ -3823,16 +3831,17 @@ async def whatsapp_webhook(request: Request):
                         _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
                     except Exception:
                         _wa_date = slot.get("start", "")[:10]
-                    reply = (
-                        f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
-                        "Please confirm your booking:\n"
-                        "<button value=\"confirm\">Confirm booking</button> "
-                        "<button value=\"cancel\">Cancel</button>"
-                    )
+                    _wa_confirm_text = f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\nPlease confirm your booking:"
+                    _wa_confirm_buttons = [{"id": "btn_confirm", "title": "Confirm booking"}, {"id": "btn_cancel", "title": "Cancel"}]
+                    session["last_whatsapp_choice_map"] = {"btn_confirm": "confirm", "btn_cancel": "cancel"}
+                    _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, _wa_confirm_text, _wa_confirm_buttons, from_phone=twilio_phone)
+                    if not _ok:
+                        _fallback = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel\n\nPlease reply with the number of your choice."
+                        await whatsapp_service.send_message(user_phone, _fallback, from_phone=twilio_phone)
+                    _history_reply = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel"
                     conversation_history.append({"role": "user", "content": user_text})
-                    conversation_history.append({"role": "assistant", "content": reply})
+                    conversation_history.append({"role": "assistant", "content": _history_reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
-                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 if calendar_flow == "slots" and num is None and calendar_slots:
                     slot_tz_match = integration.get("calendarTimezone") or (calendar_slots[0].get("timezone") if calendar_slots else None) or "UTC"
@@ -3860,16 +3869,17 @@ async def whatsapp_webhook(request: Request):
                             _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
                         except Exception:
                             _wa_date = slot.get("start", "")[:10]
-                        reply = (
-                            f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
-                            "Please confirm your booking:\n"
-                            "<button value=\"confirm\">Confirm booking</button> "
-                            "<button value=\"cancel\">Cancel</button>"
-                        )
+                        _wa_confirm_text = f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\nPlease confirm your booking:"
+                        _wa_confirm_buttons = [{"id": "btn_confirm", "title": "Confirm booking"}, {"id": "btn_cancel", "title": "Cancel"}]
+                        session["last_whatsapp_choice_map"] = {"btn_confirm": "confirm", "btn_cancel": "cancel"}
+                        _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, _wa_confirm_text, _wa_confirm_buttons, from_phone=twilio_phone)
+                        if not _ok:
+                            _fallback = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel\n\nPlease reply with the number of your choice."
+                            await whatsapp_service.send_message(user_phone, _fallback, from_phone=twilio_phone)
+                        _history_reply = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel"
                         conversation_history.append({"role": "user", "content": user_text})
-                        conversation_history.append({"role": "assistant", "content": reply})
+                        conversation_history.append({"role": "assistant", "content": _history_reply})
                         whatsapp_sessions[session_id]["history"] = conversation_history
-                        await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                         return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 if calendar_flow == "days" and num is not None and 1 <= num <= len(calendar_days):
                     day_info = calendar_days[num - 1]
@@ -3894,7 +3904,7 @@ async def whatsapp_webhook(request: Request):
                         if start and end:
                             t_start = _format_slot_time_local(start, slot_tz)
                             t_end = _format_slot_time_local(end, slot_tz)
-                            lines.append(f"<button value=\"{i}\">🕒 {t_start}–{t_end}</button>")
+                            lines.append(f"<button value=\"{i}\">{i}. 🕒 {t_start}–{t_end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -3930,7 +3940,7 @@ async def whatsapp_webhook(request: Request):
                             if start and end:
                                 t_start = _format_slot_time_local(start, slot_tz)
                                 t_end = _format_slot_time_local(end, slot_tz)
-                                lines.append(f"<button value=\"{i}\">🕒 {t_start}–{t_end}</button>")
+                                lines.append(f"<button value=\"{i}\">{i}. 🕒 {t_start}–{t_end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -4006,7 +4016,7 @@ async def whatsapp_webhook(request: Request):
                             intro = "Here are the available dates for your appointment. Please choose a day:"
                         lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
+                            lines.append(f"<button value=\"{i}\">{i}. 📅 {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -5251,8 +5261,8 @@ async def messenger_webhook(request: Request):
                     reply = (
                         f"You selected: {slot_label}\n"
                         "Please confirm your booking:\n"
-                        "<button value=\"confirm\">1. Confirm booking</button>\n"
-                        "<button value=\"cancel\">2. Cancel</button>"
+                        "<button value=\"confirm\">Confirm booking</button>\n"
+                        "<button value=\"cancel\">Cancel</button>"
                     )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -6437,8 +6447,8 @@ async def instagram_webhook(request: Request):
                     reply = (
                         f"You selected: {slot_label}\n"
                         "Please confirm your booking:\n"
-                        "<button value=\"confirm\">1. Confirm booking</button>\n"
-                        "<button value=\"cancel\">2. Cancel</button>"
+                        "<button value=\"confirm\">Confirm booking</button>\n"
+                        "<button value=\"cancel\">Cancel</button>"
                     )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
