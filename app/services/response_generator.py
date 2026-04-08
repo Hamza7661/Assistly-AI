@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Optional
 import logging
 from openai import AsyncOpenAI
 import json
+import re
 
 from app.services.conversation_state import FlowController, ConversationState
 from app.services.data_extractors import DataExtractor
@@ -1167,12 +1168,21 @@ Classify the intent:"""
             if current_options and not conversation_style_enabled and (user_message or "").strip():
                 sorted_opts = sorted(current_options, key=lambda o: o.get("order", 0))
                 allowed = {(str(o.get("text") or "").strip().lower()) for o in sorted_opts if str(o.get("text") or "").strip()}
-                provided_parts = [p.strip().lower() for p in user_message.strip().split(",") if p.strip()]
+                provided_parts = [p.strip().lower() for p in re.split(r"[,;\n]+", user_message.strip()) if p.strip()]
                 if user_message.strip().isdigit():
                     number = int(user_message.strip())
                     is_valid = 1 <= number <= len(sorted_opts)
                 else:
-                    is_valid = bool(provided_parts) and all(p in allowed for p in provided_parts)
+                    is_valid = bool(provided_parts)
+                    for part in provided_parts:
+                        if part.isdigit():
+                            idx = int(part)
+                            if not (1 <= idx <= len(sorted_opts)):
+                                is_valid = False
+                                break
+                        elif part not in allowed:
+                            is_valid = False
+                            break
                 if not is_valid:
                     current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
                     return (
