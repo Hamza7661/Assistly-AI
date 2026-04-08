@@ -3308,14 +3308,13 @@ async def whatsapp_webhook(request: Request):
                 choice_map.update({f"button_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)})
                 whatsapp_sessions[session_id]["last_whatsapp_choice_map"] = choice_map
                 _is_initial_multi = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=_is_initial_multi)
                 if len(buttons) <= 3 and not _is_initial_multi:
                     _wa_btns = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
-                    _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, cleaned_reply, _wa_btns, from_phone=twilio_phone)
+                    _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, full_message, _wa_btns, from_phone=twilio_phone)
                     if not _ok:
-                        full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
                         await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
                 else:
-                    full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=_is_initial_multi)
                     await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             else:
                 await whatsapp_service.send_message(user_phone, initial_reply, from_phone=twilio_phone)
@@ -3831,16 +3830,18 @@ async def whatsapp_webhook(request: Request):
                         _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
                     except Exception:
                         _wa_date = slot.get("start", "")[:10]
-                    _wa_confirm_text = f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\nPlease confirm your booking:"
+                    _wa_confirm_text = (
+                        f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
+                        "Please confirm your booking:\n\n"
+                        "1. Confirm booking\n2. Cancel"
+                    )
                     _wa_confirm_buttons = [{"id": "btn_confirm", "title": "Confirm booking"}, {"id": "btn_cancel", "title": "Cancel"}]
                     session["last_whatsapp_choice_map"] = {"btn_confirm": "confirm", "btn_cancel": "cancel"}
                     _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, _wa_confirm_text, _wa_confirm_buttons, from_phone=twilio_phone)
                     if not _ok:
-                        _fallback = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel\n\nPlease reply with the number of your choice."
-                        await whatsapp_service.send_message(user_phone, _fallback, from_phone=twilio_phone)
-                    _history_reply = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel"
+                        await whatsapp_service.send_message(user_phone, _wa_confirm_text, from_phone=twilio_phone)
                     conversation_history.append({"role": "user", "content": user_text})
-                    conversation_history.append({"role": "assistant", "content": _history_reply})
+                    conversation_history.append({"role": "assistant", "content": _wa_confirm_text})
                     whatsapp_sessions[session_id]["history"] = conversation_history
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 if calendar_flow == "slots" and num is None and calendar_slots:
@@ -3869,16 +3870,18 @@ async def whatsapp_webhook(request: Request):
                             _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
                         except Exception:
                             _wa_date = slot.get("start", "")[:10]
-                        _wa_confirm_text = f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\nPlease confirm your booking:"
+                        _wa_confirm_text = (
+                            f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
+                            "Please confirm your booking:\n\n"
+                            "1. Confirm booking\n2. Cancel"
+                        )
                         _wa_confirm_buttons = [{"id": "btn_confirm", "title": "Confirm booking"}, {"id": "btn_cancel", "title": "Cancel"}]
                         session["last_whatsapp_choice_map"] = {"btn_confirm": "confirm", "btn_cancel": "cancel"}
                         _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, _wa_confirm_text, _wa_confirm_buttons, from_phone=twilio_phone)
                         if not _ok:
-                            _fallback = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel\n\nPlease reply with the number of your choice."
-                            await whatsapp_service.send_message(user_phone, _fallback, from_phone=twilio_phone)
-                        _history_reply = _wa_confirm_text + "\n\n1. Confirm booking\n2. Cancel"
+                            await whatsapp_service.send_message(user_phone, _wa_confirm_text, from_phone=twilio_phone)
                         conversation_history.append({"role": "user", "content": user_text})
-                        conversation_history.append({"role": "assistant", "content": _history_reply})
+                        conversation_history.append({"role": "assistant", "content": _wa_confirm_text})
                         whatsapp_sessions[session_id]["history"] = conversation_history
                         return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
                 if calendar_flow == "days" and num is not None and 1 <= num <= len(calendar_days):
@@ -3893,7 +3896,7 @@ async def whatsapp_webhook(request: Request):
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
-                    slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                    slot_tz = integration.get("calendarTimezone") or (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
                     tz_label = _get_tz_label(slot_tz)
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
                     lines.append(f"🌐 All times in {tz_label}")
@@ -3929,7 +3932,7 @@ async def whatsapp_webhook(request: Request):
                         session["calendar_flow"] = "slots"
                         session["calendar_slots"] = slots_for_day
                         session["calendar_selected_day"] = selected_date
-                        slot_tz = (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        slot_tz = integration.get("calendarTimezone") or (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
                         tz_label = _get_tz_label(slot_tz)
                         lines = [f"Times on {day_info.get('label', selected_date)}:"]
                         lines.append(f"🌐 All times in {tz_label}")
@@ -4762,15 +4765,16 @@ async def whatsapp_webhook(request: Request):
         # Send appropriate WhatsApp message
         is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
         if buttons and len(buttons) <= 3 and not is_multi_select_prompt:
-            # Try native interactive buttons first; fall back to numbered list on failure
+            # Always include numbered list in body so options are visible even when interactive
+            # buttons don't render (e.g. Twilio sandbox). Interactive chips appear on top when supported.
+            full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
             wa_buttons = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
-            success, message = await whatsapp_service.send_interactive_buttons(user_phone, cleaned_reply, wa_buttons, from_phone=twilio_phone)
             session["last_whatsapp_choice_map"] = {
                 f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)
             }
+            success, message = await whatsapp_service.send_interactive_buttons(user_phone, full_message, wa_buttons, from_phone=twilio_phone)
             if not success:
                 logger.info("Interactive buttons failed (%s), falling back to numbered list", message)
-                full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
                 success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
                 if not success:
                     logger.error("Failed to send WhatsApp message: %s", message)
