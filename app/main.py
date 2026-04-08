@@ -875,6 +875,18 @@ def _format_whatsapp_option_prompt(base_text: str, options: List[Dict[str, str]]
         guidance = "\n\nPlease reply with the number of your choice."
     return f"{base_text}{numbered}{guidance}"
 
+
+def _format_social_option_prompt(base_text: str, options: List[Dict[str, str]], multi_select: bool) -> str:
+    numbered = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(options, 1)])
+    if multi_select:
+        guidance = (
+            "\n\nYou can select multiple options. Reply with comma-separated numbers "
+            "(e.g. 1,2) or option names."
+        )
+    else:
+        guidance = "\n\nPlease reply with the number of your choice."
+    return f"{base_text}{numbered}{guidance}"
+
 def _slot_matches_local_date(slot: Dict[str, Any], selected_date: str, calendar_tz: str) -> bool:
     """Match slot start date against selected local calendar date."""
     if not selected_date:
@@ -4087,7 +4099,6 @@ async def whatsapp_webhook(request: Request):
                             if msg.get("role") == "user":
                                 content = msg.get("content", "").lower()
                                 if "name is" in content or "my name is" in content:
-                                    import re
                                     name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
                                     if name_match:
                                         customer_name = name_match.group(1).strip()
@@ -4519,7 +4530,6 @@ async def whatsapp_webhook(request: Request):
                             if msg.get("role") == "user":
                                 content = msg.get("content", "").lower()
                                 if "name is" in content or "my name is" in content:
-                                    import re
                                     name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
                                     if name_match:
                                         customer_name = name_match.group(1).strip()
@@ -4579,7 +4589,6 @@ async def whatsapp_webhook(request: Request):
                     if msg.get("role") == "user":
                         content = msg.get("content", "").lower()
                         if "name is" in content or "my name is" in content:
-                            import re
                             name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
                             if name_match:
                                 email_validation_state["customer_name"] = name_match.group(1).strip()
@@ -4865,14 +4874,13 @@ async def messenger_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
             if buttons:
-                btn_text = "\n\n" + "\n".join(
-                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
-                )
-                await messenger_service.send_message(
-                    sender_id,
-                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
-                    page_access_token,
-                )
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await messenger_service.send_message(sender_id, full_message, page_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
             else:
                 await messenger_service.send_message(sender_id, initial_reply, page_access_token)
 
@@ -4976,6 +4984,8 @@ async def messenger_webhook(request: Request):
             await messenger_service.send_message(sender_id, followup, page_access_token)
             return {"status": "ok"}
 
+        enhanced_message_text = _normalize_workflow_choice_input(message_text, flow_controller) or message_text
+
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
         calendar_slots = session.get("calendar_slots") or []
@@ -5053,7 +5063,10 @@ async def messenger_webhook(request: Request):
                             if _post_booking_note_chat:
                                 reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
                             _review_url_inline = _integration_google_review_url(integration)
-                            if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            _skip_global_prompts = _should_skip_global_review_feedback_prompts(flow_controller, context)
+                            _should_send_review_prompt = bool(_review_url_inline) and not _skip_global_prompts
+                            _should_collect_feedback = _capture_feedback_enabled(context) and not _skip_global_prompts
+                            if _should_send_review_prompt:
                                 reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
                             # Ensure social-channel bookings are persisted as leads.
                             try:
@@ -5099,13 +5112,17 @@ async def messenger_webhook(request: Request):
                         conversation_history.append({"role": "assistant", "content": reply})
                         session["history"] = conversation_history
                         await messenger_service.send_message(sender_id, reply, page_access_token)
-                        if book_result.get("success") and _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        if book_result.get("success") and _should_collect_feedback:
                             feedback_prompt = _feedback_prompt_message()
                             session["feedback_collection_active"] = True
                             session["feedback_data"] = {}
                             conversation_history.append({"role": "assistant", "content": feedback_prompt})
                             session["history"] = conversation_history
                             await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                        elif book_result.get("success"):
+                            key = f"messenger_{recipient_id}_{sender_id}"
+                            messenger_key_to_session.pop(key, None)
+                            messenger_sessions.pop(session_id, None)
                         return {"status": "ok"}
                     if is_cancel_choice:
                         session["calendar_flow"] = "slots"
@@ -5206,7 +5223,7 @@ async def messenger_webhook(request: Request):
         if (
             app_id
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
-            and _is_availability_intent(message_text)
+            and _is_availability_intent(enhanced_message_text)
         ):
             from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
@@ -5270,7 +5287,7 @@ async def messenger_webhook(request: Request):
                         for i, day in enumerate(show_days, 1):
                             lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 cleaned_reply, buttons = _extract_buttons_from_response(reply)
@@ -5283,14 +5300,14 @@ async def messenger_webhook(request: Request):
             except Exception as cal_exc:
                 logger.exception("Messenger: Calendar availability error: %s", cal_exc)
                 reply = "I couldn't fetch availability right now. Please try again later."
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
 
         # Add user message to history
-        conversation_history.append({"role": "user", "content": message_text})
+        conversation_history.append({"role": "user", "content": enhanced_message_text})
 
         # Detect language and configure response generator
         lang_code = detect_language(message_text)
@@ -5525,7 +5542,7 @@ async def messenger_webhook(request: Request):
 
             # ── Generate response via state machine ───────────────────────────────
             reply = await response_generator.generate_response(
-                flow_controller, message_text, conversation_history, context
+                flow_controller, enhanced_message_text, conversation_history, context
             )
 
             # ── SEND_EMAIL / SEND_PHONE signal interceptors ───────────────────────
@@ -5874,8 +5891,13 @@ async def messenger_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
-                await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await messenger_service.send_message(sender_id, full_message, page_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
             else:
                 await messenger_service.send_message(sender_id, reply, page_access_token)
 
@@ -6038,9 +6060,13 @@ async def instagram_webhook(request: Request):
             # Send reply via Meta Graph API
             cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
             if buttons:
-                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
-                await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
             else:
                 await instagram_service.send_message(sender_id, initial_reply, instagram_access_token)
             
@@ -6144,6 +6170,8 @@ async def instagram_webhook(request: Request):
             await instagram_service.send_message(sender_id, followup, instagram_access_token)
             return {"status": "ok"}
 
+        enhanced_message_text = _normalize_workflow_choice_input(message_text, flow_controller) or message_text
+
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
         calendar_slots = session.get("calendar_slots") or []
@@ -6221,7 +6249,10 @@ async def instagram_webhook(request: Request):
                             if _post_booking_note_chat:
                                 reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
                             _review_url_inline = _integration_google_review_url(integration)
-                            if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            _skip_global_prompts = _should_skip_global_review_feedback_prompts(flow_controller, context)
+                            _should_send_review_prompt = bool(_review_url_inline) and not _skip_global_prompts
+                            _should_collect_feedback = _capture_feedback_enabled(context) and not _skip_global_prompts
+                            if _should_send_review_prompt:
                                 reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
                             # Ensure social-channel bookings are persisted as leads.
                             try:
@@ -6267,13 +6298,17 @@ async def instagram_webhook(request: Request):
                         conversation_history.append({"role": "assistant", "content": reply})
                         session["history"] = conversation_history
                         await instagram_service.send_message(sender_id, reply, instagram_access_token)
-                        if book_result.get("success") and _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        if book_result.get("success") and _should_collect_feedback:
                             feedback_prompt = _feedback_prompt_message()
                             session["feedback_collection_active"] = True
                             session["feedback_data"] = {}
                             conversation_history.append({"role": "assistant", "content": feedback_prompt})
                             session["history"] = conversation_history
                             await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                        elif book_result.get("success"):
+                            key = f"instagram_{recipient_id}_{sender_id}"
+                            instagram_key_to_session.pop(key, None)
+                            instagram_sessions.pop(session_id, None)
                         return {"status": "ok"}
                     if is_cancel_choice:
                         session["calendar_flow"] = "slots"
@@ -6374,7 +6409,7 @@ async def instagram_webhook(request: Request):
         if (
             app_id
             and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
-            and _is_availability_intent(message_text)
+            and _is_availability_intent(enhanced_message_text)
         ):
             from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
@@ -6438,7 +6473,7 @@ async def instagram_webhook(request: Request):
                         for i, day in enumerate(show_days, 1):
                             lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                         reply = "\n".join(lines)
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 cleaned_reply, buttons = _extract_buttons_from_response(reply)
@@ -6451,14 +6486,14 @@ async def instagram_webhook(request: Request):
             except Exception as cal_exc:
                 logger.exception("Instagram: Calendar availability error: %s", cal_exc)
                 reply = "I couldn't fetch availability right now. Please try again later."
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
         
         # Add user message to history
-        conversation_history.append({"role": "user", "content": message_text})
+        conversation_history.append({"role": "user", "content": enhanced_message_text})
 
         # Detect language and configure response generator
         lang_code = detect_language(message_text)
@@ -6685,7 +6720,7 @@ async def instagram_webhook(request: Request):
 
             # ── Generate response via state machine ───────────────────────────────
             reply = await response_generator.generate_response(
-                flow_controller, message_text, conversation_history, context
+                flow_controller, enhanced_message_text, conversation_history, context
             )
 
             # ── SEND_EMAIL / SEND_PHONE signal interceptors ───────────────────────
@@ -7030,8 +7065,13 @@ async def instagram_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
-                await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
             else:
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
 
