@@ -1719,6 +1719,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     calendar_selected_day: Optional[str] = None
     calendar_pending_slot: Dict[str, Any] = {}
     user_timezone: str = "UTC"
+    pending_lead_switch: Optional[Dict[str, Any]] = None  # awaiting user yes/no confirmation
 
     # Build RAG off the event loop so the client gets the first message(s) quickly.
     # Blocking embeddings here previously stretched time-to-first-byte (~5s+), which
@@ -1751,6 +1752,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             user_timezone = str(resume_blob.get("user_timezone") or "UTC")
             feedback_collection_active = bool(resume_blob.get("feedback_collection_active"))
             feedback_data = dict(resume_blob.get("feedback_data") or {})
+            _pls_raw = resume_blob.get("pending_lead_switch")
+            if isinstance(_pls_raw, dict):
+                pending_lead_switch = _pls_raw
             _restore_flow_controller_from_resume(flow_controller, resume_blob.get("flow"))
             lid = resume_blob.get("lead_id")
             if lid:
@@ -1973,6 +1977,111 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             # If user selects a different lead type mid-flow, terminate current branch
             # (including calendar/workflow) and restart from the new lead type gracefully.
             lead_types_list = context.get("lead_types", [])
+
+            # ── Pending lead-type switch confirmation handler ─────────────────────────
+            # If we previously asked the user to confirm a lead-type switch, handle
+            # their yes/no before anything else on this turn.
+            if pending_lead_switch:
+                _confirm_text = str(user_text).strip().lower()
+                _yes_set = {"yes", "y", "yeah", "yep", "sure", "confirm", "ok", "okay", "switch"}
+                _no_set = {"no", "n", "nope", "cancel", "keep", "stay", "dont", "don't"}
+                _is_yes = _confirm_text in _yes_set or _confirm_text.startswith("yes")
+                _is_no = _confirm_text in _no_set or _confirm_text.startswith("no")
+
+                if _is_yes or _is_no:
+                    _pls = pending_lead_switch
+                    pending_lead_switch = None
+                    conversation_history.append({"role": "user", "content": user_text})
+
+                    if _is_yes:
+                        _switched = _pls["switched_lead_type"]
+                        _prev_lt = _pls["previous_lead_type"]
+
+                        calendar_flow = None
+                        calendar_days = []
+                        calendar_slots = []
+                        calendar_free_slots = []
+                        calendar_selected_day = None
+                        calendar_pending_slot = {}
+
+                        if flow_controller.workflow_manager:
+                            flow_controller.workflow_manager.reset()
+                        flow_controller.update_collected_data("leadType", _switched.get("value"))
+                        flow_controller.update_collected_data("serviceType", None)
+                        flow_controller.update_collected_data("workflowAnswers", {})
+                        flow_controller.update_collected_data("appointmentSlot", None)
+
+                        _existing_switch_hist = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
+                        _switch_hist = list(_existing_switch_hist) if isinstance(_existing_switch_hist, list) else []
+                        _switch_hist.append({
+                            "from": _prev_lt,
+                            "to": _switched.get("value"),
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        flow_controller.update_collected_data("leadTypeSwitchHistory", _switch_hist)
+
+                        if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                            flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                        elif (
+                            flow_controller.capture_lead_phone
+                            and not flow_controller.skip_phone_collection
+                            and not flow_controller.collected_data.get("leadPhoneNumber")
+                        ):
+                            flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+                        else:
+                            if flow_controller.is_booking_lead_type():
+                                flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                            else:
+                                flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+
+                        _new_lbl = _lead_type_display_label_from_dict(_switched)
+                        if not _new_lbl:
+                            _new_lbl = _switched.get("text") or _switched.get("value") or "this option"
+                        _prev_lbl = _lead_type_display_label_from_value(_prev_lt, lead_types_list)
+                        try:
+                            _lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
+                                _switched.get("value"), context.get("lead_types", [])
+                            )
+                        except Exception:
+                            _lt_empathy = ""
+                        _lt_empathy = (_lt_empathy or "").strip()
+                        if _prev_lbl and _prev_lt.lower() != (_switched.get("value") or "").strip().lower():
+                            _switch_confirm_msg = (
+                                f"{_lt_empathy} I've switched you from **{_prev_lbl}** to **{_new_lbl}**."
+                                if _lt_empathy
+                                else f"Got it — switching from **{_prev_lbl}** to **{_new_lbl}**."
+                            )
+                        else:
+                            _switch_confirm_msg = (
+                                f"{_lt_empathy} I've updated your request to **{_new_lbl}**."
+                                if _lt_empathy
+                                else f"Got it — switched to **{_new_lbl}**."
+                            )
+                        _next_prompt = await response_generator.get_post_switch_prompt(
+                            flow_controller, conversation_history, context
+                        )
+                        reply = f"{_switch_confirm_msg}\n\n{_next_prompt}"
+                    else:
+                        # User declined — stay on current lead type and re-prompt current step
+                        _stay_label = _lead_type_display_label_from_value(
+                            _pls["previous_lead_type"], lead_types_list
+                        ) or _pls["previous_lead_type"]
+                        reply = f"No problem, continuing with **{_stay_label}**."
+                        _current_prompt = await response_generator._generate_state_response(
+                            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                        )
+                        if _current_prompt:
+                            reply = f"{reply}\n\n{_current_prompt}"
+
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                else:
+                    # User sent something unrelated — discard the pending switch and process normally
+                    pending_lead_switch = None
+
             # Lead-type *switch* detection only when not in explicit lead-type selection
             # (that path uses resolve_lead_type(..., LEAD_SELECTION) inside ResponseGenerator).
             # MID_FLOW_SWITCH ignores plain digits and uses strict matching so workflow
@@ -1993,53 +2102,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 and _existing_lt.lower()
                 != (switched_lead_type.get("value") or "").strip().lower()
             ):
-                previous_lead_type = flow_controller.collected_data.get("leadType")
-                # Break any ongoing calendar branch
-                calendar_flow = None
-                calendar_days = []
-                calendar_slots = []
-                calendar_free_slots = []
-                calendar_selected_day = None
-                calendar_pending_slot = {}
-
-                # Reset service/workflow context and apply the new lead type
-                if flow_controller.workflow_manager:
-                    flow_controller.workflow_manager.reset()
-                flow_controller.update_collected_data("leadType", switched_lead_type.get("value"))
-                flow_controller.update_collected_data("serviceType", None)
-                flow_controller.update_collected_data("workflowAnswers", {})
-                flow_controller.update_collected_data("appointmentSlot", None)
-
-                # Keep already provided personal/verification info on lead-type switch.
-                # We only reset service/workflow/booking branch data.
-
-                existing_switch_history = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
-                switch_history = list(existing_switch_history) if isinstance(existing_switch_history, list) else []
-                switch_history.append({
-                    "from": previous_lead_type,
-                    "to": switched_lead_type.get("value"),
-                    "at": datetime.now(timezone.utc).isoformat(),
-                })
-                flow_controller.update_collected_data("leadTypeSwitchHistory", switch_history)
-
-                # Keep already collected name; continue from the right next step
-                if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
-                    flow_controller.transition_to(ConversationState.NAME_COLLECTION)
-                elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
-                    flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
-                elif (
-                    flow_controller.capture_lead_phone
-                    and not flow_controller.skip_phone_collection
-                    and not flow_controller.collected_data.get("leadPhoneNumber")
-                ):
-                    flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
-                else:
-                    if flow_controller.is_booking_lead_type():
-                        flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
-                    else:
-                        flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
-
-                # Polished switch confirmation: show full button-style labels (emoji + text) and from → to
+                # Ask for confirmation before switching — do not switch immediately.
                 _new_label = _lead_type_display_label_from_dict(switched_lead_type)
                 if not _new_label:
                     _new_label = (
@@ -2047,34 +2110,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         or switched_lead_type.get("value")
                         or "this option"
                     )
-                _prev_label = _lead_type_display_label_from_value(previous_lead_type, lead_types_list)
-                _prev_val = str(previous_lead_type or "").strip().lower()
-                _new_val = str(switched_lead_type.get("value") or "").strip().lower()
-                try:
-                    _lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
-                        switched_lead_type.get("value"), context.get("lead_types", [])
-                    )
-                except Exception:
-                    _lt_empathy = ""
-                _lt_empathy = (_lt_empathy or "").strip()
-                if _prev_label and _prev_val and _prev_val != _new_val:
-                    switch_msg = (
-                        f"{_lt_empathy} I've switched you from **{_prev_label}** to **{_new_label}**."
-                        if _lt_empathy
-                        else f"Got it — switching from **{_prev_label}** to **{_new_label}**."
-                    )
-                else:
-                    switch_msg = (
-                        f"{_lt_empathy} I've updated your request to **{_new_label}**."
-                        if _lt_empathy
-                        else f"Got it — switched to **{_new_label}**."
-                    )
-                next_prompt = await response_generator._generate_state_response(
-                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                _prev_label = _lead_type_display_label_from_value(_existing_lt, lead_types_list) or _existing_lt
+                pending_lead_switch = {
+                    "switched_lead_type": switched_lead_type,
+                    "previous_lead_type": _existing_lt,
+                }
+                _confirm_q = (
+                    f"Would you like to switch from **{_prev_label}** to **{_new_label}**?\n\n"
+                    f'<button value="yes">Yes, switch</button> '
+                    f'<button value="no">No, keep {_prev_label}</button>'
                 )
-                reply = f"{switch_msg}\n\n{next_prompt}"
-                conversation_history.append({"role": "assistant", "content": reply})
-                await websocket.send_json({"type": "bot", "content": reply})
+                conversation_history.append({"role": "user", "content": user_text})
+                conversation_history.append({"role": "assistant", "content": _confirm_q})
+                await websocket.send_json({"type": "bot", "content": _confirm_q})
                 continue
 
             # ── Side-question interjection ─────────────────────────────────────────────
@@ -3023,6 +3071,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     "feedback_data": feedback_data,
                     "flow": _snapshot_flow_controller_for_resume(flow_controller),
                     "lead_id": lead_id,
+                    "pending_lead_switch": pending_lead_switch,
                 }
                 _prune_widget_resume_store()
             except Exception:
