@@ -1214,13 +1214,16 @@ Classify the intent:"""
                     )
 
             # Non-booking open text/voice workflow question:
-            # 1) Try FAQ/RAG first.
+            # 1) Try FAQ/RAG first if the message looks like a question/interjection.
             # 2) If not found but still industry-related, answer via LLM.
             # 3) If off-industry/off-route, apologize and repeat same question (no progression).
+            # Direct answers (question_type == "not_question") skip this block entirely and
+            # are recorded as workflow answers below — preventing false "off-topic" rejections.
             if (
                 not current_options
                 and not flow_controller.is_booking_lead_type()
                 and (user_message or "").strip()
+                and question_type != "not_question"
             ):
                 try:
                     rag_context = await self._get_rag_context(user_message, context, is_question=True)
@@ -2113,6 +2116,66 @@ RULES:
             logger.error(f"Error generating response: {e}")
             return "I'm here to help you. How can I assist you today?"
     
+    async def get_post_switch_prompt(
+        self,
+        flow_controller: "FlowController",
+        conversation_history: List[Dict[str, Any]],
+        context: Dict[str, Any],
+    ) -> str:
+        """Return the correct prompt to show immediately after a lead-type switch is confirmed.
+
+        Unlike _generate_state_response (which uses a generic LLM prompt for WORKFLOW_QUESTION),
+        this method properly initialises the workflow/service for the new lead type:
+          - 1 service  → auto-selects it, starts its workflow, returns the first question
+          - >1 services → transitions to SERVICE_SELECTION and returns the selection prompt
+          - other states → delegates to _generate_state_response as usual
+        """
+        # Ensure workflow manager exists (it may have been reset, not nulled)
+        if flow_controller.workflow_manager is None:
+            wm_context = dict(context)
+            wm_context["api_base_url"] = self.api_base_url
+            flow_controller.workflow_manager = WorkflowManager(wm_context)
+        wm = flow_controller.workflow_manager
+
+        state = flow_controller.state
+
+        if state == ConversationState.WORKFLOW_QUESTION:
+            collected_lead_type = flow_controller.collected_data.get("leadType")
+            service_plans = context.get("service_plans", [])
+            lead_types = context.get("lead_types", [])
+
+            filtered = self._filter_services_by_lead_type(service_plans, lead_types, collected_lead_type)
+            if filtered is not None:
+                all_service_options = filtered
+            else:
+                all_service_options = []
+                for plan in service_plans:
+                    if isinstance(plan, dict):
+                        name = plan.get("question", plan.get("name", plan.get("title", "")))
+                        if name:
+                            all_service_options.append(name)
+                    else:
+                        name = str(plan).strip()
+                        if name:
+                            all_service_options.append(name)
+
+            if len(all_service_options) == 1:
+                single_service = all_service_options[0]
+                flow_controller.update_collected_data("serviceType", single_service)
+                if wm.start_workflow_for_service(single_service):
+                    q = wm.get_current_question()
+                    if q:
+                        return wm.format_question_with_options(q) or ""
+            elif len(all_service_options) > 1:
+                flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                return await self._generate_service_selection_response(
+                    conversation_history, context, collected_lead_type=collected_lead_type
+                )
+
+        return await self._generate_state_response(
+            state, "", conversation_history, context, flow_controller=flow_controller
+        )
+
     async def generate_lead_json(
         self,
         flow_controller: FlowController,
