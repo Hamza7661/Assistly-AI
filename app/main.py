@@ -25,6 +25,12 @@ from .services.messenger_graph_service import MessengerGraphService
 from .services.voice_agent_service import VoiceAgentService
 from .services.rag_service import RAGService
 from .services.calendar_service import CalendarService
+from .services.quota_service import (
+    AppPlanChannelDenied,
+    apply_app_plan_sms_addon,
+    enforce_app_plan_for_channel,
+    user_message_for_app_plan_denial,
+)
 from .services.conversation_state import FlowController, ConversationState
 from .services.response_generator import ResponseGenerator
 from .services.data_extractors import DataExtractor
@@ -1026,6 +1032,9 @@ def _validate_email_enabled(context: Dict[str, Any]) -> bool:
 
 def _validate_phone_enabled(context: Dict[str, Any]) -> bool:
     integration = (context or {}).get("integration") or {}
+    addons = ((context or {}).get("appPlan") or {}).get("addons") or {}
+    if "smsVerification" in addons:
+        return bool(addons.get("smsVerification") and integration.get("captureLeadPhoneNumber", True))
     return bool(integration.get("validatePhoneNumber", True) and integration.get("captureLeadPhoneNumber", True))
 
 
@@ -1235,11 +1244,13 @@ def _format_post_booking_note_for_chat(note: str) -> str:
 
 def _snapshot_flow_controller_for_resume(fc: FlowController) -> Dict[str, Any]:
     wm = fc.workflow_manager
+    bctx = getattr(fc, "booking_block_ctx", None)
     return {
         "state": fc.state.value,
         "collected_data": json.loads(json.dumps(fc.collected_data, default=str)),
         "otp_state": dict(fc.otp_state),
         "workflow": wm.export_state() if wm else None,
+        "booking_block_ctx": json.loads(json.dumps(bctx, default=str)) if bctx else None,
     }
 
 
@@ -1265,6 +1276,18 @@ def _restore_flow_controller_from_resume(fc: FlowController, snap: Optional[Dict
         wm = WorkflowManager(fc.context)
         wm.import_state(wf_snap)
         fc.workflow_manager = wm
+    bb_ctx = snap.get("booking_block_ctx")
+    if bb_ctx is not None:
+        fc.booking_block_ctx = bb_ctx if isinstance(bb_ctx, dict) else None
+
+
+def _is_inline_booking_calendar_ctx(flow_controller: Any) -> bool:
+    """True when calendar UI was opened from a mid-workflow booking block (non–book-appointment flows)."""
+    bctx = getattr(flow_controller, "booking_block_ctx", None)
+    if not isinstance(bctx, dict):
+        return False
+    cfg = bctx.get("config")
+    return bctx.get("stage") == "calendar" and isinstance(cfg, dict) and bool(cfg.get("enabled"))
 
 
 def _prune_widget_resume_store() -> None:
@@ -1700,6 +1723,34 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         company_name=resolved_company_name or None,
     )
 
+    resume_blob: Optional[Dict[str, Any]] = None
+    restored = False
+    if resume_key and app_id:
+        _blob = WIDGET_CHAT_RESUME.get(resume_key)
+        if (
+            isinstance(_blob, dict)
+            and str(_blob.get("app_id") or "") == str(app_id)
+            and (time.time() - float(_blob.get("saved_at", 0))) < WIDGET_RESUME_TTL_SEC
+            and not _blob.get("terminal")
+        ):
+            restored = True
+            resume_blob = _blob
+
+    apply_app_plan_sms_addon(context)
+    if resolved_app_id and not restored:
+        _plan_deny = await enforce_app_plan_for_channel(
+            settings, context, resolved_app_id, "web"
+        )
+        if _plan_deny:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "content": user_message_for_app_plan_denial(_plan_deny),
+                }
+            )
+            await websocket.close(code=1008)
+            return
+
     # Initialize production-grade components
     flow_controller = FlowController(context)
     flow_controller.set_whatsapp(False)
@@ -1731,31 +1782,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     feedback_collection_active = False
     feedback_data: Dict[str, Any] = {}
     last_snapshot: Dict[str, Any] = {}
-    restored = False
-    if resume_key and app_id:
-        resume_blob = WIDGET_CHAT_RESUME.get(resume_key)
-        if (
-            isinstance(resume_blob, dict)
-            and str(resume_blob.get("app_id") or "") == str(app_id)
-            and (time.time() - float(resume_blob.get("saved_at", 0))) < WIDGET_RESUME_TTL_SEC
-            and not resume_blob.get("terminal")
-        ):
-            restored = True
-            conversation_history = list(resume_blob.get("conversation_history") or [])
-            calendar_flow = resume_blob.get("calendar_flow")
-            calendar_days = list(resume_blob.get("calendar_days") or [])
-            calendar_slots = list(resume_blob.get("calendar_slots") or [])
-            calendar_free_slots = list(resume_blob.get("calendar_free_slots") or [])
-            calendar_selected_day = resume_blob.get("calendar_selected_day")
-            calendar_pending_slot = dict(resume_blob.get("calendar_pending_slot") or {})
-            user_timezone = str(resume_blob.get("user_timezone") or "UTC")
-            feedback_collection_active = bool(resume_blob.get("feedback_collection_active"))
-            feedback_data = dict(resume_blob.get("feedback_data") or {})
-            _restore_flow_controller_from_resume(flow_controller, resume_blob.get("flow"))
-            lid = resume_blob.get("lead_id")
-            if lid:
-                lead_id = str(lid)
-                flow_controller.update_collected_data("leadId", lead_id)
+    if restored and resume_blob:
+        conversation_history = list(resume_blob.get("conversation_history") or [])
+        calendar_flow = resume_blob.get("calendar_flow")
+        calendar_days = list(resume_blob.get("calendar_days") or [])
+        calendar_slots = list(resume_blob.get("calendar_slots") or [])
+        calendar_free_slots = list(resume_blob.get("calendar_free_slots") or [])
+        calendar_selected_day = resume_blob.get("calendar_selected_day")
+        calendar_pending_slot = dict(resume_blob.get("calendar_pending_slot") or {})
+        user_timezone = str(resume_blob.get("user_timezone") or "UTC")
+        feedback_collection_active = bool(resume_blob.get("feedback_collection_active"))
+        feedback_data = dict(resume_blob.get("feedback_data") or {})
+        _restore_flow_controller_from_resume(flow_controller, resume_blob.get("flow"))
+        lid = resume_blob.get("lead_id")
+        if lid:
+            lead_id = str(lid)
+            flow_controller.update_collected_data("leadId", lead_id)
 
     if not restored:
         flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
@@ -2195,6 +2237,39 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if calendar_flow and app_id_for_calendar and str(user_text).strip():
                 raw_lower = str(user_text).strip().lower()
                 if raw_lower in ("cancel", "back", "exit"):
+                    if _is_inline_booking_calendar_ctx(flow_controller):
+                        bctx = getattr(flow_controller, "booking_block_ctx", None) or {}
+                        bb = bctx.get("config") if isinstance(bctx, dict) else {}
+                        wm = getattr(flow_controller, "workflow_manager", None)
+                        calendar_flow = None
+                        calendar_days = []
+                        calendar_slots = []
+                        calendar_free_slots = []
+                        calendar_selected_day = None
+                        calendar_pending_slot = {}
+                        flow_controller.booking_block_ctx = None
+                        if wm and isinstance(bb, dict):
+                            wm.apply_booking_block_after_resolution(
+                                "Cancelled during scheduling",
+                                bb.get("onNoNextQuestionId"),
+                            )
+                        nq = wm.get_current_question() if wm else None
+                        if not wm:
+                            reply = "Cancelled. How can I help?"
+                        elif nq:
+                            reply = wm.format_question_with_options(nq) or "Let's continue."
+                        else:
+                            workflow_answers = wm.get_workflow_answers()
+                            flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                            wm.reset()
+                            flow_controller.transition_to(flow_controller.get_next_state())
+                            reply = await response_generator._generate_state_response(
+                                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                            )
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await websocket.send_json({"type": "bot", "content": reply})
+                        continue
                     calendar_flow = None
                     calendar_days = []
                     calendar_slots = []
@@ -2247,6 +2322,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     calendar_free_slots = []
                     calendar_selected_day = None
                     calendar_pending_slot = {}
+                    inline_cal = _is_inline_booking_calendar_ctx(flow_controller)
+                    bb_inline = (
+                        (flow_controller.booking_block_ctx or {}).get("config")
+                        if inline_cal and isinstance(flow_controller.booking_block_ctx, dict)
+                        else None
+                    )
                     if book_result.get("success"):
                         _display_tz = integration.get("calendarTimezone") or slot_timezone or "UTC"
                         flow_controller.update_collected_data("appointmentSlot", {
@@ -2267,12 +2348,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
                         if _post_booking_note_chat:
                             reply += f"\n\n📋 **Important Instructions**\n{_post_booking_note_chat}"
+                        if isinstance(bb_inline, dict):
+                            post_inst = str(bb_inline.get("postBookingInstructions") or "").strip()
+                            if post_inst:
+                                reply += f"\n\n📋 **Instructions**\n{post_inst}"
                         _review_url_inline = _integration_google_review_url(integration)
-                        if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        if (
+                            not inline_cal
+                            and _review_url_inline
+                            and not _should_skip_global_review_feedback_prompts(flow_controller, context)
+                        ):
                             reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
-                        # Booking confirmation is the terminal step for this lead cycle.
+                        # Terminal lead completion only for standard end-of-flow booking.
                         try:
-                            if lead_id:
+                            if lead_id and not inline_cal:
                                 full_history = conversation_history + [
                                     {"role": "user", "content": user_text},
                                     {"role": "assistant", "content": reply},
@@ -2300,6 +2389,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     "history": full_history,
                                 }
                                 await lead_service.update_lead(user_id, lead_id, completion_payload)
+                            elif lead_id and inline_cal:
+                                await lead_service.update_lead(
+                                    user_id,
+                                    lead_id,
+                                    {
+                                        "status": "in_progress",
+                                        "appointmentDetails": {
+                                            "eventId": book_result.get("eventId"),
+                                            "start": book_result.get("start") or start_iso,
+                                            "end": book_result.get("end") or end_iso,
+                                            "link": book_result.get("link"),
+                                            "confirmed": True,
+                                        },
+                                    },
+                                )
                         except Exception as completion_exc:
                             logger.warning("Lead completion update after booking failed: %s", completion_exc)
                     else:
@@ -2308,7 +2412,36 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     if book_result.get("success"):
-                        if _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        if inline_cal:
+                            wm = getattr(flow_controller, "workflow_manager", None)
+                            flow_controller.booking_block_ctx = None
+                            if wm and isinstance(bb_inline, dict):
+                                wm.apply_booking_block_after_resolution(
+                                    f"Booked appointment for {time_str}",
+                                    bb_inline.get("onYesNextQuestionId"),
+                                )
+                            nq = wm.get_current_question() if wm else None
+                            if nq:
+                                follow = wm.format_question_with_options(nq) or ""
+                                if follow:
+                                    conversation_history.append({"role": "assistant", "content": follow})
+                                    await websocket.send_json({"type": "bot", "content": follow})
+                                    if _bot_requests_file_upload(follow):
+                                        await websocket.send_json({"type": "enable_file_upload"})
+                            else:
+                                if wm:
+                                    workflow_answers = wm.get_workflow_answers()
+                                    flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                                    wm.reset()
+                                flow_controller.transition_to(flow_controller.get_next_state())
+                                follow = await response_generator._generate_state_response(
+                                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                                )
+                                conversation_history.append({"role": "assistant", "content": follow})
+                                await websocket.send_json({"type": "bot", "content": follow})
+                                if _bot_requests_file_upload(follow):
+                                    await websocket.send_json({"type": "enable_file_upload"})
+                        elif _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                             feedback_prompt = _feedback_prompt_message()
                             feedback_collection_active = True
                             feedback_data = {}
@@ -3045,8 +3178,24 @@ async def voice_agent_webhook(request: Request) -> Response:
 
     logger.info("Voice agent webhook: call_sid=%s from=%s to=%s", call_sid, from_number, to_number)
 
+    twilio_geo: Dict[str, str] = {}
+    for geo_key in ("CallerName", "FromCity", "FromState", "FromZip", "FromCountry"):
+        gv = form.get(geo_key)
+        if gv:
+            twilio_geo[str(geo_key)] = str(gv)
+
     try:
-        await voice_agent_service.start_session(call_sid, from_number, to_number)
+        await voice_agent_service.start_session(
+            call_sid,
+            from_number,
+            to_number,
+            twilio_geo=twilio_geo or None,
+        )
+    except AppPlanChannelDenied as denied:
+        logger.info("Voice call %s blocked by app plan: %s", call_sid, denied.user_message)
+        failure_response = VoiceResponse()
+        failure_response.say(denied.user_message)
+        return Response(content=str(failure_response), media_type="text/xml")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Unable to initialize voice agent session for %s: %s", call_sid, exc)
         failure_response = VoiceResponse()
@@ -3223,6 +3372,20 @@ async def whatsapp_webhook(request: Request):
             except Exception as exc:
                 logger.exception("Failed to fetch user context for Twilio number %s: %s", twilio_phone, exc)
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I'm having trouble accessing your information. Please try again later."), media_type="text/xml")
+
+            apply_app_plan_sms_addon(context)
+            wa_app_id = str((context.get("app") or {}).get("id") or "").strip()
+            if wa_app_id:
+                wa_deny = await enforce_app_plan_for_channel(
+                    settings, context, wa_app_id, "whatsapp"
+                )
+                if wa_deny:
+                    return Response(
+                        content=whatsapp_service.create_twiml_response(
+                            user_message_for_app_plan_denial(wa_deny)
+                        ),
+                        media_type="text/xml",
+                    )
 
             runtime_twilio_sid = str(context.get("twilioAccountSid") or "").strip() or None
             runtime_twilio_token = str(context.get("twilioAuthToken") or "").strip() or None
@@ -4927,6 +5090,20 @@ async def messenger_webhook(request: Request):
                 )
                 return {"status": "error", "message": "No Messenger page access token configured"}
 
+            apply_app_plan_sms_addon(context)
+            ms_app_id = str(app_id or "").strip()
+            if ms_app_id:
+                ms_deny = await enforce_app_plan_for_channel(
+                    settings, context, ms_app_id, "facebook"
+                )
+                if ms_deny:
+                    await messenger_service.send_message(
+                        sender_id,
+                        user_message_for_app_plan_denial(ms_deny),
+                        page_access_token,
+                    )
+                    return {"status": "ok"}
+
             current_time = time.time()
             messenger_sessions[session_id] = {
                 "user_id": sender_id,          # PSID
@@ -6116,6 +6293,20 @@ async def instagram_webhook(request: Request):
             if not instagram_access_token:
                 logger.error(f"Instagram: no access token in context for business_account_id={recipient_id}")
                 return {"status": "error", "message": "No Instagram access token configured"}
+
+            apply_app_plan_sms_addon(context)
+            ig_app_id = str(app_id or "").strip()
+            if ig_app_id:
+                ig_deny = await enforce_app_plan_for_channel(
+                    settings, context, ig_app_id, "instagram"
+                )
+                if ig_deny:
+                    await instagram_service.send_message(
+                        sender_id,
+                        user_message_for_app_plan_denial(ig_deny),
+                        instagram_access_token,
+                    )
+                    return {"status": "ok"}
             
             current_time = time.time()
             instagram_sessions[session_id] = {

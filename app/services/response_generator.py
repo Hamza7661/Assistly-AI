@@ -1150,7 +1150,73 @@ Classify the intent:"""
                 flow_controller.transition_to(flow_controller.get_next_state())
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
-            
+
+            # ── Inline booking block (plug-in): non–book-appointment flows only ─────────
+            # Lead types that route to the standard end-of-flow APPOINTMENT_OFFER /
+            # CALENDAR_BOOKING keep that behaviour; we do not inject per-step booking here.
+            if flow_controller.is_booking_lead_type():
+                flow_controller.booking_block_ctx = None
+            else:
+                bb = (current_question.get("bookingBlock") or {}) if isinstance(current_question, dict) else {}
+                qid_bb = str((current_question or {}).get("_id") or "")
+                if bb.get("enabled") and qid_bb:
+                    bctx = getattr(flow_controller, "booking_block_ctx", None) or {}
+                    st = bctx.get("stage")
+                    if st == "calendar" and not (user_message or "").strip():
+                        return ""
+                    if st not in ("yes_no", "cancel_reason", "calendar"):
+                        flow_controller.booking_block_ctx = {"question_id": qid_bb, "stage": "yes_no", "config": bb}
+                        qtxt = (bb.get("bookingQuestionText") or "Would you like to book an appointment?").strip()
+                        if self.channel == "voice":
+                            return f"{qtxt} Please say yes or no."
+                        return f"{qtxt}\n<button value=\"yes\">Yes</button> <button value=\"no\">No</button>"
+
+                    um_l = (user_message or "").strip().lower()
+                    if st == "yes_no" and um_l:
+                        yes = um_l in {"yes", "y", "yeah", "please", "book", "1"} or um_l.startswith("yes ")
+                        no = um_l in {"no", "n", "nope", "2", "not now", "no thanks"} or um_l.startswith("no ")
+                        if yes:
+                            flow_controller.booking_block_ctx = {**bctx, "stage": "calendar"}
+                            return "BOOK_APPOINTMENT_REQUESTED"
+                        if no:
+                            if bb.get("cancellationReasonEnabled"):
+                                flow_controller.booking_block_ctx = {**bctx, "stage": "cancel_reason"}
+                                return "No problem. Could you share a brief reason? (Or type skip)"
+                            workflow_manager.apply_booking_block_after_resolution(
+                                "Declined optional booking",
+                                bb.get("onNoNextQuestionId"),
+                            )
+                            flow_controller.booking_block_ctx = None
+                            nq = workflow_manager.get_current_question()
+                            if nq:
+                                return workflow_manager.format_question_with_options(nq) or ""
+                            workflow_answers = workflow_manager.get_workflow_answers()
+                            flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                            workflow_manager.reset()
+                            flow_controller.transition_to(flow_controller.get_next_state())
+                            return await self._generate_state_response(
+                                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                            )
+                    if st == "cancel_reason" and um_l:
+                        reason = (user_message or "").strip()
+                        if reason.lower() in {"skip", "no", "none"}:
+                            reason = "Not specified"
+                        workflow_manager.apply_booking_block_after_resolution(
+                            f"Declined booking; reason: {reason[:300]}",
+                            bb.get("onNoNextQuestionId"),
+                        )
+                        flow_controller.booking_block_ctx = None
+                        nq = workflow_manager.get_current_question()
+                        if nq:
+                            return workflow_manager.format_question_with_options(nq) or ""
+                        workflow_answers = workflow_manager.get_workflow_answers()
+                        flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                        workflow_manager.reset()
+                        flow_controller.transition_to(flow_controller.get_next_state())
+                        return await self._generate_state_response(
+                            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                        )
+
             # Check if user is asking a question instead of answering the workflow question
             if has_question:
                 current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""

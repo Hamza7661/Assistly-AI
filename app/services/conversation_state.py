@@ -61,11 +61,17 @@ class FlowController:
         self.capture_lead_email = integration.get("captureLeadEmail", True)
         self.capture_lead_phone = integration.get("captureLeadPhoneNumber", True)
         self.validate_email = bool(integration.get("validateEmail", True) and self.capture_lead_email)
-        self.validate_phone = bool(integration.get("validatePhoneNumber", True) and self.capture_lead_phone)
+        plan_addons = ((context or {}).get("appPlan") or {}).get("addons") or {}
+        if "smsVerification" in plan_addons:
+            self.validate_phone = bool(plan_addons.get("smsVerification") and self.capture_lead_phone)
+        else:
+            self.validate_phone = bool(integration.get("validatePhoneNumber", True) and self.capture_lead_phone)
         self.is_whatsapp = False  # Set externally
         self.channel: str = integration.get("channel", "web")
         self.skip_phone_collection: bool = False
         self.workflow_manager: Optional[Any] = None  # Will be set by response_generator
+        # Mid-workflow booking block: { question_id, stage: yes_no|cancel_reason|calendar, config }
+        self.booking_block_ctx: Optional[Dict[str, Any]] = None
 
     def is_booking_lead_type(self) -> bool:
         lead_type = (self.collected_data.get("leadType") or "").lower()

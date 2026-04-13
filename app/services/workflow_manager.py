@@ -462,6 +462,37 @@ class WorkflowManager:
         self.is_active = False
         self._linked_question_ids = set()
 
+    def apply_booking_block_after_resolution(self, summary_answer: str, next_question_id: Optional[str]) -> bool:
+        """
+        After an inline booking block (yes/no + optional calendar), record a synthetic answer for the
+        current question and continue to onYes/onNo next question or advance sequentially.
+        """
+        if not self.is_active:
+            return False
+        current_question = self.get_current_question()
+        if not current_question:
+            return False
+        qid = current_question.get("_id")
+        self.workflow_answers[qid] = {
+            "question": current_question.get("question", ""),
+            "answer": summary_answer,
+            "order": current_question.get("order", 0),
+        }
+        next_norm = self._normalize_id(next_question_id) if next_question_id else ""
+        if next_norm:
+            target_q = self._find_question_by_id(next_norm)
+            if target_q:
+                if self._question_queue is None:
+                    self._question_queue = self._get_sorted_questions()[:]
+                insert_at = self._queue_index + 1
+                self._question_queue = [
+                    q for q in self._question_queue
+                    if self._normalize_id(q.get("_id")) != next_norm
+                ]
+                self._question_queue.insert(insert_at, target_q)
+        self._advance_index()
+        return self.get_current_question() is not None
+
     def export_state(self) -> Optional[Dict[str, Any]]:
         """JSON-friendly snapshot for web widget session resume."""
         if not self.is_active:
