@@ -2601,9 +2601,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             if ok:
                                 flow_controller.otp_state["email_verified"] = True
                                 flow_controller.transition_to(flow_controller.get_next_state())
-                                # Get AI response to continue
+                                # Get AI response to continue (empty string so PHONE_COLLECTION
+                                # generates a proper prompt instead of a validation error)
                                 reply = await response_generator.generate_response(
-                                    flow_controller, "Email verified", conversation_history, context
+                                    flow_controller, "", conversation_history, context
                                 )
                             else:
                                 reply = get_string("otp_wrong_code", lang_code)
@@ -4300,8 +4301,8 @@ async def whatsapp_webhook(request: Request):
                         # Update flow controller OTP state
                         flow_controller.otp_state["email_verified"] = True
                         flow_controller.transition_to(flow_controller.get_next_state())
-                        # Get AI response to continue the flow
-                        reply = await response_generator.generate_response(flow_controller, "Email verified", conversation_history, context)
+                        # Empty string so PHONE_COLLECTION generates a proper prompt instead of a validation error
+                        reply = await response_generator.generate_response(flow_controller, "", conversation_history, context)
                     
                     # Check if it's JSON (lead completion) - BEFORE sending
                     parsed_json = _maybe_parse_json(reply)
@@ -5633,8 +5634,9 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_verified"] = True
                             flow_controller.otp_state["email_verified"] = True
                             flow_controller.transition_to(flow_controller.get_next_state())
+                            # Empty string so PHONE_COLLECTION generates a proper prompt instead of a validation error
                             reply = await response_generator.generate_response(
-                                flow_controller, "Email verified", conversation_history, context
+                                flow_controller, "", conversation_history, context
                             )
                         else:
                             reply = temp_reply
@@ -6813,8 +6815,9 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_verified"] = True
                             flow_controller.otp_state["email_verified"] = True
                             flow_controller.transition_to(flow_controller.get_next_state())
+                            # Empty string so PHONE_COLLECTION generates a proper prompt instead of a validation error
                             reply = await response_generator.generate_response(
-                                flow_controller, "Email verified", conversation_history, context
+                                flow_controller, "", conversation_history, context
                             )
                         else:
                             reply = temp_reply
