@@ -1528,6 +1528,11 @@ Classify the intent:"""
                 # No phone-like content at all (empty message, system sentinel like "Email verified",
                 # or plain text with no digits) — ask for phone instead of showing an error.
                 if not phone:
+                    # If the message contains a digit sequence (user tried to enter a number but
+                    # it was too short / in an unrecognised format), give a validation error so
+                    # the LLM is never shown an unvalidated number in conversation history.
+                    if re.search(r'\d{3,}', user_message):
+                        return "I didn't catch a valid phone number. Please share your full number including the area code (e.g. 07700 900123 or +44 7700 900123)."
                     return await self._generate_state_response(
                         ConversationState.PHONE_COLLECTION, "", conversation_history, context,
                         flow_controller=flow_controller
@@ -1927,9 +1932,13 @@ When answering the user's question, follow these guidelines:
 - If the user provided something other than a 6-digit code (e.g. a phone number, a name, or other text), gently clarify and ask them to enter the 6-digit code from their email.
 - Do NOT proceed to the next step until a valid 6-digit code is entered.
 - Do NOT ask for a phone number or any other data at this stage.""",
-            ConversationState.PHONE_COLLECTION: f"""You are a {self.profession} assistant. 
+            ConversationState.PHONE_COLLECTION: f"""You are a {self.profession} assistant.
+- A valid phone number has NOT been collected yet — you must ask for it now.
 - If user asks a question, answer it briefly (1-2 sentences) using context, then ask for their phone number.
-- Ask for the user's phone number naturally.
+- Ask for the user's phone number naturally (e.g. 'Could you please share your phone number?').
+- CRITICAL: DO NOT confirm, thank, or acknowledge any number from the conversation history as accepted.
+- CRITICAL: DO NOT say 'I have your phone number' or imply the number has been saved — validation happens separately.
+- If the user's last message looks like an incomplete or too-short number, politely ask them to enter their full number with the area code.
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT show previous options - continue with phone collection.""",
             ConversationState.PHONE_OTP_SENT: f"""You are a {self.profession} assistant.
