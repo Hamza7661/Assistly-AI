@@ -1429,11 +1429,18 @@ Classify the intent:"""
                 return "That doesn't look like a valid email address. Please enter it in the format name@example.com."
         
         if state == ConversationState.PHONE_COLLECTION:
+            # Country hint from context improves local-format phone validation
+            _country_hint = str(
+                (context.get("app") or {}).get("country")
+                or context.get("country")
+                or ""
+            ).strip().upper()[:2] or None
+
             # Graceful email correction during phone step:
             # If the user provides/updates email before phone, accept latest email.
             # - With email verification enabled: restart email OTP on the new email.
             # - With email verification disabled: keep moving on phone collection.
-            if email and validator.is_valid_email(email) and not (phone and validator.is_valid_phone(phone)):
+            if email and validator.is_valid_email(email) and not (phone and validator.is_valid_phone(phone, _country_hint)):
                 flow_controller.update_collected_data("leadEmail", email)
                 if flow_controller.validate_email:
                     # Force re-verification for the updated email (latest email wins)
@@ -1459,7 +1466,7 @@ Classify the intent:"""
                     return f"{answer}\n\nThanks — I have updated your email to {email}.\n\n{phone_prompt}"
                 return f"Thanks — I have updated your email to {email}. Please share your phone number to continue."
 
-            if phone and validator.is_valid_phone(phone):
+            if phone and validator.is_valid_phone(phone, _country_hint):
                 flow_controller.update_collected_data("leadPhoneNumber", phone)
                 
                 # Check if user asked a question along with phone
@@ -1511,8 +1518,21 @@ Classify the intent:"""
                             flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                         )
             else:
-                # Phone not valid — re-ask without calling the LLM so the bot stays
-                # locked on this field regardless of any question in the user message.
+                # If user entered a 6-digit OTP/verification code in this step, they are
+                # likely confused about which number to enter. Ask for phone gracefully.
+                if otp_code and validator.is_valid_otp(otp_code):
+                    return await self._generate_state_response(
+                        ConversationState.PHONE_COLLECTION, "", conversation_history, context,
+                        flow_controller=flow_controller
+                    )
+                # No phone-like content at all (empty message, system sentinel like "Email verified",
+                # or plain text with no digits) — ask for phone instead of showing an error.
+                if not phone:
+                    return await self._generate_state_response(
+                        ConversationState.PHONE_COLLECTION, "", conversation_history, context,
+                        flow_controller=flow_controller
+                    )
+                # Phone digits were extracted but failed validation — re-ask with guidance.
                 return "I didn't catch a valid phone number. Please share your full number including the area code (e.g. 07700 900123 or +44 7700 900123)."
 
         if state == ConversationState.APPOINTMENT_OFFER:
@@ -1898,11 +1918,29 @@ When answering the user's question, follow these guidelines:
 - Ask for the user's email address naturally.
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT show previous options - continue with email collection.""",
+            ConversationState.EMAIL_OTP_SENT: f"""You are a {self.profession} assistant.
+- A 6-digit verification code has been sent to the user's email address.
+- Politely let them know the code was sent and ask them to enter it.
+- DO NOT ask for any other information right now.""",
+            ConversationState.EMAIL_OTP_VERIFICATION: f"""You are a {self.profession} assistant.
+- You are waiting for the user to enter the 6-digit verification code sent to their email.
+- If the user provided something other than a 6-digit code (e.g. a phone number, a name, or other text), gently clarify and ask them to enter the 6-digit code from their email.
+- Do NOT proceed to the next step until a valid 6-digit code is entered.
+- Do NOT ask for a phone number or any other data at this stage.""",
             ConversationState.PHONE_COLLECTION: f"""You are a {self.profession} assistant. 
 - If user asks a question, answer it briefly (1-2 sentences) using context, then ask for their phone number.
 - Ask for the user's phone number naturally.
 - DO NOT ask for date/time - that is NOT part of this flow.
 - DO NOT show previous options - continue with phone collection.""",
+            ConversationState.PHONE_OTP_SENT: f"""You are a {self.profession} assistant.
+- A 6-digit verification code has been sent to the user's phone number via SMS.
+- Politely let them know the code was sent and ask them to enter it.
+- DO NOT ask for any other information right now.""",
+            ConversationState.PHONE_OTP_VERIFICATION: f"""You are a {self.profession} assistant.
+- You are waiting for the user to enter the 6-digit verification code sent to their phone via SMS.
+- If the user provided something other than a 6-digit code (e.g. an email, a name, or other text), gently clarify and ask them to enter the 6-digit code from their SMS.
+- Do NOT proceed to the next step until a valid 6-digit code is entered.
+- Do NOT ask for an email or any other data at this stage.""",
         }
 
         conversation_style = self._conversation_style_enabled(context)
