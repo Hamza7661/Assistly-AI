@@ -816,7 +816,10 @@ def _normalize_workflow_choice_input(
             continue
         seen.add(key)
         unique_resolved.append(val)
-    return ", ".join(unique_resolved) if unique_resolved else None
+    # Join with newline so response_generator.py (which splits on [;\n]+) correctly
+    # recognises each item as a separate selection for multi-choice validation.
+    # Single-choice results in a single item so no separator is added.
+    return "\n".join(unique_resolved) if unique_resolved else None
 
 
 def _normalize_whatsapp_interactive_selection(
