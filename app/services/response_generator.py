@@ -1151,31 +1151,12 @@ Classify the intent:"""
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             
-            # Check if user is asking a question instead of answering the workflow question
-            if has_question:
-                current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
-                if conversation_style_enabled:
-                    answer = await _answer_if_relevant_question(user_message)
-                    return f"{answer}\n\n{current_question_formatted}" if answer else current_question_formatted
-                logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
-                rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                if rag_context and self.client:
-                    try:
-                        answer = await self._generate_question_response(
-                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
-                        )
-                        return f"{answer}\n\n{current_question_formatted}"
-                    except Exception as e:
-                        logger.warning(f"Failed to generate answer for question: {e}")
-                        return current_question_formatted
-                else:
-                    return current_question_formatted
-            
             current_options = current_question.get("options", []) or []
+            is_option_driven_workflow_q = bool(current_options) and not conversation_style_enabled
 
             # Guard option-based questions: if user types a random/off-route value (e.g. from channels
             # where UI constraints aren't enforced), do not advance. Re-show the same question.
-            if current_options and not conversation_style_enabled and (user_message or "").strip():
+            if is_option_driven_workflow_q and (user_message or "").strip():
                 sorted_opts = sorted(current_options, key=lambda o: o.get("order", 0))
                 allowed = {(str(o.get("text") or "").strip().lower()) for o in sorted_opts if str(o.get("text") or "").strip()}
                 # Determine if this question allows multiple selections.
@@ -1212,6 +1193,30 @@ Classify the intent:"""
                         "Please choose from the provided options so I can continue.\n\n"
                         f"{current_question_formatted}"
                     )
+                # Option-driven workflow questions (single/multi choice in non-conversation mode)
+                # should always treat valid payloads as answers and advance the workflow.
+                has_question = False
+
+            # Check if user is asking a question instead of answering the workflow question
+            # Skip this branch for option-driven workflow questions in non-conversation mode.
+            if has_question and not is_option_driven_workflow_q:
+                current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
+                if conversation_style_enabled:
+                    answer = await _answer_if_relevant_question(user_message)
+                    return f"{answer}\n\n{current_question_formatted}" if answer else current_question_formatted
+                logger.info(f"User asked a question during workflow: '{user_message}'. Answering it first.")
+                rag_context = await self._get_rag_context(user_message, context, is_question=True)
+                if rag_context and self.client:
+                    try:
+                        answer = await self._generate_question_response(
+                            user_message, rag_context, conversation_history, context, flow_controller=flow_controller
+                        )
+                        return f"{answer}\n\n{current_question_formatted}"
+                    except Exception as e:
+                        logger.warning(f"Failed to generate answer for question: {e}")
+                        return current_question_formatted
+                else:
+                    return current_question_formatted
 
             # Non-booking open text/voice workflow question:
             # 1) Try FAQ/RAG first if the message looks like a question/interjection.
