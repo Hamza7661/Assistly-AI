@@ -3,7 +3,9 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import asyncio
 
@@ -24,6 +26,7 @@ except ImportError:
 
 from .context_service import ContextService
 from .lead_service import LeadService
+from .calendar_service import CalendarService
 from ..utils.phone_utils import format_phone_number_with_gpt
 from ..utils.greeting_utils import get_greeting_with_fallback
 from ..utils.text_utils import strip_emojis_for_voice
@@ -74,6 +77,63 @@ def _maybe_parse_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_lead_id_from_create_response(resp: Any) -> Optional[str]:
+    if not isinstance(resp, dict):
+        return None
+    data = resp.get("data")
+    lead = data.get("lead") if isinstance(data, dict) else None
+    if isinstance(lead, dict):
+        lead_id = lead.get("_id") or lead.get("id")
+        if lead_id:
+            return str(lead_id)
+    return None
+
+
+def _is_booking_lead_value(value: Any) -> bool:
+    v = str(value or "").strip().lower()
+    return any(k in v for k in ("book", "appointment", "treatment", "schedule"))
+
+
+def _normalize_timezone(tz_name: Optional[str], fallback: str = "UTC") -> str:
+    tz = str(tz_name or "").strip()
+    if not tz:
+        return fallback
+    try:
+        ZoneInfo(tz)
+        return tz
+    except Exception:
+        return fallback
+
+
+def _slot_label_in_timezone(slot: Dict[str, Any], tz_name: str) -> str:
+    start = str(slot.get("start") or "")
+    end = str(slot.get("end") or "")
+    if not start:
+        return ""
+    try:
+        tz = ZoneInfo(_normalize_timezone(tz_name))
+        dt_start = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(tz)
+        if end:
+            dt_end = datetime.fromisoformat(end.replace("Z", "+00:00")).astimezone(tz)
+            return f"{dt_start.strftime('%a %d/%m %I:%M %p')} - {dt_end.strftime('%I:%M %p')} ({_normalize_timezone(tz_name)})"
+        return f"{dt_start.strftime('%a %d/%m %I:%M %p')} ({_normalize_timezone(tz_name)})"
+    except Exception:
+        return start
+
+
+def _matches_natural_slot_text(slot: Dict[str, Any], slot_text: str, tz_name: str) -> bool:
+    text = str(slot_text or "").strip().lower()
+    if not text:
+        return False
+    label = _slot_label_in_timezone(slot, tz_name).lower()
+    start_iso = str(slot.get("start") or "").lower()
+    # Keep it simple: exact iso match, direct substring match, and hour token match.
+    if text == start_iso or text in label:
+        return True
+    hour_tokens = [t for t in text.replace(":", " ").split() if t.isdigit()]
+    return bool(hour_tokens) and any(f" {h}:" in label or f" {h} " in label for h in hour_tokens)
+
+
 @dataclass
 class VoiceAgentSession:
     """Manages a voice agent session using Deepgram Voice Agent API."""
@@ -83,9 +143,11 @@ class VoiceAgentSession:
     user_id: str
     context: Dict[str, Any]
     lead_service: LeadService
+    calendar_service: CalendarService
     deepgram_client: AsyncDeepgramClient
     on_stop: Optional[Callable[[str], None]] = None
     app_id: Optional[str] = None  # For app-scoped leads
+    voice_model: str = "aura-2-electra-en"
 
     twilio_websocket: Optional[WebSocket] = None
     twilio_stream_sid: Optional[str] = None
@@ -105,6 +167,7 @@ class VoiceAgentSession:
     _last_user_audio_time: Optional[float] = None  # Track when user last spoke
     _first_response_sent: bool = False  # Track if we've sent first response chunk
     _json_buffer: str = ""  # Buffer for incomplete JSON messages
+    lead_id: Optional[str] = None  # Keep updating this same lead through the call
 
     def __post_init__(self) -> None:
         self.deepgram_agent_ready_event = asyncio.Event()
@@ -207,15 +270,21 @@ SERVICES:
 YOUR TASKS:
 1. When you hear "initiate greeting", say only this short follow-up (nothing else): "How can I help you today?"
 2. Answer questions using the knowledge base above - be helpful and friendly.
-3. Collect: service type, full name, email. (Phone: {self.caller_phone} is already known)
+3. Match chat-flow ordering: after greeting, identify lead type, then collect full name and email immediately. (Phone: {self.caller_phone} is already known)
+4. Two flow modes:
+   - BOOKING flow: lead type -> name/email -> service -> workflow questions -> appointment slot -> booking confirmation.
+   - NON-BOOKING flow: lead type -> name/email -> service/workflow and support, with no booking language unless user explicitly asks.
+5. Keep the conversation natural and empathetic, but stay structured like the chat flow.
+6. For booking, always confirm slot details in the caller's region/timezone when known and include timezone in JSON.
 
 WORKFLOW QUESTIONS (CRITICAL):
-- If a service has "Workflow questions to ask" listed and user select's that service, you MUST ask those EXACT questions in order BEFORE asking for name/email.
+- If a service has "Workflow questions to ask" listed and user selects that service, you MUST ask those EXACT questions in order at the workflow step.
 - Ask them word-for-word, do NOT rephrase or make up questions.
 - Be empathetic when asking - acknowledge their responses naturally.
 
 JSON OUTPUT (CRITICAL - ABSOLUTE RULE):
-- When you have service type, name, and email, you MUST output ONLY the JSON below in your internal response text.
+- For NON-BOOKING flow: output JSON once lead type + name + email + service context are complete.
+- For BOOKING flow: output JSON only after a valid slot is selected/confirmed.
 - DO NOT speak the JSON out loud - output it silently in your response text only. The JSON should NOT be converted to speech.
 - DO NOT say "Thank you", "Perfect", "Great", "Let me save that", "I'll output the JSON", "Here's your information", or ANY words before the JSON.
 - DO NOT say anything after the JSON.
@@ -230,6 +299,11 @@ Output this JSON format:
   "leadPhoneNumber": "{self.caller_phone}",
   "leadType": "lead type value",
   "serviceType": "selected service name",
+  "flowType": "booking or non_booking",
+  "selectedSlotStart": "ISO datetime when booking (optional)",
+  "selectedSlotEnd": "ISO datetime when booking (optional)",
+  "selectedSlotText": "caller's natural slot phrase like 'tomorrow at 3 pm' (optional)",
+  "userTimezone": "IANA timezone for caller region when known, e.g. Europe/London (optional)",
   "summary": "brief conversation summary",
   "description": "what customer wants"
 }}
@@ -239,6 +313,9 @@ RULES:
 - Be warm, empathetic, and conversational - not robotic
 - Show understanding and acknowledge responses naturally
 - Ask one question at a time
+- Keep questions conversational and empathetic
+- In non-booking flow, avoid calendar/appointment prompts unless user asks for booking
+- In booking flow, gather and confirm slot in user's local timezone wording
 - If service has workflow questions, ask them first (exact wording, in order)
 - When ready: output JSON ONLY - no words before, no words after, no exceptions"""
         return prompt
@@ -284,7 +361,7 @@ RULES:
                     "speak": {
                         "provider": {
                             "type": "deepgram",
-                            "model": "aura-athena-en"
+                            "model": self.voice_model
                         }
                     },
                     "think": {
@@ -607,69 +684,196 @@ RULES:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Error processing Deepgram Agent message for call %s: %s", self.call_sid, exc)
 
-    async def _handle_lead_json(self, lead_data: Dict[str, Any]) -> None:
-        """Handle JSON lead data from Deepgram Agent and create lead."""
+    async def _speak_text(self, text: str) -> None:
+        if not text or not self.twilio_websocket or not self.active:
+            return
+        clean_text = strip_emojis_for_voice(text)
+        if not clean_text:
+            return
+        async for chunk in self.deepgram_client.speak.v1.audio.generate(
+            text=clean_text,
+            model=self.voice_model,
+            encoding="mulaw",
+            sample_rate=8000,
+        ):
+            if chunk and self.active and self.twilio_websocket:
+                await self._send_audio_to_twilio(chunk)
+
+    async def _patch_active_lead(self, payload: Dict[str, Any]) -> bool:
+        if not self.lead_id:
+            return False
+        ok, _ = await self.lead_service.update_lead(self.user_id, self.lead_id, payload)
+        if not ok:
+            logger.warning("Failed to patch active voice lead for call %s", self.call_sid)
+        return ok
+
+    async def _handle_booking_if_applicable(self, lead_data: Dict[str, Any]) -> Optional[str]:
+        if not _is_booking_lead_value(lead_data.get("leadType")):
+            return None
+        if not self.app_id:
+            return None
+
+        integration = self.context.get("integration", {}) or {}
+        slot_minutes = integration.get("calendarSlotMinutes", 30)
+        if slot_minutes not in (15, 30, 60):
+            slot_minutes = 30
+        cal_tz = _normalize_timezone(integration.get("calendarTimezone"), "UTC")
+        user_tz = _normalize_timezone(lead_data.get("userTimezone"), cal_tz)
+
+        now_utc = datetime.now(timezone.utc)
+        from_date = now_utc.strftime("%Y-%m-%d")
+        to_date = (now_utc + timedelta(days=14)).strftime("%Y-%m-%d")
+
         try:
-            # Ensure phone number is set
+            availability = await self.calendar_service.get_availability(
+                self.app_id,
+                from_date,
+                to_date,
+                slot_minutes=slot_minutes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Voice calendar availability failed for call %s: %s", self.call_sid, exc)
+            return "I could not check calendar availability right now. I have still saved your request, and our team will follow up shortly."
+
+        if not availability.get("calendarConnected"):
+            return "Our calendar is not connected right now. I have captured your details and the team will contact you to confirm a time."
+
+        free_slots = [s for s in (availability.get("freeSlots") or []) if isinstance(s, dict) and s.get("start") and s.get("end")]
+        if not free_slots:
+            return "I do not have any available slots right now. I have captured your details and the team will contact you with options."
+
+        selected_start = (
+            lead_data.get("selectedSlotStart")
+            or lead_data.get("selectedSlotStartISO")
+            or lead_data.get("slotStart")
+            or lead_data.get("slotStartIso")
+        )
+        selected_end = (
+            lead_data.get("selectedSlotEnd")
+            or lead_data.get("selectedSlotEndISO")
+            or lead_data.get("slotEnd")
+            or lead_data.get("slotEndIso")
+        )
+        selected_text = (
+            lead_data.get("selectedSlotText")
+            or lead_data.get("slotText")
+            or lead_data.get("selectedTimeText")
+            or lead_data.get("appointmentSlotText")
+        )
+
+        if not selected_start and not selected_text:
+            top3 = free_slots[:3]
+            options = ", ".join([_slot_label_in_timezone(s, user_tz) for s in top3])
+            return f"Please choose one of these available slots: {options}."
+
+        selected_start = str(selected_start or "")
+        selected_end = str(selected_end or "")
+
+        chosen = None
+        if selected_start:
+            for slot in free_slots:
+                if str(slot.get("start")) == selected_start:
+                    chosen = slot
+                    break
+        if not chosen and selected_text:
+            for slot in free_slots:
+                if _matches_natural_slot_text(slot, str(selected_text), user_tz):
+                    chosen = slot
+                    break
+
+        if not chosen:
+            future_slots = [s for s in free_slots if str(s.get("start")) > selected_start] if selected_start else []
+            top3 = (future_slots or free_slots)[:3]
+            options = ", ".join([_slot_label_in_timezone(s, user_tz) for s in top3])
+            return f"That slot is no longer available. Here are the next available options: {options}. Please choose one."
+
+        start_iso = str(chosen.get("start"))
+        end_iso = str(chosen.get("end") or selected_end or "")
+        if not end_iso:
+            return "I found that slot, but I could not confirm its duration. Please choose another available slot."
+
+        booking = await self.calendar_service.book_appointment(
+            app_id=self.app_id,
+            start_iso=start_iso,
+            end_iso=end_iso,
+            title=str(lead_data.get("serviceType") or "Appointment"),
+            attendee_email=lead_data.get("leadEmail"),
+            description=lead_data.get("description"),
+            time_zone=user_tz,
+            customer_name=lead_data.get("leadName"),
+            customer_phone=lead_data.get("leadPhoneNumber") or self.caller_phone,
+            lead_id=self.lead_id,
+        )
+        if not booking.get("success"):
+            return "That slot could not be booked just now. Please choose another available slot and I will confirm it."
+
+        lead_data["selectedSlotStart"] = start_iso
+        lead_data["selectedSlotEnd"] = end_iso
+        lead_data["userTimezone"] = user_tz
+        lead_data["appointmentDetails"] = {
+            "eventId": booking.get("eventId"),
+            "start": booking.get("start") or start_iso,
+            "end": booking.get("end") or end_iso,
+            "link": booking.get("link"),
+            "confirmed": True,
+            "timezone": user_tz,
+        }
+        return f"Perfect, your appointment is confirmed for {_slot_label_in_timezone(chosen, user_tz)}."
+
+    async def _handle_lead_json(self, lead_data: Dict[str, Any]) -> None:
+        """Handle JSON lead data from Deepgram Agent and patch/create lead state."""
+        try:
             if not lead_data.get("leadPhoneNumber"):
                 lead_data["leadPhoneNumber"] = self.caller_phone
-            
-            # Extract title from lead types if missing (to match web/WhatsApp format)
+
             if not lead_data.get("title") and lead_data.get("leadType"):
                 lead_types = self.context.get("lead_types", [])
                 for lt in lead_types:
                     if isinstance(lt, dict) and lt.get("value") == lead_data.get("leadType"):
                         lead_data["title"] = lt.get("text", lead_data.get("leadType", ""))
                         break
-                # Fallback: use leadType as title if not found
                 if not lead_data.get("title"):
                     lead_data["title"] = lead_data.get("leadType", "")
-            
-            # Add appId if available (for app-scoped voice leads)
+
             if self.app_id:
                 lead_data["appId"] = self.app_id
-            
-            # Ensure source channel is set so dashboard can filter voice leads
             if not lead_data.get("sourceChannel"):
                 lead_data["sourceChannel"] = "voice"
-            
-            # Create lead
-            ok, _ = await self.lead_service.create_public_lead(self.user_id, lead_data)
-            
-            if ok:
-                logger.info("Successfully created lead from Deepgram Agent for call %s", self.call_sid)
-                closing_message = "Thanks! I have your details and someone will get back to you soon. Bye!"
+            if not lead_data.get("flowType"):
+                lead_data["flowType"] = "booking" if _is_booking_lead_value(lead_data.get("leadType")) else "non_booking"
+
+            booking_message = await self._handle_booking_if_applicable(lead_data)
+
+            # Keep patching into the same lead while conversation progresses.
+            patch_payload = dict(lead_data)
+            patch_payload["status"] = "interacting"
+            patched = await self._patch_active_lead(patch_payload)
+            if not patched:
+                ok_create, create_resp = await self.lead_service.create_public_lead(self.user_id, patch_payload)
+                if ok_create and not self.lead_id:
+                    self.lead_id = _extract_lead_id_from_create_response(create_resp)
+
+            # If booking still needs user re-selection, keep the call open and ask for another slot.
+            if booking_message and "please choose" in booking_message.lower():
+                await self._speak_text(booking_message)
+                return
+
+            # Final patch with completed status once we have enough details.
+            finalize_payload = dict(lead_data)
+            finalize_payload["status"] = "confirmed" if lead_data.get("appointmentDetails") else "new"
+            await self._patch_active_lead(finalize_payload)
+
+            if booking_message:
+                closing_message = f"{booking_message} Thanks, I have everything I need. Bye for now."
             else:
-                logger.warning("Failed to create lead from Deepgram Agent for call %s", self.call_sid)
-                closing_message = "Thanks! I captured your details. There was a small issue creating the lead right now, but the team will still follow up shortly. Bye!"
-            
-            # Generate and send closing message audio
-            audio_chunks = []
+                closing_message = "Thanks! I have your details and someone will get back to you soon. Bye!"
+
             try:
-                # Check if we can still send audio
-                if not self.twilio_websocket or not self.active:
-                    logger.warning("Cannot send closing message - Twilio connection not active for call %s", self.call_sid)
-                else:
-                    closing_clean = strip_emojis_for_voice(closing_message)
-                    async for chunk in self.deepgram_client.speak.v1.audio.generate(
-                        text=closing_clean,
-                        model="aura-athena-en",
-                        encoding="mulaw",
-                        sample_rate=8000,
-                    ):
-                        if chunk and self.active and self.twilio_websocket:
-                            audio_chunks.append(chunk)
-                            await self._send_audio_to_twilio(chunk)
-                
-                # Wait for the message to play before ending the call
-                if audio_chunks:
-                    wait_time = 10.0  # Hardcoded 10 seconds to ensure message plays completely
-                    logger.info("Waiting %.2fs for closing message to play for call %s", wait_time, self.call_sid)
-                    await asyncio.sleep(wait_time)
+                await self._speak_text(closing_message)
+                await asyncio.sleep(2.0)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to send closing message for call %s: %s", self.call_sid, exc)
-            
-            # Stop the session after creating lead and sending closing message
+
             await self.stop()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Error handling lead JSON from Deepgram Agent for call %s: %s", self.call_sid, exc)
@@ -903,7 +1107,7 @@ RULES:
             trigger_chunks = []
             async for chunk in self.deepgram_client.speak.v1.audio.generate(
                 text="initiate greeting",
-                model="aura-athena-en",
+                model=self.voice_model,
                 encoding="mulaw",
                 sample_rate=8000,
             ):
@@ -919,7 +1123,7 @@ RULES:
                 greeting_chunks = []
                 async for chunk in self.deepgram_client.speak.v1.audio.generate(
                     text=greeting_text,
-                    model="aura-athena-en",
+                    model=self.voice_model,
                     encoding="mulaw",
                     sample_rate=8000,
                 ):
@@ -948,8 +1152,10 @@ class VoiceAgentService:
     def __init__(self, settings: Any = app_settings):
         self.settings = settings
         self.deepgram_api_key: Optional[str] = getattr(settings, "deepgram_api_key", None)
+        self.deepgram_voice_model: str = getattr(settings, "deepgram_voice_model", "aura-2-electra-en")
         self.context_service = ContextService(settings)
         self.lead_service = LeadService(settings)
+        self.calendar_service = CalendarService(settings)
         self.sessions: Dict[str, VoiceAgentSession] = {}
 
         from openai import AsyncOpenAI
@@ -1006,14 +1212,32 @@ class VoiceAgentService:
             raise ValueError("OpenAI client not configured for phone formatting")
         formatted_phone = await format_phone_number_with_gpt(caller_phone, self.openai_client, self.gpt_model)
 
+        # Create an interaction lead immediately when call connects (chat-like behavior).
+        lead_id: Optional[str] = None
+        try:
+            ok_interaction, interaction_resp = await self.lead_service.create_interaction_lead(
+                app_id=app_id,
+                user_id=user_id,
+                initial_interaction="call_connected",
+                source_channel="voice",
+                dedupe_window_hours=getattr(self.settings, "lead_dedupe_window_hours", None),
+            )
+            if ok_interaction:
+                lead_id = _extract_lead_id_from_create_response(interaction_resp)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Voice interaction lead create failed for call %s: %s", call_sid, exc)
+
         session = VoiceAgentSession(
             call_sid=call_sid,
             caller_phone=formatted_phone,
             user_id=user_id,
             context=context,
             lead_service=self.lead_service,
+            calendar_service=self.calendar_service,
             deepgram_client=self.deepgram_client,
-            app_id=app_id  # Pass app_id for app-scoped leads
+            app_id=app_id,  # Pass app_id for app-scoped leads
+            voice_model=self.deepgram_voice_model,
+            lead_id=lead_id,
         )
 
         self.sessions[call_sid] = session

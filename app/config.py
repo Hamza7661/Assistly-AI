@@ -34,6 +34,7 @@ class Settings(BaseModel):
 
     # Deepgram voice agent
     deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
+    deepgram_voice_model: str = Field(default="aura-2-electra-en", alias="DEEPGRAM_VOICE_MODEL")
     
     # RAG (Retrieval-Augmented Generation) configuration
     rag_k: int = Field(default=3, alias="RAG_K")  # Number of documents to retrieve
