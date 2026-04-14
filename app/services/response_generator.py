@@ -1345,13 +1345,9 @@ Classify the intent:"""
                         )
                     return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
-                # Name not extracted - check if user asked a question
-                if has_question:
-                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
-                else:
-                    # Just ask for name again - no RAG needed
-                    return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
+                # Name not valid — re-ask without calling the LLM so the bot stays
+                # locked on this field regardless of any question in the user message.
+                return "I didn't quite catch your name. Could you please share your first and last name?"
         
         if state == ConversationState.EMAIL_COLLECTION:
             if email and validator.is_valid_email(email):
@@ -1414,13 +1410,9 @@ Classify the intent:"""
                                 )
                             return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             else:
-                # Email not extracted - check if user asked a question
-                if has_question:
-                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
-                else:
-                    # No RAG needed for standard email collection prompt
-                    return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
+                # Email not valid — re-ask without calling the LLM so the bot stays
+                # locked on this field regardless of any question in the user message.
+                return "That doesn't look like a valid email address. Please enter it in the format name@example.com."
         
         if state == ConversationState.PHONE_COLLECTION:
             # Graceful email correction during phone step:
@@ -1505,13 +1497,9 @@ Classify the intent:"""
                             flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                         )
             else:
-                # Phone not extracted - check if user asked a question
-                if has_question:
-                    rag_context = await self._get_rag_context(user_message, context, is_question=True)
-                    return await self._generate_state_response(state, rag_context, conversation_history, context, flow_controller=flow_controller)
-                else:
-                    # No RAG needed for standard phone collection prompt
-                    return await self._generate_state_response(state, "", conversation_history, context, flow_controller=flow_controller)
+                # Phone not valid — re-ask without calling the LLM so the bot stays
+                # locked on this field regardless of any question in the user message.
+                return "I didn't catch a valid phone number. Please share your full number including the area code (e.g. 07700 900123 or +44 7700 900123)."
 
         if state == ConversationState.APPOINTMENT_OFFER:
             text = user_message.strip().lower()

@@ -98,17 +98,24 @@ class DataExtractor:
             if re.match(pattern, text, re.IGNORECASE):
                 return None
         
-        # If it's 2-50 characters and mostly letters/spaces, likely a name
-        # But exclude if it's too long (likely not a name) or contains common lead type words
+        # If it's 2-50 characters and purely letters/spaces, treat as a full name
+        # But exclude if it has more than 4 words (likely a sentence, not a name)
         if 2 <= len(text) <= 50 and re.match(r'^[A-Za-z\s\-\']+$', text):
-            # Additional check: if it has more than 4 words, it's probably not a name
             if len(text.split()) > 4:
                 return None
-            
             name = ' '.join(word.capitalize() for word in text.split())
             logger.info(f"Extracted name: {name}")
             return name
-        
+
+        # Fallback: user may have typed their name alongside digits (e.g. "John 123456").
+        # Strip digit-only tokens and try again with whatever letters remain.
+        alpha_only = ' '.join(w for w in text.split() if re.match(r'^[A-Za-z\-\']+$', w))
+        if 2 <= len(alpha_only) <= 50 and alpha_only.strip():
+            if len(alpha_only.split()) <= 4:
+                name = ' '.join(word.capitalize() for word in alpha_only.split())
+                logger.info(f"Extracted name (partial, stripped digits): {name}")
+                return name
+
         return None
     
     # Optional fallback synonyms per value – only used when the app's lead type has no synonyms from DB.
