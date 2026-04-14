@@ -1168,25 +1168,39 @@ Classify the intent:"""
                     _qtid_int = 0
                 is_multi_select_q = (q_type_code == "multiple_choice" or q_input_mode == "checkbox" or _qtid_int == 3)
 
-                provided_parts = [p.strip().lower() for p in re.split(r"[,;\n]+", user_message.strip()) if p.strip()]
+                msg_lower = user_message.strip().lower()
 
-                # Single-select: reject any comma/multi-token input upfront.
-                if not is_multi_select_q and len(provided_parts) > 1:
-                    is_valid = False
-                elif user_message.strip().isdigit():
-                    number = int(user_message.strip())
-                    is_valid = 1 <= number <= len(sorted_opts)
+                # Numeric-only input (single: "2" or multi: "1, 3" / "1 3").
+                # Extract all digit tokens and validate each as a 1-based index.
+                # This is handled entirely separately from text matching so that
+                # commas in "1, 3" are treated as numeric separators rather than
+                # as part of an option label.
+                numeric_tokens = re.findall(r'\d+', user_message)
+                all_numeric = bool(numeric_tokens) and all(
+                    re.fullmatch(r'\d+', t) for t in re.split(r'[\s,;]+', user_message.strip()) if t.strip()
+                )
+                if all_numeric:
+                    if not is_multi_select_q and len(numeric_tokens) > 1:
+                        is_valid = False
+                    else:
+                        is_valid = all(1 <= int(t) <= len(sorted_opts) for t in numeric_tokens)
                 else:
-                    is_valid = bool(provided_parts)
-                    for part in provided_parts:
-                        if part.isdigit():
-                            idx = int(part)
-                            if not (1 <= idx <= len(sorted_opts)):
-                                is_valid = False
-                                break
-                        elif part not in allowed:
-                            is_valid = False
-                            break
+                    # Text-based input.
+                    # Check the full message first — option texts may contain commas
+                    # (e.g. "Yes, current licence"). Only split when the full message
+                    # is not itself a recognised option.
+                    if msg_lower in allowed:
+                        provided_parts = [msg_lower]
+                    else:
+                        # Split on newline/semicolon only — NOT on comma — because
+                        # the frontend widget joins multi-select values with \n and
+                        # commas belong to the option labels, not the separator.
+                        provided_parts = [p.strip().lower() for p in re.split(r"[;\n]+", user_message.strip()) if p.strip()]
+
+                    if not is_multi_select_q and len(provided_parts) > 1:
+                        is_valid = False
+                    else:
+                        is_valid = bool(provided_parts) and all(p in allowed for p in provided_parts)
                 if not is_valid:
                     current_question_formatted = workflow_manager.format_question_with_options(current_question) or ""
                     return (

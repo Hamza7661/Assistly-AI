@@ -340,10 +340,33 @@ class WorkflowManager:
 
         sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
         raw_answer = answer.strip()
-        # Support checkbox submissions where frontend sends multiple selections
-        # as comma-separated labels (e.g. "Option A, Option B").
-        parts = [p.strip() for p in re.split(r"[,;\n]+", raw_answer) if p.strip()]
-        candidate_answers = parts or [raw_answer]
+
+        all_opt_texts_lower = {(opt.get("text") or "").strip().lower() for opt in sorted_opts}
+
+        # If the full answer is an exact option match, use it directly.
+        # This handles single selections whose text contains commas
+        # (e.g. "Yes, current licence") without fragmenting them.
+        if raw_answer.lower() in all_opt_texts_lower:
+            candidate_answers = [raw_answer]
+
+        # Numeric input: "2" or multi-select "1, 3".
+        # Commas here are numeric separators, not part of option labels.
+        # Extract digit tokens and map each to the corresponding option by index.
+        elif all(re.fullmatch(r'\d+', t) for t in re.split(r'[\s,;]+', raw_answer.strip()) if t.strip()):
+            numeric_tokens = re.findall(r'\d+', raw_answer)
+            candidate_answers = []
+            for t in numeric_tokens:
+                idx = int(t)
+                if 1 <= idx <= len(sorted_opts):
+                    candidate_answers.append(sorted_opts[idx - 1].get("text", ""))
+            candidate_answers = candidate_answers or [raw_answer]
+
+        else:
+            # Text-based multi-select: the frontend joins selections with \n,
+            # so split on newline/semicolon only — NOT comma — because commas
+            # belong to option labels, not the multi-value separator.
+            parts = [p.strip() for p in re.split(r"[;\n]+", raw_answer) if p.strip()]
+            candidate_answers = parts or [raw_answer]
 
         matched_opt = None
 
