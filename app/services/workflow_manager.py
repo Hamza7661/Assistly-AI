@@ -362,10 +362,15 @@ class WorkflowManager:
             candidate_answers = candidate_answers or [raw_answer]
 
         else:
-            # Text-based multi-select: the frontend joins selections with \n,
-            # so split on newline/semicolon only — NOT comma — because commas
-            # belong to option labels, not the multi-value separator.
+            # Primary split: newline/semicolon.
+            # Fallback: accept comma-separated values only when each token
+            # exactly matches a known option label.
             parts = [p.strip() for p in re.split(r"[;\n]+", raw_answer) if p.strip()]
+            if len(parts) <= 1 and "," in raw_answer:
+                comma_parts = [p.strip() for p in raw_answer.split(",") if p.strip()]
+                comma_parts_lower = [p.lower() for p in comma_parts]
+                if comma_parts and all(p in all_opt_texts_lower for p in comma_parts_lower):
+                    parts = comma_parts
             candidate_answers = parts or [raw_answer]
 
         matched_opt = None

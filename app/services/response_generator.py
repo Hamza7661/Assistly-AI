@@ -1205,10 +1205,14 @@ Classify the intent:"""
                     if msg_lower in allowed:
                         provided_parts = [msg_lower]
                     else:
-                        # Split on newline/semicolon only — NOT on comma — because
-                        # the frontend widget joins multi-select values with \n and
-                        # commas belong to the option labels, not the separator.
+                        # Primary split: newline/semicolon.
+                        # Fallback: accept comma-separated values only when each
+                        # token exactly matches an allowed option.
                         provided_parts = [p.strip().lower() for p in re.split(r"[;\n]+", user_message.strip()) if p.strip()]
+                        if len(provided_parts) <= 1 and "," in user_message:
+                            comma_parts = [p.strip().lower() for p in user_message.split(",") if p.strip()]
+                            if comma_parts and all(p in allowed for p in comma_parts):
+                                provided_parts = comma_parts
 
                     if not is_multi_select_q and len(provided_parts) > 1:
                         is_valid = False
