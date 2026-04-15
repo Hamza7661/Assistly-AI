@@ -74,6 +74,17 @@ class FlowController:
         keywords = ("book", "appointment", "treatment")
         return any(k in lead_type for k in keywords)
 
+    def should_offer_booking_after_workflow(self) -> bool:
+        """
+        Booking/appointment lead types are always compulsory booking.
+        For non-booking lead types, honor workflow toggle (default True).
+        """
+        if self.is_booking_lead_type():
+            return True
+
+        # Backward-compatible default: missing flag means enabled.
+        return self.collected_data.get("workflowAskForBookingAtEnd", True) is not False
+
     def reset_service_flow(self):
         self.collected_data["serviceType"] = None
         self.collected_data["workflowAnswers"] = {}
@@ -142,7 +153,9 @@ class FlowController:
             if self.workflow_manager and self.workflow_manager.is_workflow_complete():
                 if self.is_booking_lead_type():
                     return ConversationState.CALENDAR_BOOKING
-                return ConversationState.APPOINTMENT_OFFER
+                if self.should_offer_booking_after_workflow():
+                    return ConversationState.APPOINTMENT_OFFER
+                return ConversationState.COMPLETE
             return ConversationState.WORKFLOW_QUESTION
         
         elif self.state == ConversationState.NAME_COLLECTION:

@@ -210,6 +210,14 @@ class ResponseGenerator:
             return False
         return any(k in lt for k in ("book", "appointment", "treatment"))
 
+    @staticmethod
+    def _sync_workflow_booking_toggle(flow_controller: FlowController, workflow_manager: WorkflowManager) -> None:
+        """Store current workflow booking-toggle on controller (missing -> True)."""
+        flow_controller.update_collected_data(
+            "workflowAskForBookingAtEnd",
+            workflow_manager.should_ask_for_booking_at_end(),
+        )
+
     def _resolve_session_lead_type_value(
         self,
         context: Dict[str, Any],
@@ -819,6 +827,7 @@ Classify the intent:"""
                     
                     workflow_started = False
                     if workflow_manager.start_workflow_for_service(single_service):
+                        self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
                         # Start workflow questions
                         flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
                         workflow_started = True
@@ -1014,6 +1023,7 @@ Classify the intent:"""
                 if matched_service_name and matched_service_name in all_service_options:
                     logger.info(f"Checking for workflows for service: '{matched_service_name}' (matched from service: '{service}')")
                     if workflow_manager.start_workflow_for_service(matched_service_name):
+                        self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
                         # Start workflow questions
                         flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
                         workflow_started = True
@@ -1125,6 +1135,7 @@ Classify the intent:"""
                     single_service = all_service_options[0]
                     flow_controller.update_collected_data("serviceType", single_service)
                     if workflow_manager.start_workflow_for_service(single_service):
+                        self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
                         current_question = workflow_manager.get_current_question()
                         if current_question:
                             return workflow_manager.format_question_with_options(current_question) or ""
@@ -1146,8 +1157,10 @@ Classify the intent:"""
                 # Workflow complete, store answers and move to next state
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
+                next_state = flow_controller.get_next_state()
                 workflow_manager.reset()
-                flow_controller.transition_to(flow_controller.get_next_state())
+                flow_controller.transition_to(next_state)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             
@@ -1275,8 +1288,10 @@ Classify the intent:"""
                         else:
                             workflow_answers = workflow_manager.get_workflow_answers()
                             flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                            self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
+                            next_state = flow_controller.get_next_state()
                             workflow_manager.reset()
-                            flow_controller.transition_to(flow_controller.get_next_state())
+                            flow_controller.transition_to(next_state)
                             logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                             if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                                 next_prompt = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
@@ -1309,8 +1324,10 @@ Classify the intent:"""
                 else:
                     workflow_answers = workflow_manager.get_workflow_answers()
                     flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                    self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
+                    next_state = flow_controller.get_next_state()
                     workflow_manager.reset()
-                    flow_controller.transition_to(flow_controller.get_next_state())
+                    flow_controller.transition_to(next_state)
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                     if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                         return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
@@ -1320,8 +1337,10 @@ Classify the intent:"""
             else:
                 workflow_answers = workflow_manager.get_workflow_answers()
                 flow_controller.update_collected_data("workflowAnswers", workflow_answers)
+                self._sync_workflow_booking_toggle(flow_controller, workflow_manager)
+                next_state = flow_controller.get_next_state()
                 workflow_manager.reset()
-                flow_controller.transition_to(flow_controller.get_next_state())
+                flow_controller.transition_to(next_state)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
                 if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                     return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
@@ -1541,6 +1560,9 @@ Classify the intent:"""
                 return "I didn't catch a valid phone number. Please share your full number including the area code (e.g. 07700 900123 or +44 7700 900123)."
 
         if state == ConversationState.APPOINTMENT_OFFER:
+            if not flow_controller.should_offer_booking_after_workflow():
+                flow_controller.transition_to(ConversationState.COMPLETE)
+                return await self._generate_json(flow_controller, conversation_history)
             text = user_message.strip().lower()
             if text in {"yes", "y", "book", "book now", "sure"}:
                 flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
