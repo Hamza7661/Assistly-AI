@@ -2165,11 +2165,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # Booking-intent interjections should route to calendar flow directly
                 # instead of generic FAQ text + redirection.
                 if _is_availability_intent(str(user_text)):
-                    flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
-                    logger.info(
-                        "interjection_detected booking_intent=True routing_to_calendar state=%s",
-                        flow_controller.state.value,
-                    )
+                    if flow_controller.should_offer_booking_after_workflow():
+                        flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                        logger.info(
+                            "interjection_detected booking_intent=True routing_to_calendar state=%s",
+                            flow_controller.state.value,
+                        )
+                    else:
+                        logger.info(
+                            "interjection_detected booking_intent=True but booking disabled for non-booking workflow"
+                        )
                 else:
                     _rag_answer: Optional[str] = None
                     try:
@@ -2193,7 +2198,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
                                 )
                         elif flow_controller.state == ConversationState.APPOINTMENT_OFFER:
-                            _pending_step = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
+                            if flow_controller.should_offer_booking_after_workflow():
+                                _pending_step = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
+                            else:
+                                _pending_step = "Thanks. How else can I help you today?"
                         elif flow_controller.state == ConversationState.CALENDAR_BOOKING:
                             _pending_step = "BOOK_APPOINTMENT_REQUESTED"
                         else:

@@ -469,6 +469,15 @@ class WorkflowManager:
         if not self.is_active:
             return True
         return self.get_current_question() is None
+
+    def should_ask_for_booking_at_end(self) -> bool:
+        """
+        Workflow-level booking toggle.
+        Missing flag defaults to True for backward compatibility.
+        """
+        if not self.current_workflow:
+            return True
+        return self.current_workflow.get("askForBookingAtEnd", True) is not False
     
     def get_workflow_answers(self) -> Dict[str, Any]:
         """Get all workflow answers"""
