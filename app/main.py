@@ -66,7 +66,7 @@ async def _consume_channel_limit_or_block(
         block_code = str(payload.get("data", {}).get("code") or payload.get("code") or block_code)
     return False, {
         "code": block_code,
-        "message": "This chat channel is currently unavailable for this organization. Please contact them through another channel.",
+        "message": "Service is unavailable right now.",
     }
 
 
@@ -1821,7 +1821,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if not allowed:
             await websocket.send_json({
                 "type": "channel_blocked",
-                "content": (block_payload or {}).get("message") or "This chat channel is currently unavailable for this organization. Please contact them through another channel.",
+                "content": (block_payload or {}).get("message") or "Service is unavailable right now.",
                 "code": (block_payload or {}).get("code") or "channel_unavailable",
             })
             await websocket.close(code=1008)
@@ -3381,7 +3381,7 @@ async def whatsapp_webhook(request: Request):
             if not allowed:
                 return Response(
                     content=whatsapp_service.create_twiml_response(
-                        (block_payload or {}).get("message") or "This chat channel is currently unavailable for this organization. Please contact them through another channel."
+                        (block_payload or {}).get("message") or "Service is unavailable right now."
                     ),
                     media_type="text/xml"
                 )
