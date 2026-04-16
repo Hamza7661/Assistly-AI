@@ -24,6 +24,9 @@ class ConversationState(Enum):
     PHONE_COLLECTION = "phone_collection"
     PHONE_OTP_SENT = "phone_otp_sent"
     PHONE_OTP_VERIFICATION = "phone_otp_verification"
+    APPOINTMENT_OFFER = "appointment_offer"
+    CALENDAR_BOOKING = "calendar_booking"
+    APPOINTMENT_CONFIRMATION = "appointment_confirmation"
     COMPLETE = "complete"
 
 
@@ -39,6 +42,9 @@ class FlowController:
             "leadName": None,
             "leadEmail": None,
             "leadPhoneNumber": None,
+            "sourceChannel": None,
+            "leadId": None,
+            "appointmentSlot": None,
             "title": None,
             "workflowAnswers": {}
         }
@@ -51,12 +57,41 @@ class FlowController:
         
         # Get validation flags
         integration = context.get("integration", {})
-        self.validate_email = integration.get("validateEmail", True)
-        self.validate_phone = integration.get("validatePhoneNumber", True)
+        self.capture_lead_name = integration.get("captureLeadName", True)
+        self.capture_lead_email = integration.get("captureLeadEmail", True)
+        self.capture_lead_phone = integration.get("captureLeadPhoneNumber", True)
+        self.validate_email = bool(integration.get("validateEmail", True) and self.capture_lead_email)
+        self.validate_phone = bool(integration.get("validatePhoneNumber", True) and self.capture_lead_phone)
         self.is_whatsapp = False  # Set externally
         self.channel: str = integration.get("channel", "web")
         self.skip_phone_collection: bool = False
         self.workflow_manager: Optional[Any] = None  # Will be set by response_generator
+
+    def is_booking_lead_type(self) -> bool:
+        lead_type = (self.collected_data.get("leadType") or "").lower()
+        if not lead_type:
+            return False
+        keywords = ("book", "appointment", "treatment")
+        return any(k in lead_type for k in keywords)
+
+    def should_offer_booking_after_workflow(self) -> bool:
+        """
+        Booking/appointment lead types are always compulsory booking.
+        For non-booking lead types, honor workflow toggle (default True).
+        """
+        if self.is_booking_lead_type():
+            return True
+
+        # Backward-compatible default: missing flag means enabled.
+        return self.collected_data.get("workflowAskForBookingAtEnd", True) is not False
+
+    def reset_service_flow(self):
+        self.collected_data["serviceType"] = None
+        self.collected_data["workflowAnswers"] = {}
+        self.collected_data["appointmentSlot"] = None
+        if self.workflow_manager:
+            self.workflow_manager.reset()
+        self.transition_to(ConversationState.SERVICE_SELECTION)
     
     def set_whatsapp(self, is_whatsapp: bool):
         """Set WhatsApp mode (phone already verified)"""
@@ -98,26 +133,38 @@ class FlowController:
         
         elif self.state == ConversationState.LEAD_TYPE_SELECTION:
             if self.collected_data["leadType"]:
-                return ConversationState.SERVICE_SELECTION
+                if self.capture_lead_name:
+                    return ConversationState.NAME_COLLECTION
+                if self.capture_lead_email:
+                    return ConversationState.EMAIL_COLLECTION
+                if self.capture_lead_phone and not (self.is_whatsapp or self.skip_phone_collection):
+                    return ConversationState.PHONE_COLLECTION
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.LEAD_TYPE_SELECTION
         
         elif self.state == ConversationState.SERVICE_SELECTION:
             if self.collected_data["serviceType"]:
-                # Check if workflow questions need to be asked
-                # This will be handled by response_generator checking workflow_manager
-                return ConversationState.NAME_COLLECTION
+                return ConversationState.WORKFLOW_QUESTION
             return ConversationState.SERVICE_SELECTION
         
         elif self.state == ConversationState.WORKFLOW_QUESTION:
             # Workflow questions are handled by workflow_manager
             # Check if workflow is complete
             if self.workflow_manager and self.workflow_manager.is_workflow_complete():
-                return ConversationState.NAME_COLLECTION
+                if self.is_booking_lead_type():
+                    return ConversationState.CALENDAR_BOOKING
+                if self.should_offer_booking_after_workflow():
+                    return ConversationState.APPOINTMENT_OFFER
+                return ConversationState.COMPLETE
             return ConversationState.WORKFLOW_QUESTION
         
         elif self.state == ConversationState.NAME_COLLECTION:
             if self.collected_data["leadName"]:
-                return ConversationState.EMAIL_COLLECTION
+                if self.capture_lead_email:
+                    return ConversationState.EMAIL_COLLECTION
+                if self.capture_lead_phone and not (self.is_whatsapp or self.skip_phone_collection):
+                    return ConversationState.PHONE_COLLECTION
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.NAME_COLLECTION
         
         elif self.state == ConversationState.EMAIL_COLLECTION:
@@ -125,9 +172,9 @@ class FlowController:
                 if self.validate_email:
                     return ConversationState.EMAIL_OTP_SENT
                 else:
-                    # Skip email OTP, go to phone or complete
-                    if self.is_whatsapp or self.skip_phone_collection:
-                        return ConversationState.COMPLETE
+                    # Skip email OTP, go to phone or continue flow
+                    if (not self.capture_lead_phone) or self.is_whatsapp or self.skip_phone_collection:
+                        return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
                     else:
                         return ConversationState.PHONE_COLLECTION
             return ConversationState.EMAIL_COLLECTION
@@ -137,20 +184,20 @@ class FlowController:
         
         elif self.state == ConversationState.EMAIL_OTP_VERIFICATION:
             if self.otp_state["email_verified"]:
-                if self.is_whatsapp or self.skip_phone_collection:
-                    return ConversationState.COMPLETE
+                if (not self.capture_lead_phone) or self.is_whatsapp or self.skip_phone_collection:
+                    return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
                 else:
                     return ConversationState.PHONE_COLLECTION
             return ConversationState.EMAIL_OTP_VERIFICATION
         
         elif self.state == ConversationState.PHONE_COLLECTION:
             if self.skip_phone_collection:
-                return ConversationState.COMPLETE
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             if self.collected_data["leadPhoneNumber"]:
                 if self.validate_phone:
                     return ConversationState.PHONE_OTP_SENT
                 else:
-                    return ConversationState.COMPLETE
+                    return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.PHONE_COLLECTION
         
         elif self.state == ConversationState.PHONE_OTP_SENT:
@@ -158,8 +205,17 @@ class FlowController:
         
         elif self.state == ConversationState.PHONE_OTP_VERIFICATION:
             if self.otp_state["phone_verified"]:
-                return ConversationState.COMPLETE
+                return ConversationState.SERVICE_SELECTION if self.is_booking_lead_type() else ConversationState.WORKFLOW_QUESTION
             return ConversationState.PHONE_OTP_VERIFICATION
+
+        elif self.state == ConversationState.APPOINTMENT_OFFER:
+            return ConversationState.APPOINTMENT_OFFER
+
+        elif self.state == ConversationState.CALENDAR_BOOKING:
+            return ConversationState.CALENDAR_BOOKING
+
+        elif self.state == ConversationState.APPOINTMENT_CONFIRMATION:
+            return ConversationState.APPOINTMENT_CONFIRMATION
         
         elif self.state == ConversationState.COMPLETE:
             return ConversationState.COMPLETE
@@ -170,6 +226,28 @@ class FlowController:
         """Transition to new state"""
         logger.info(f"State transition: {self.state.value} → {new_state.value}")
         self.state = new_state
+
+    def skip_email_verification_after_send_failure(self) -> None:
+        """
+        Advance when email OTP could not be delivered (provider/network).
+        Does not apply when the user enters a wrong code — that path stays in verification.
+        """
+        self.update_collected_data("emailVerificationSkipped", True)
+        self.otp_state["email_verified"] = True
+        self.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
+        next_state = self.get_next_state()
+        self.transition_to(next_state)
+
+    def skip_phone_verification_after_send_failure(self) -> None:
+        """
+        Advance when SMS OTP could not be delivered (provider/network).
+        Does not apply when the user enters a wrong code — that path stays in verification.
+        """
+        self.update_collected_data("phoneVerificationSkipped", True)
+        self.otp_state["phone_verified"] = True
+        self.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
+        next_state = self.get_next_state()
+        self.transition_to(next_state)
     
     def can_generate_json(self) -> bool:
         """Check if all required data is collected for JSON generation"""
@@ -177,11 +255,15 @@ class FlowController:
         
         # Check required fields
         for field in required_fields:
+            if field == "leadName" and not self.capture_lead_name:
+                continue
+            if field == "leadEmail" and not self.capture_lead_email:
+                continue
             if not self.collected_data.get(field):
                 return False
         
         # Check phone (if not skipping phone collection)
-        if not self.skip_phone_collection and not self.collected_data.get("leadPhoneNumber"):
+        if self.capture_lead_phone and (not self.skip_phone_collection) and not self.collected_data.get("leadPhoneNumber"):
             return False
         
         # Check OTP verification
@@ -198,13 +280,26 @@ class FlowController:
         data = {
             "leadType": self.collected_data["leadType"],
             "serviceType": self.collected_data["serviceType"],
-            "leadName": self.collected_data["leadName"],  # Customer name
-            "leadEmail": self.collected_data["leadEmail"],
             "title": self.collected_data.get("title", "")
         }
+        if self.capture_lead_name and self.collected_data.get("leadName"):
+            data["leadName"] = self.collected_data["leadName"]
+        if self.capture_lead_email and self.collected_data.get("leadEmail"):
+            data["leadEmail"] = self.collected_data["leadEmail"]
         
-        if self.collected_data.get("leadPhoneNumber"):
+        if self.capture_lead_phone and self.collected_data.get("leadPhoneNumber"):
             data["leadPhoneNumber"] = self.collected_data.get("leadPhoneNumber", "")
+
+        if self.collected_data.get("sourceChannel"):
+            data["sourceChannel"] = self.collected_data.get("sourceChannel")
+        if self.collected_data.get("leadId"):
+            data["leadId"] = self.collected_data.get("leadId")
+        if self.collected_data.get("appointmentSlot"):
+            data["appointmentSlot"] = self.collected_data.get("appointmentSlot")
+        if self.collected_data.get("emailVerificationSkipped"):
+            data["emailVerificationSkipped"] = True
+        if self.collected_data.get("phoneVerificationSkipped"):
+            data["phoneVerificationSkipped"] = True
         
         # Add workflow answers if present
         workflow_answers = self.collected_data.get("workflowAnswers", {})
@@ -231,6 +326,9 @@ class FlowController:
             ConversationState.PHONE_COLLECTION: "Ask for the user's phone number.",
             ConversationState.PHONE_OTP_SENT: "Acknowledge OTP sent and wait for verification code.",
             ConversationState.PHONE_OTP_VERIFICATION: "Verify the OTP code provided.",
+            ConversationState.APPOINTMENT_OFFER: "Ask if the user wants to book now.",
+            ConversationState.CALENDAR_BOOKING: "Show and collect available date/time slots.",
+            ConversationState.APPOINTMENT_CONFIRMATION: "Ask user to confirm selected appointment details.",
             ConversationState.COMPLETE: "All information collected. Generate JSON."
         }
         return state_prompts.get(self.state, "Continue conversation naturally.")

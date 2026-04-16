@@ -14,6 +14,13 @@ class EmailValidationService:
         self.backend_url: str = settings.api_base_url.rstrip("/")
         self.frontend_url: str = settings.frontend_base_url.rstrip("/")
         self.secret: Optional[str] = settings.tp_sign_secret
+        self.default_app_id: Optional[str] = None
+        self.default_company_name: Optional[str] = None
+
+    def set_branding_context(self, app_id: Optional[str] = None, company_name: Optional[str] = None) -> None:
+        """Set per-conversation branding hints so OTP requests can be app/company aware."""
+        self.default_app_id = str(app_id).strip() if app_id else None
+        self.default_company_name = str(company_name).strip() if company_name else None
 
     async def get_otp_template(self, customer_name: str) -> str:
         """Get OTP verification template from the frontend API."""
@@ -52,7 +59,14 @@ class EmailValidationService:
         
         return html_template
 
-    async def send_otp_email(self, user_id: str, email: str, customer_name: str) -> Tuple[bool, str]:
+    async def send_otp_email(
+        self,
+        user_id: str,
+        email: str,
+        customer_name: str,
+        app_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+    ) -> Tuple[bool, str]:
         """Send OTP verification email to user."""
         # Get the OTP template
         html_template = await self.get_otp_template(customer_name)
@@ -72,10 +86,20 @@ class EmailValidationService:
             "accept": "application/json",
         }
         
+        resolved_app_id = str(app_id).strip() if app_id else self.default_app_id
+        resolved_company_name = (
+            str(company_name).strip() if company_name else self.default_company_name
+        )
+
         payload = {
             "email": email,
-            "htmlTemplate": html_template
+            "htmlTemplate": html_template,
+            "customerName": customer_name,
         }
+        if resolved_app_id:
+            payload["appId"] = resolved_app_id
+        if resolved_company_name:
+            payload["companyName"] = resolved_company_name
         
         start_time = time.time()
         logger.info("Sending OTP email request at %s for user_id=%s, email=%s", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)), user_id, email)

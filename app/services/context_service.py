@@ -309,7 +309,14 @@ class ContextService:
         lead_types: List[LeadTypeEntry] = []
         if isinstance(lead_types_raw, list) and lead_types_raw and isinstance(lead_types_raw[0], dict):
             # Already in desired shape; preserve relevantServicePlans, synonyms, and emoji (per-app from DB)
-            for idx, item in enumerate(lead_types_raw, start=1):
+            items_in_order = list(lead_types_raw)
+            # Preserve configured sequence: sort by `order` when present.
+            try:
+                if any(isinstance(x, dict) and x.get("order") is not None for x in items_in_order):
+                    items_in_order.sort(key=lambda x: (x.get("order") if isinstance(x, dict) and x.get("order") is not None else 10**9))
+            except Exception:
+                pass
+            for idx, item in enumerate(items_in_order, start=1):
                 value = str(item.get("value") or item.get("id") or idx)
                 text = str(item.get("text") or value)
                 entry: LeadTypeEntry = {"id": item.get("id") or idx, "value": value, "text": text}
@@ -350,19 +357,17 @@ class ContextService:
             "questions",
         ], [])
 
-        # Treatment plans
-        treatment_plans = first_present([
+        # Service plans (menu/services)
+        service_plans = first_present([
+            "servicePlans",
+            "service_plans",
             "treatmentPlans",
             "treatment_plans",
             "treatment_plans_options",
             "treatments",
         ], [])
         
-        # Capitalize first letter of treatment plan questions
-        if isinstance(treatment_plans, list):
-            for plan in treatment_plans:
-                if isinstance(plan, dict) and "question" in plan:
-                    plan["question"] = plan["question"].capitalize()
+        # Preserve service plan titles as configured (capitalise() would corrupt mixed-case names).
 
         # Profession/industry: prefer app's industry over user's professionDescription
         profession = ""
@@ -433,9 +438,25 @@ class ContextService:
             None,
         )
 
+        twilio_account_sid = first_present(
+            [
+                "twilioAccountSid",
+                "twilio_account_sid",
+            ],
+            None,
+        )
+
+        twilio_auth_token = first_present(
+            [
+                "twilioAuthToken",
+                "twilio_auth_token",
+            ],
+            None,
+        )
+
         return {
             "lead_types": lead_types,
-            "treatment_plans": treatment_plans,
+            "service_plans": service_plans,
             "faqs": faqs,
             "profession": profession,
             "integration": integration,
@@ -445,4 +466,6 @@ class ContextService:
             "workflows": workflows,  # Preserve workflows for workflow questions
             "messengerAccessToken": messenger_access_token,  # Facebook Page Access Token
             "instagramAccessToken": instagram_access_token,  # Instagram Access Token
+            "twilioAccountSid": twilio_account_sid,
+            "twilioAuthToken": twilio_auth_token,
         }

@@ -4,6 +4,8 @@ import re
 import time
 import secrets
 import asyncio
+import uuid
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, HTTPException, Header
@@ -27,6 +29,7 @@ from .services.calendar_service import CalendarService
 from .services.conversation_state import FlowController, ConversationState
 from .services.response_generator import ResponseGenerator
 from .services.data_extractors import DataExtractor
+from .services.lead_type_resolver import LeadTypeResolutionMode, resolve_lead_type
 from .utils.phone_utils import format_phone_number
 from .utils.language_utils import detect_language, get_language_name_for_prompt
 from .utils.response_strings import get_string
@@ -36,6 +39,29 @@ from twilio.twiml.voice_response import VoiceResponse
 
 logger = logging.getLogger("assistly")
 logging.basicConfig(level=logging.INFO)
+
+
+async def _consume_channel_limit_or_block(
+    lead_service: LeadService,
+    app_id: Optional[str],
+    channel: str,
+    idempotency_key: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Consume one conversation unit for a new session.
+    Returns (allowed, block_message). block_message is safe for end users and avoids renewal details.
+    """
+    if not app_id:
+        return True, None
+    ok, payload = await lead_service.consume_channel_conversation(
+        app_id=str(app_id),
+        channel=channel,
+        idempotency_key=idempotency_key,
+    )
+    if ok:
+        return True, None
+    logger.warning("Conversation blocked by subscription gate app_id=%s channel=%s payload=%s", app_id, channel, payload)
+    return False, "Service is temporarily unavailable. Please try again later."
 
 
 # ─── TypedDicts for Messenger and Instagram sessions ────────────────────────
@@ -154,8 +180,165 @@ def get_or_create_instagram_session(sender_id: str, user_id: str) -> Tuple[str, 
 # Session timeout from environment variable (default: 5 minutes)
 SESSION_TIMEOUT = settings.session_timeout_seconds
 
+# Conversation-style toggle refresh:
+# Backend notifies this service when `integration.conversationStyle` changes.
+# For existing Messenger/Instagram sessions we do NOT clear them immediately.
+# Instead, the next incoming message will apply the new style only after
+# the session has been idle for `idle_seconds`.
+conversation_style_change_requests: Dict[str, Dict[str, Any]] = {}
+
+# Web widget: resume interrupted chats (in-memory; best-effort across reconnects / page navigations)
+WIDGET_CHAT_RESUME: Dict[str, Dict[str, Any]] = {}
+WIDGET_RESUME_TTL_SEC = 86400 * 2
+WIDGET_RESUME_MAX_KEYS = 4000
+
+# Mid-flow lead-type switch is only meaningful after the user left the greeting / lead menu.
+_LEAD_TYPE_SWITCH_ALLOWED_STATES = frozenset(
+    s
+    for s in ConversationState
+    if s
+    not in (
+        ConversationState.GREETING,
+        ConversationState.LEAD_TYPE_SELECTION,
+        ConversationState.COMPLETE,
+    )
+)
+
+
+def _lead_type_display_label_from_dict(lt: Optional[Dict[str, Any]]) -> str:
+    """Human label for chat (emoji + text), same as widget lead-type buttons."""
+    if not lt or not isinstance(lt, dict):
+        return ""
+    text = str(lt.get("text") or lt.get("value") or "").strip()
+    emoji = str(lt.get("emoji") or "").strip()
+    if emoji and text:
+        return f"{emoji} {text}".strip()
+    return text or str(lt.get("value") or "").strip()
+
+
+def _lead_type_display_label_from_value(value: Any, lead_types: List[Dict[str, Any]]) -> str:
+    """Resolve stored leadType slug to the same display string as the menu."""
+    v = str(value or "").strip().lower()
+    if not v:
+        return ""
+    for lt in lead_types:
+        if not isinstance(lt, dict):
+            continue
+        lv = str(lt.get("value") or "").strip().lower()
+        if lv == v:
+            return _lead_type_display_label_from_dict(lt) or str(value or "").strip()
+    return str(value or "").strip()
+
+
 # Voice agent sessions
 voice_agent_service = VoiceAgentService(settings)
+
+
+def _integration_google_review_url(integration: Any) -> Optional[str]:
+    """Return Google review URL when enabled; tolerates string booleans from APIs."""
+    if not isinstance(integration, dict):
+        return None
+    raw_en = integration.get("googleReviewEnabled")
+    if isinstance(raw_en, str):
+        enabled = raw_en.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        enabled = bool(raw_en)
+    if not enabled:
+        return None
+    url = str(integration.get("googleReviewUrl") or "").strip()
+    return url or None
+
+
+def _is_review_or_feedback_lead_type(flow_controller: Any, context: Dict[str, Any]) -> bool:
+    """
+    True when current lead type is explicitly review/feedback oriented.
+    In that case, do not inject extra global review/feedback prompts at completion
+    to avoid asking the same thing twice.
+    """
+    try:
+        lead_type_value = str((flow_controller.collected_data or {}).get("leadType") or "").strip().lower()
+    except Exception:
+        lead_type_value = ""
+    if not lead_type_value:
+        return False
+
+    lead_types = context.get("lead_types") or []
+    lead_type_text = ""
+    for lt in lead_types:
+        if not isinstance(lt, dict):
+            continue
+        if str(lt.get("value") or "").strip().lower() == lead_type_value:
+            lead_type_text = str(lt.get("text") or "").strip().lower()
+            break
+
+    haystack = f"{lead_type_value} {lead_type_text}".strip()
+    keywords = tuple(_review_feedback_keywords(context))
+    return any(k in haystack for k in keywords)
+
+
+def _review_feedback_keywords(context: Dict[str, Any]) -> List[str]:
+    """
+    Configurable keyword list for review/feedback detection.
+    Integration can provide:
+      - reviewFeedbackKeywords: list[str] or comma-separated string
+      - reviewFeedbackKeywordList: list[str] or comma-separated string
+    """
+    defaults = ["review", "feedback", "rating", "testimonial"]
+    integration = context.get("integration") or {}
+    raw = integration.get("reviewFeedbackKeywords")
+    if raw is None:
+        raw = integration.get("reviewFeedbackKeywordList")
+
+    parsed: List[str] = []
+    if isinstance(raw, str):
+        parsed = [p.strip().lower() for p in re.split(r"[,\n;|]+", raw) if p and p.strip()]
+    elif isinstance(raw, list):
+        parsed = [str(p).strip().lower() for p in raw if str(p).strip()]
+
+    cleaned = [k for k in parsed if len(k) >= 3]
+    return cleaned if cleaned else defaults
+
+
+def _workflow_has_review_feedback_question(flow_controller: Any, context: Dict[str, Any]) -> bool:
+    """Detect whether current/answered workflow questions already include review/feedback intent."""
+    keywords = _review_feedback_keywords(context)
+
+    def _matches(text: str) -> bool:
+        t = str(text or "").strip().lower()
+        if not t:
+            return False
+        return any(k in t for k in keywords)
+
+    try:
+        answers = (flow_controller.collected_data or {}).get("workflowAnswers") or {}
+        if isinstance(answers, dict):
+            for item in answers.values():
+                if isinstance(item, dict) and _matches(item.get("question", "")):
+                    return True
+    except Exception:
+        pass
+
+    try:
+        wm = getattr(flow_controller, "workflow_manager", None)
+        cw = getattr(wm, "current_workflow", None) if wm else None
+        if isinstance(cw, dict):
+            for q in (cw.get("questions") or []):
+                if isinstance(q, dict) and _matches(q.get("question", "")):
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _should_skip_global_review_feedback_prompts(flow_controller: Any, context: Dict[str, Any]) -> bool:
+    """
+    Skip global review/feedback prompts only when:
+    1) user is in review/feedback lead type, AND
+    2) workflow already has a review/feedback question.
+    """
+    return _is_review_or_feedback_lead_type(flow_controller, context) and _workflow_has_review_feedback_question(flow_controller, context)
+
 
 def get_or_create_session(user_phone: str) -> tuple[str, bool]:
     """Get existing session or create new one. Returns (session_id, is_new)"""
@@ -316,6 +499,56 @@ async def invalidate_whatsapp_sessions(
     return {"status": "ok", "twilio_phone": clean_phone, "removed_sessions": len(removed)}
 
 
+class ConversationStyleChangeBody(BaseModel):
+    app_id: str
+    conversation_style: bool
+    idle_seconds: int = 120
+
+
+@app.post("/api/v1/social/conversation-style/invalidate-sessions")
+async def invalidate_conversation_style_sessions(
+    body: ConversationStyleChangeBody,
+    x_invalidate_sessions_secret: Optional[str] = Header(default=None, alias="X-Invalidate-Sessions-Secret"),
+) -> Dict[str, Any]:
+    """
+    Mark existing Messenger/Instagram sessions for `app_id` as stale.
+
+    We don't clear in-memory sessions immediately. When a session becomes idle
+    for `idle_seconds`, the next incoming message will apply the new
+    `conversationStyle` to the session context.
+    """
+    if settings.tp_sign_secret:
+        if x_invalidate_sessions_secret != settings.tp_sign_secret:
+            raise HTTPException(status_code=401, detail="Invalid or missing secret")
+
+    clean_app_id = (body.app_id or "").strip()
+    if not clean_app_id:
+        raise HTTPException(status_code=400, detail="app_id required")
+
+    idle_seconds = max(0, int(body.idle_seconds or 120))
+    desired_conversation_style = bool(body.conversation_style)
+
+    current = conversation_style_change_requests.get(clean_app_id)
+    current_version = int(current.get("version", 0)) if isinstance(current, dict) else 0
+    new_version = current_version + 1
+
+    conversation_style_change_requests[clean_app_id] = {
+        "version": new_version,
+        "conversation_style": desired_conversation_style,
+        "idle_seconds": idle_seconds,
+        "requested_at": time.time(),
+    }
+
+    logger.info(
+        "Marked social sessions stale after idle: app_id=%s version=%s conversation_style=%s idle_seconds=%s",
+        clean_app_id,
+        new_version,
+        desired_conversation_style,
+        idle_seconds,
+    )
+    return {"status": "ok", "app_id": clean_app_id, "version": new_version, "idle_seconds": idle_seconds}
+
+
 def _maybe_parse_json(text: str) -> Optional[Dict]:
     """Parse JSON from text if it looks like JSON."""
     content = text.strip()
@@ -325,6 +558,93 @@ def _maybe_parse_json(text: str) -> Optional[Dict]:
         return json.loads(content)
     except Exception:
         return None
+
+
+def _looks_like_internal_lead_payload(text: str) -> bool:
+    """Detect internal lead payloads that should never be sent to end users."""
+    if not text or not isinstance(text, str):
+        return False
+
+    parsed = _maybe_parse_json(text)
+    if not isinstance(parsed, dict):
+        return False
+
+    payload_keys = {
+        "leadType",
+        "serviceType",
+        "leadName",
+        "leadEmail",
+        "leadPhoneNumber",
+        "history",
+        "workflowAnswers",
+        "appointmentSlot",
+        "sourceChannel",
+        "title",
+    }
+    return any(k in parsed for k in payload_keys)
+
+
+async def _continue_after_otp_delivery_failed(
+    flow_controller: FlowController,
+    response_generator: ResponseGenerator,
+    conversation_history: List[Dict[str, str]],
+    context: Dict[str, Any],
+    lang_code: str,
+    kind: str,
+) -> str:
+    """
+    When email/SMS OTP cannot be sent (provider/network), skip verification and advance the flow.
+    Wrong codes entered by the user are handled separately (stay in verification).
+    """
+    logger.warning("OTP delivery failed; skipping verification and advancing flow (kind=%s)", kind)
+    if kind == "email":
+        flow_controller.skip_email_verification_after_send_failure()
+        prefix = get_string("otp_unavailable_skip_email", lang_code)
+    else:
+        flow_controller.skip_phone_verification_after_send_failure()
+        prefix = get_string("otp_unavailable_skip_phone", lang_code)
+    if flow_controller.state == ConversationState.SERVICE_SELECTION:
+        next_prompt = await response_generator._generate_service_selection_response(
+            conversation_history,
+            context,
+            collected_lead_type=flow_controller.collected_data.get("leadType"),
+        )
+    else:
+        next_prompt = await response_generator._generate_state_response(
+            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+        )
+    body = (next_prompt or "").strip()
+    return f"{prefix}\n\n{body}" if body else prefix
+
+
+async def _continue_after_otp_delivery_failed_with_session(
+    flow_controller: FlowController,
+    response_generator: ResponseGenerator,
+    conversation_history: List[Dict[str, str]],
+    context: Dict[str, Any],
+    lang_code: str,
+    kind: str,
+    email_validation_state: Optional[Dict[str, Any]] = None,
+    phone_validation_state: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Session-aware wrapper for WhatsApp/Messenger/Instagram handlers.
+    Keeps per-channel OTP state in sync when delivery fails.
+    """
+    if kind == "email" and email_validation_state is not None:
+        email_validation_state["otp_sent"] = False
+        email_validation_state["otp_verified"] = True
+    if kind == "phone" and phone_validation_state is not None:
+        phone_validation_state["otp_sent"] = False
+        phone_validation_state["otp_verified"] = True
+    return await _continue_after_otp_delivery_failed(
+        flow_controller,
+        response_generator,
+        conversation_history,
+        context,
+        lang_code,
+        kind,
+    )
 
 
 def _validate_email_verification(email_validation_state: Dict) -> bool:
@@ -406,8 +726,581 @@ def _is_availability_intent(text: str) -> bool:
         "schedule a viewing",
         "schedule a service",
         "schedule a checkup",
+        "book a treatment",
+        "book treatment",
     ]
     return any(p in t for p in availability_phrases)
+
+
+def _extract_index_choice(text: str) -> Optional[int]:
+    """Extract numeric choice from text like '2', '2. Fri', or '📅 2. Fri'."""
+    if not text or not isinstance(text, str):
+        return None
+    raw = text.strip()
+    # Fast path: plain numeric start.
+    match = re.match(r"^\s*(\d{1,2})\b", raw)
+    if not match:
+        # Messenger quick replies often include a leading emoji, e.g. "📅 2. Thu 09/04/2026".
+        match = re.search(r"(?<!\d)(\d{1,2})(?=\s*[\.\-\)])", raw)
+        if not match:
+            return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _split_choice_tokens(text: str) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    return [p.strip() for p in re.split(r"[,;\n]+", raw) if p.strip()]
+
+
+def _is_checkbox_style_question(question: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(question, dict):
+        return False
+    code = str(question.get("questionTypeCode") or "").strip().lower()
+    if code == "multiple_choice":
+        return True
+    if code == "single_choice":
+        return False
+    mode = str(question.get("choiceInputMode") or "").strip().lower()
+    if mode == "checkbox":
+        return True
+    qtid = question.get("questionTypeId")
+    try:
+        return int(float(qtid)) == 3
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalize_workflow_choice_input(
+    raw_input: str,
+    flow_controller: Optional[Any],
+) -> Optional[str]:
+    """Normalize workflow answer to canonical option labels, including mixed numeric/text comma input."""
+    if not flow_controller or flow_controller.state != ConversationState.WORKFLOW_QUESTION:
+        return None
+    wm = getattr(flow_controller, "workflow_manager", None)
+    if not wm or not getattr(wm, "is_active", False):
+        return None
+    current_q = wm.get_current_question()
+    if not current_q:
+        return None
+    options = current_q.get("options", []) or []
+    if not options:
+        return None
+    sorted_opts = sorted(options, key=lambda o: o.get("order", 0))
+    by_text: Dict[str, str] = {}
+    for opt in sorted_opts:
+        opt_text = (opt.get("text") or "").strip()
+        if opt_text:
+            by_text[opt_text.lower()] = opt_text
+
+    tokens = _split_choice_tokens(raw_input)
+    if not tokens:
+        tokens = [str(raw_input or "").strip()] if str(raw_input or "").strip() else []
+    if not tokens:
+        return None
+
+    # For single-select questions, reject comma-separated multi-token input immediately.
+    is_multi_select = _is_checkbox_style_question(current_q)
+    if not is_multi_select and len(tokens) > 1:
+        return None
+
+    resolved: List[str] = []
+    for token in tokens:
+        t = token.strip()
+        if not t:
+            continue
+        if t.isdigit():
+            number = int(t)
+            if 1 <= number <= len(sorted_opts):
+                selected_text = (sorted_opts[number - 1].get("text") or "").strip()
+                if selected_text:
+                    resolved.append(selected_text)
+                    continue
+            return None
+        mapped = by_text.get(t.lower())
+        if mapped:
+            resolved.append(mapped)
+            continue
+        return None
+
+    if not resolved:
+        return None
+
+    # Keep first-seen order while removing duplicates.
+    seen = set()
+    unique_resolved = []
+    for val in resolved:
+        key = val.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_resolved.append(val)
+    # Join with newline so response_generator.py (which splits on [;\n]+) correctly
+    # recognises each item as a separate selection for multi-choice validation.
+    # Single-choice results in a single item so no separator is added.
+    return "\n".join(unique_resolved) if unique_resolved else None
+
+
+def _normalize_whatsapp_interactive_selection(
+    raw_text: str,
+    message_data: Dict[str, Any],
+    flow_controller: Optional[Any],
+    session: Dict[str, Any],
+) -> str:
+    """
+    Resolve WhatsApp interactive replies to human-readable labels/payloads.
+    Prefers titles; falls back to previous-choice map and workflow option index map.
+    """
+    resolved = str(raw_text or "").strip()
+    button_id = str(message_data.get("button_id") or "").strip()
+    button_title = str(message_data.get("button_title") or "").strip()
+    list_id = str(message_data.get("list_id") or "").strip()
+    list_title = str(message_data.get("list_title") or "").strip()
+
+    if button_title:
+        return button_title
+    if list_title:
+        return list_title
+
+    selected_id = button_id or list_id
+    if not selected_id:
+        return resolved
+
+    # First try explicit map from last outgoing choice set.
+    choice_map = session.get("last_whatsapp_choice_map") or {}
+    if isinstance(choice_map, dict):
+        mapped = choice_map.get(selected_id)
+        if isinstance(mapped, str) and mapped.strip():
+            return mapped.strip()
+
+    # Fallback: map btn_N to current workflow options.
+    id_match = re.match(r"^(?:btn_|button_)?(\d+)$", selected_id, flags=re.IGNORECASE)
+    if id_match and flow_controller and flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+        wm = getattr(flow_controller, "workflow_manager", None)
+        if wm and getattr(wm, "is_active", False):
+            current_q = wm.get_current_question()
+            if current_q:
+                opts = current_q.get("options", []) or []
+                sorted_opts = sorted(opts, key=lambda o: o.get("order", 0))
+                number = int(id_match.group(1))
+                if 1 <= number <= len(sorted_opts):
+                    opt_text = (sorted_opts[number - 1].get("text") or "").strip()
+                    if opt_text:
+                        return opt_text
+
+    return selected_id or resolved
+
+
+def _format_whatsapp_option_prompt(base_text: str, options: List[Dict[str, str]], multi_select: bool) -> str:
+    numbered = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(options, 1)])
+    if multi_select:
+        guidance = (
+            "\n\nYou can choose multiple. Reply with numbers separated by commas "
+            "(e.g. 1,2) or option names."
+        )
+    else:
+        guidance = "\n\nPlease reply with the number of your choice."
+    return f"{base_text}{numbered}{guidance}"
+
+
+def _format_social_option_prompt(base_text: str, options: List[Dict[str, str]], multi_select: bool) -> str:
+    numbered = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(options, 1)])
+    if multi_select:
+        guidance = (
+            "\n\nYou can select multiple options. Reply with comma-separated numbers "
+            "(e.g. 1,2) or option names."
+        )
+    else:
+        guidance = "\n\nPlease reply with the number of your choice."
+    return f"{base_text}{numbered}{guidance}"
+
+def _slot_matches_local_date(slot: Dict[str, Any], selected_date: str, calendar_tz: str) -> bool:
+    """Match slot start date against selected local calendar date."""
+    if not selected_date:
+        return False
+    start = str(slot.get("start") or "").strip()
+    if not start:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        local_date = dt_utc.astimezone(ZoneInfo(calendar_tz or "UTC")).strftime("%Y-%m-%d")
+        return local_date == selected_date
+    except Exception:
+        return start[:10] == selected_date
+
+
+def _feedback_prompt_message() -> str:
+    return (
+        "Your feedback helps us improve every chat.\n"
+        "Please choose your experience and rating in one tap:\n"
+        "<button value=\"feedback:very_happy:5\">😄 Excellent (5/5)</button>\n"
+        "<button value=\"feedback:happy:4\">🙂 Good (4/5)</button>\n"
+        "<button value=\"feedback:neutral:3\">😐 Okay (3/5)</button>\n"
+        "<button value=\"feedback:sad:2\">🙁 Not good (2/5)</button>\n"
+        "<button value=\"feedback:very_sad:1\">😞 Poor (1/5)</button>"
+    )
+
+
+def _extract_feedback_experience(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = str(text).strip().lower()
+    direct = re.search(r"\bexp:(very_happy|happy|neutral|sad|very_sad)\b", t)
+    if direct:
+        return direct.group(1)
+    phrase_map = {
+        "very happy": "very_happy",
+        "happy": "happy",
+        "neutral": "neutral",
+        "sad": "sad",
+        "very sad": "very_sad",
+    }
+    for phrase, key in phrase_map.items():
+        if phrase in t:
+            return key
+    emoji_map = {
+        "😄": "very_happy",
+        "😀": "very_happy",
+        "🙂": "happy",
+        "😐": "neutral",
+        "🙁": "sad",
+        "☹": "sad",
+        "😞": "very_sad",
+    }
+    for emoji, key in emoji_map.items():
+        if emoji in text:
+            return key
+    return None
+
+
+def _extract_feedback_rating(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = str(text).strip().lower()
+    match = re.search(r"\brating:(\d)\b", t)
+    if match:
+        value = int(match.group(1))
+        return value if 1 <= value <= 5 else None
+    match = re.search(r"\b([1-5])\b", t)
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if 1 <= value <= 5 else None
+
+
+def _extract_feedback_submission(text: str) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Normalize feedback input so one response can contain both values.
+    Supports values like `feedback:happy:4`, old split values, and plain text.
+    """
+    if not text:
+        return None, None
+    t = str(text).strip().lower()
+    combined = re.search(r"\bfeedback:(very_happy|happy|neutral|sad|very_sad):([1-5])\b", t)
+    if combined:
+        return combined.group(1), int(combined.group(2))
+
+    exp = _extract_feedback_experience(text)
+    rating = _extract_feedback_rating(text)
+
+    exp_to_rating = {
+        "very_happy": 5,
+        "happy": 4,
+        "neutral": 3,
+        "sad": 2,
+        "very_sad": 1,
+    }
+    rating_to_exp = {
+        5: "very_happy",
+        4: "happy",
+        3: "neutral",
+        2: "sad",
+        1: "very_sad",
+    }
+
+    if exp and not rating:
+        rating = exp_to_rating.get(exp)
+    if rating and not exp:
+        exp = rating_to_exp.get(rating)
+    return exp, rating
+
+
+def _capture_feedback_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("captureFeedbackEnabled"))
+
+
+def _capture_email_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("captureLeadEmail", True))
+
+
+def _capture_phone_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("captureLeadPhoneNumber", True))
+
+
+def _validate_email_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("validateEmail", True) and integration.get("captureLeadEmail", True))
+
+
+def _validate_phone_enabled(context: Dict[str, Any]) -> bool:
+    integration = (context or {}).get("integration") or {}
+    return bool(integration.get("validatePhoneNumber", True) and integration.get("captureLeadPhoneNumber", True))
+
+
+def _extract_lead_id_from_create_response(resp: Any) -> Optional[str]:
+    if not isinstance(resp, dict):
+        return None
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return None
+    lead = data.get("lead")
+    if not isinstance(lead, dict):
+        return None
+    lead_id = lead.get("_id") or lead.get("id")
+    if lead_id:
+        return str(lead_id)
+    return None
+
+
+def _format_slot_time_local(iso_str: str, iana_timezone: str) -> str:
+    """Format a UTC ISO datetime to a 12-hour local time string using the given IANA timezone."""
+    try:
+        dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt_local = dt_utc
+        if iana_timezone and iana_timezone != "UTC":
+            try:
+                from zoneinfo import ZoneInfo
+                dt_local = dt_utc.astimezone(ZoneInfo(iana_timezone))
+            except Exception:
+                pass
+        h = dt_local.hour
+        m = dt_local.minute
+        period = "AM" if h < 12 else "PM"
+        display_h = h % 12 or 12
+        return f"{display_h}:{m:02d} {period}"
+    except Exception:
+        return iso_str
+
+
+def _get_tz_label(iana_timezone: str) -> str:
+    """Return a readable timezone label like 'Asia/Karachi (GMT+5)'."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(iana_timezone)
+        offset = datetime.now(tz).utcoffset()
+        total_minutes = int(offset.total_seconds() / 60)
+        sign = "+" if total_minutes >= 0 else "-"
+        abs_h, abs_m = divmod(abs(total_minutes), 60)
+        offset_str = f"GMT{sign}{abs_h}" if abs_m == 0 else f"GMT{sign}{abs_h}:{abs_m:02d}"
+        return f"{iana_timezone} ({offset_str})"
+    except Exception:
+        return iana_timezone or "UTC"
+
+
+def _calendar_tz_from_integration(integration: Dict[str, Any]) -> str:
+    tz = (integration or {}).get("calendarTimezone") or "UTC"
+    return str(tz) if tz else "UTC"
+
+
+def _availability_window_from_tomorrow_utc(integration: Dict[str, Any], horizon_days: int = 14) -> Tuple[str, str]:
+    """UTC ISO Z range for calendar API: start tomorrow 00:00 in the business calendar timezone."""
+    from zoneinfo import ZoneInfo
+
+    cal_tz = _calendar_tz_from_integration(integration)
+    try:
+        zi = ZoneInfo(cal_tz)
+    except Exception:
+        zi = ZoneInfo("UTC")
+    now_local = datetime.now(zi)
+    tomorrow = (now_local + timedelta(days=1)).date()
+    start_local = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=zi)
+    end_local = start_local + timedelta(days=horizon_days)
+    start_utc = start_local.astimezone(timezone.utc).replace(microsecond=0)
+    end_utc = end_local.astimezone(timezone.utc).replace(microsecond=0)
+    return (
+        start_utc.isoformat().replace("+00:00", "Z"),
+        end_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _local_slot_date_key(iso_start: str, cal_tz: str) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+
+        dt_utc = datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
+        return dt_utc.astimezone(ZoneInfo(cal_tz)).strftime("%Y-%m-%d")
+    except Exception:
+        return (iso_start or "")[:10]
+
+
+def _tomorrow_date_key_in_tz(cal_tz: str) -> str:
+    from zoneinfo import ZoneInfo
+
+    try:
+        zi = ZoneInfo(cal_tz)
+    except Exception:
+        zi = ZoneInfo("UTC")
+    return (datetime.now(zi) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _filter_slots_from_tomorrow_local(slots: List[Dict[str, Any]], cal_tz: str) -> List[Dict[str, Any]]:
+    if not slots:
+        return []
+    cutoff = _tomorrow_date_key_in_tz(cal_tz)
+    return [s for s in slots if _local_slot_date_key((s.get("start") or ""), cal_tz) >= cutoff]
+
+
+def _normalize_service_title_for_plan_match(title: str) -> str:
+    t = (title or "").strip()
+    t = re.sub(r"\*+", "", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip().lower()
+
+
+def _find_post_booking_note(service_plans: List[Any], service_title: str) -> str:
+    target = _normalize_service_title_for_plan_match(service_title)
+    if not target:
+        return ""
+    for sp in service_plans or []:
+        if not isinstance(sp, dict):
+            continue
+        candidate_titles = [
+            sp.get("question", ""),
+            sp.get("title", ""),
+            sp.get("name", ""),
+            sp.get("serviceName", ""),
+        ]
+        q = _normalize_service_title_for_plan_match(
+            next((str(v) for v in candidate_titles if str(v).strip()), "")
+        )
+        # Prefer exact match, but allow contains-based fallback for minor title variations
+        # (e.g. numbering/punctuation differences across channels).
+        if q == target or (q and target in q) or (q and q in target):
+            raw = sp.get("postBookingNote")
+            return (str(raw).strip() if raw is not None else "")
+    return ""
+
+
+async def _resolve_post_booking_note(
+    context: Dict[str, Any],
+    app_id: Optional[str],
+    service_title: str,
+    context_service: Optional[Any] = None,
+) -> str:
+    """
+    Resolve post-booking note with a fresh-context fallback for social channels.
+    This avoids stale in-memory context causing missing notes.
+    """
+    service_plans_ctx = context.get("service_plans", []) if isinstance(context, dict) else []
+    note = _find_post_booking_note(service_plans_ctx, service_title)
+    if note:
+        return note
+    if not app_id or context_service is None:
+        return ""
+    try:
+        refreshed = await context_service.fetch_context_by_app(str(app_id))
+        refreshed_plans = refreshed.get("service_plans", []) if isinstance(refreshed, dict) else []
+        if isinstance(context, dict):
+            context["service_plans"] = refreshed_plans
+        return _find_post_booking_note(refreshed_plans, service_title)
+    except Exception as note_exc:
+        logger.warning("Post-booking note refresh failed (app_id=%s): %s", app_id, note_exc)
+        return ""
+
+
+def _html_post_booking_to_chat_text(html: str) -> str:
+    from html import unescape
+
+    s = html
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</p>\s*", "\n", s, flags=re.I)
+    s = re.sub(r"<p[^>]*>", "", s, flags=re.I)
+    s = re.sub(r"<li[^>]*>", "\n• ", s, flags=re.I)
+    s = re.sub(r"</li>", "", s, flags=re.I)
+    s = re.sub(r"</(ul|ol)>", "\n", s, flags=re.I)
+    s = re.sub(r"<(ul|ol)[^>]*>", "\n", s, flags=re.I)
+
+    def _bold_tag(m: Any) -> str:
+        inner = (m.group(1) or "").strip()
+        return f"**{inner}**" if inner else ""
+
+    s = re.sub(r"<strong[^>]*>([\s\S]*?)</strong>", _bold_tag, s, flags=re.I)
+    s = re.sub(r"<b[^>]*>([\s\S]*?)</b>", _bold_tag, s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = unescape(s)
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def _format_post_booking_note_for_chat(note: str) -> str:
+    raw = (note or "").strip()
+    if not raw:
+        return ""
+    if "<" in raw and ">" in raw:
+        return _html_post_booking_to_chat_text(raw)
+    lines_out: List[str] = []
+    for ln in raw.splitlines():
+        piece = ln.strip()
+        if not piece:
+            continue
+        if re.match(r"^[-•*]\s*", piece):
+            piece = re.sub(r"^[-•*]\s+", "", piece)
+            lines_out.append(f"• {piece}")
+        else:
+            lines_out.append(f"• {piece}")
+    return "\n".join(lines_out)
+
+
+def _snapshot_flow_controller_for_resume(fc: FlowController) -> Dict[str, Any]:
+    wm = fc.workflow_manager
+    return {
+        "state": fc.state.value,
+        "collected_data": json.loads(json.dumps(fc.collected_data, default=str)),
+        "otp_state": dict(fc.otp_state),
+        "workflow": wm.export_state() if wm else None,
+    }
+
+
+def _restore_flow_controller_from_resume(fc: FlowController, snap: Optional[Dict[str, Any]]) -> None:
+    if not snap or not isinstance(snap, dict):
+        return
+    st = snap.get("state")
+    if st:
+        try:
+            fc.state = ConversationState(st)
+        except Exception:
+            pass
+    cd = snap.get("collected_data")
+    if isinstance(cd, dict):
+        fc.collected_data = {**fc.collected_data, **cd}
+    ot = snap.get("otp_state")
+    if isinstance(ot, dict):
+        fc.otp_state = {**fc.otp_state, **ot}
+    wf_snap = snap.get("workflow")
+    if wf_snap:
+        from .services.workflow_manager import WorkflowManager
+
+        wm = WorkflowManager(fc.context)
+        wm.import_state(wf_snap)
+        fc.workflow_manager = wm
+
+
+def _prune_widget_resume_store() -> None:
+    if len(WIDGET_CHAT_RESUME) <= WIDGET_RESUME_MAX_KEYS:
+        return
+    items = sorted(WIDGET_CHAT_RESUME.items(), key=lambda kv: kv[1].get("saved_at", 0))
+    drop = max(1, len(items) // 2)
+    for k, _ in items[:drop]:
+        WIDGET_CHAT_RESUME.pop(k, None)
 
 
 def _extract_otp_from_text(text: str) -> str:
@@ -510,27 +1403,132 @@ def _extract_phone_from_text(text: str) -> str:
     return None
 
 def _extract_buttons_from_response(response: str) -> Tuple[str, List[Dict[str, str]]]:
-    """Extract buttons from response and return cleaned text + button data"""
+    """Extract button/checkbox options from response and return cleaned text + option data."""
     buttons = []
-    button_pattern = r'<\s*button[^>]*>\s*([^<]+?)\s*</\s*button[^>]*>'
-    button_matches = re.findall(button_pattern, response, re.IGNORECASE | re.DOTALL)
-    
+    # Messenger/Instagram can't render custom XML tags directly.
+    # Accept both <button> and <checkbox> and preserve optional value="" as payload.
+    option_tag_pattern = re.compile(
+        r'<\s*(button|checkbox)([^>]*)>\s*([\s\S]*?)\s*</\s*\1[^>]*>',
+        re.IGNORECASE,
+    )
+
     seen_buttons = set()
-    for button_text in button_matches:
-        clean_text = button_text.strip().lstrip('>').strip()
-        if clean_text and clean_text.lower() not in seen_buttons:
-            seen_buttons.add(clean_text.lower())
-            buttons.append({
-                "id": f"button_{len(buttons) + 1}",
-                "title": clean_text
-            })
+    for m in option_tag_pattern.finditer(response):
+        attrs = m.group(2) or ""
+        label_raw = m.group(3) or ""
+        clean_text = label_raw.strip().lstrip('>').strip()
+        if not clean_text:
+            continue
+        key = clean_text.lower()
+        if key in seen_buttons:
+            continue
+        seen_buttons.add(key)
+        value_match = re.search(r'value\s*=\s*["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        payload = (value_match.group(1).strip() if value_match else clean_text)[:1000]
+        buttons.append({
+            "id": f"button_{len(buttons) + 1}",
+            "title": clean_text,
+            "payload": payload,
+        })
     
-    cleaned_response = re.sub(button_pattern, '', response, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_response = re.sub(r'<\s*button[^>]*>.*?</\s*button[^>]*>', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
-    cleaned_response = re.sub(r'<\s*button[^>]*>.*?$', '', cleaned_response, flags=re.IGNORECASE | re.DOTALL)
+    cleaned_response = option_tag_pattern.sub('', response)
+    cleaned_response = re.sub(
+        r'<\s*(?:button|checkbox)[^>]*>.*?</\s*(?:button|checkbox)[^>]*>',
+        '',
+        cleaned_response,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    cleaned_response = re.sub(
+        r'<\s*(?:button|checkbox)[^>]*>.*?$',
+        '',
+        cleaned_response,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     cleaned_response = cleaned_response.strip()
     
     return cleaned_response, buttons
+
+
+async def _expand_booking_request_reply_for_social_channel(
+    reply: str,
+    integration: Dict[str, Any],
+    app_id: Optional[str],
+    flow_controller: Any,
+    session: Dict[str, Any],
+) -> str:
+    """
+    Convert BOOK_APPOINTMENT_REQUESTED into actual day-selection buttons for social channels.
+    This mirrors the web widget behavior so Messenger/Instagram don't show raw internal tokens.
+    """
+    if str(reply).strip() != "BOOK_APPOINTMENT_REQUESTED":
+        return reply
+    if not app_id:
+        return "I'd love to help you book. Please share which service you'd like, and I'll suggest available times."
+
+    from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
+    slot_minutes = integration.get("calendarSlotMinutes", 30)
+    if slot_minutes not in (15, 30, 60):
+        slot_minutes = 30
+
+    try:
+        calendar_service = CalendarService(settings)
+        result = await calendar_service.get_availability(app_id, from_date, to_date, slot_minutes=slot_minutes)
+        if result.get("error"):
+            return "I couldn't fetch availability right now. Please try again later."
+
+        cal_tz = _calendar_tz_from_integration(integration)
+        now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        free_slots = [
+            s for s in (result.get("freeSlots") or [])
+            if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > now_utc
+        ]
+        free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz)
+        if not free_slots:
+            if not result.get("calendarConnected"):
+                return "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
+            return "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+
+        by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for slot in free_slots:
+            start = slot.get("start") or ""
+            if not start:
+                continue
+            try:
+                from zoneinfo import ZoneInfo
+                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                date_key = dt_utc.astimezone(ZoneInfo(cal_tz)).strftime("%Y-%m-%d")
+            except Exception:
+                date_key = start[:10]
+            by_date.setdefault(date_key, []).append(slot)
+
+        days_order = sorted(by_date.keys())
+        calendar_days_list = []
+        for d in days_order:
+            try:
+                from zoneinfo import ZoneInfo
+                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
+                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
+            except Exception:
+                calendar_days_list.append({"date": d, "label": d})
+
+        session["calendar_flow"] = "days"
+        session["calendar_days"] = calendar_days_list
+        session["calendar_free_slots"] = free_slots
+        session["calendar_slots"] = None
+        session["calendar_selected_day"] = None
+
+        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+        if service_title:
+            intro = f"Great! Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+        else:
+            intro = "Great! Here are the available dates for your appointment. Please choose a day:"
+        lines = [intro]
+        for i, day in enumerate(calendar_days_list[:14], 1):
+            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
+        return "\n".join(lines)
+    except Exception as cal_exc:
+        logger.exception("Social channel: Calendar availability error: %s", cal_exc)
+        return "I couldn't fetch availability right now. Please try again later."
 
 def _convert_lead_types_to_whatsapp_buttons(lead_types: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """Convert lead types to WhatsApp button format"""
@@ -665,8 +1663,20 @@ def _bot_requests_file_upload(text: str) -> bool:
 async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
 
+    resume_key = (websocket.query_params.get("resume") or "").strip()
+    widget_session_complete = False
+    skip_history_replay = (websocket.query_params.get("skip_history_replay") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
     app_id: Optional[str] = websocket.query_params.get("app_id")
     user_id: Optional[str] = websocket.query_params.get("user_id")
+    country_hint_raw: Optional[str] = websocket.query_params.get("country")
+    country_hint = (country_hint_raw or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country_hint):
+        country_hint = ""
 
     # App-wise: accept app_id (embed widget) or legacy user_id
     if app_id:
@@ -710,6 +1720,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     # For OTP, leads, etc.: use user id from context (app owner when app_id was used)
     user_id = str(context.get("user", {}).get("id") or identifier)
+    resolved_app_id = str((context.get("app") or {}).get("id") or app_id or "").strip()
+    resolved_company_name = str((context.get("integration") or {}).get("companyName") or "").strip()
+    email_validation_service.set_branding_context(
+        app_id=resolved_app_id or None,
+        company_name=resolved_company_name or None,
+    )
 
     # Initialize production-grade components
     flow_controller = FlowController(context)
@@ -718,6 +1734,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     response_generator = ResponseGenerator(settings, rag_service)
     response_generator.set_profession(str(context.get("profession") or "Business"))
     response_generator.set_channel("web")
+    flow_controller.update_collected_data("sourceChannel", "web")
     
     extractor = DataExtractor()
     conversation_history: List[Dict[str, str]] = []
@@ -727,20 +1744,137 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     calendar_slots: List[Dict[str, Any]] = []
     calendar_free_slots: List[Dict[str, Any]] = []
     calendar_selected_day: Optional[str] = None
+    calendar_pending_slot: Dict[str, Any] = {}
+    user_timezone: str = "UTC"
+    pending_lead_switch: Optional[Dict[str, Any]] = None  # awaiting user yes/no confirmation
 
-    # Build RAG vector store
-    rag_service.build_vector_store(context)
-    
-    flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+    # Build RAG off the event loop so the client gets the first message(s) quickly.
+    # Blocking embeddings here previously stretched time-to-first-byte (~5s+), which
+    # triggered proxy/browser WebSocket closes (1006) before the greeting was sent.
+    rag_build_task = asyncio.create_task(
+        asyncio.to_thread(rag_service.build_vector_store, context)
+    )
 
-    # Send greeting (from DB) + lead types as buttons as soon as widget opens; no first user message required
+    lead_id: Optional[str] = None
+    feedback_collection_active = False
+    feedback_data: Dict[str, Any] = {}
+    last_snapshot: Dict[str, Any] = {}
+    restored = False
+    if resume_key and app_id:
+        resume_blob = WIDGET_CHAT_RESUME.get(resume_key)
+        if (
+            isinstance(resume_blob, dict)
+            and str(resume_blob.get("app_id") or "") == str(app_id)
+            and (time.time() - float(resume_blob.get("saved_at", 0))) < WIDGET_RESUME_TTL_SEC
+            and not resume_blob.get("terminal")
+        ):
+            restored = True
+            conversation_history = list(resume_blob.get("conversation_history") or [])
+            calendar_flow = resume_blob.get("calendar_flow")
+            calendar_days = list(resume_blob.get("calendar_days") or [])
+            calendar_slots = list(resume_blob.get("calendar_slots") or [])
+            calendar_free_slots = list(resume_blob.get("calendar_free_slots") or [])
+            calendar_selected_day = resume_blob.get("calendar_selected_day")
+            calendar_pending_slot = dict(resume_blob.get("calendar_pending_slot") or {})
+            user_timezone = str(resume_blob.get("user_timezone") or "UTC")
+            feedback_collection_active = bool(resume_blob.get("feedback_collection_active"))
+            feedback_data = dict(resume_blob.get("feedback_data") or {})
+            _pls_raw = resume_blob.get("pending_lead_switch")
+            if isinstance(_pls_raw, dict):
+                pending_lead_switch = _pls_raw
+            _restore_flow_controller_from_resume(flow_controller, resume_blob.get("flow"))
+            lid = resume_blob.get("lead_id")
+            if lid:
+                lead_id = str(lid)
+                flow_controller.update_collected_data("leadId", lead_id)
+
+    if not restored:
+        allowed, block_message = await _consume_channel_limit_or_block(
+            lead_service=lead_service,
+            app_id=resolved_app_id or app_id,
+            channel="web",
+            idempotency_key=f"web-{resume_key or uuid.uuid4().hex}",
+        )
+        if not allowed:
+            await websocket.send_json({
+                "type": "error",
+                "content": block_message or "Service is temporarily unavailable. Please try again later.",
+            })
+            await websocket.close(code=1008)
+            return
+
+        flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+        try:
+            location_country = country_hint or (context.get("country") or "US")
+            ok_lead, lead_resp = await lead_service.create_interaction_lead(
+                app_id=app_id,
+                user_id=user_id,
+                location={"country": location_country, "countryCode": location_country},
+                initial_interaction="widget_opened",
+                source_channel="web",
+                dedupe_window_hours=settings.lead_dedupe_window_hours,
+            )
+            if ok_lead and isinstance(lead_resp, dict):
+                lead_obj = ((lead_resp.get("data") or {}).get("lead") or {})
+                lead_id = str(lead_obj.get("_id") or "")
+                if lead_id:
+                    flow_controller.update_collected_data("leadId", lead_id)
+        except Exception as lead_exc:
+            logger.warning("WebSocket interaction lead creation failed: %s", lead_exc)
+
+    # Greeting for new sessions; resumed sessions replay transcript unless the client
+    # already has the thread (sessionStorage) and passes skip_history_replay=1.
     try:
-        initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
-        conversation_history.append({"role": "assistant", "content": initial_reply})
-        await websocket.send_json({"type": "bot", "content": initial_reply})
+        if restored and not skip_history_replay:
+            for turn in conversation_history[-50:]:
+                role = turn.get("role")
+                content = str(turn.get("content") or "")
+                if not content:
+                    continue
+                if role == "assistant":
+                    await websocket.send_json({"type": "bot", "content": content})
+                elif role == "user":
+                    await websocket.send_json({"type": "user_replay", "content": content})
+        elif restored and skip_history_replay:
+            logger.info("WebSocket resume: skip_history_replay=1, not re-sending transcript")
+        elif (not restored) and skip_history_replay:
+            # Client still has the thread in sessionStorage (skip flag) but this worker has no
+            # resume blob (TTL, cold start, or new resume id). Sending greeting again duplicates UI.
+            logger.info(
+                "WebSocket: skip_history_replay=1 without server resume — skipping greeting "
+                "(client already showing transcript)"
+            )
+        else:
+            initial_reply = await response_generator.generate_greeting(context, channel="web", first_message=None)
+            conversation_history.append({"role": "assistant", "content": initial_reply})
+            await websocket.send_json({"type": "bot", "content": initial_reply})
+    except WebSocketDisconnect:
+        logger.info(
+            "Client disconnected before/during initial WebSocket messages (user_id=%s)",
+            user_id,
+        )
     except Exception as greeting_exc:
         logger.exception("Failed to generate greeting: %s", greeting_exc)
-        await websocket.send_json({"type": "error", "content": "Failed to load greeting. Please try again."})
+        try:
+            await websocket.send_json(
+                {"type": "error", "content": "Failed to load greeting. Please try again."}
+            )
+        except Exception:
+            pass
+
+    # Lazily await RAG on first user turn so the receive loop can run while embeddings
+    # finish (important for skip_history_replay: client may send immediately with no prior bot frame).
+    rag_ready = False
+
+    async def ensure_rag_ready() -> None:
+        nonlocal rag_ready
+        if rag_ready:
+            return
+        try:
+            await rag_build_task
+        except Exception as rag_wait_exc:
+            logger.warning("RAG build task failed (non-fatal): %s", rag_wait_exc)
+        rag_ready = True
 
     try:
         while True:
@@ -751,6 +1885,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except json.JSONDecodeError:
                 parsed = {}
                 user_text = data
+
+            # Capture user's IANA timezone sent from the widget
+            if isinstance(parsed, dict):
+                tz_hint = parsed.get("timezone")
+                if tz_hint and isinstance(tz_hint, str) and len(tz_hint) < 64:
+                    user_timezone = tz_hint
 
             # ── Handle file_upload messages from the chat widget ──────────────
             if isinstance(parsed, dict) and parsed.get("type") == "file_upload":
@@ -790,7 +1930,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     else:
                         # Workflow done – move state forward (ConversationState is imported at top of module)
                         flow_controller.collected_data["workflowAnswers"] = wm.get_workflow_answers()
-                        flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        # Respect capture flags (name/email/phone) when leaving workflow.
+                        flow_controller.transition_to(flow_controller.get_next_state())
+                        await ensure_rag_ready()
                         next_reply = await response_generator.generate_response(
                             flow_controller, "[File uploaded]", conversation_history, context
                         )
@@ -804,12 +1946,350 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             if str(user_text).strip().lower() in {"ping", "pong", "keepalive", "heartbeat"}:
                 continue
 
+            if feedback_collection_active:
+                user_raw = str(user_text).strip()
+                conversation_history.append({"role": "user", "content": user_raw})
+                exp, rating = _extract_feedback_submission(user_raw)
+                if exp:
+                    feedback_data["experience"] = exp
+                if rating:
+                    feedback_data["rating"] = rating
+                if feedback_data.get("experience") and feedback_data.get("rating"):
+                    saved = False
+                    if lead_id:
+                        try:
+                            feedback_payload = {
+                                "userFeedback": {
+                                    "experience": feedback_data.get("experience"),
+                                    "rating": feedback_data.get("rating"),
+                                    "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                                }
+                            }
+                            saved, _ = await lead_service.update_lead(user_id, lead_id, feedback_payload)
+                        except Exception as feedback_exc:
+                            logger.warning("Failed to persist user feedback: %s", feedback_exc)
+                    thank_you = "Thank you for your feedback!"
+                    if not saved and lead_id:
+                        thank_you = "Thank you for your feedback! We could not save it right now."
+                    conversation_history.append({"role": "assistant", "content": thank_you})
+                    await websocket.send_json({"type": "bot", "content": thank_you})
+                    await websocket.send_json({"type": "session_complete"})
+                    widget_session_complete = True
+                    feedback_collection_active = False
+                    if resume_key:
+                        WIDGET_CHAT_RESUME.pop(resume_key, None)
+                    continue
+                missing_parts: List[str] = []
+                if not feedback_data.get("experience"):
+                    missing_parts.append("experience")
+                if not feedback_data.get("rating"):
+                    missing_parts.append("rating (1-5)")
+                followup = (
+                    "Thanks! Please also share your "
+                    + " and ".join(missing_parts)
+                    + ".\n"
+                    + _feedback_prompt_message()
+                )
+                conversation_history.append({"role": "assistant", "content": followup})
+                await websocket.send_json({"type": "bot", "content": followup})
+                continue
+
+            await ensure_rag_ready()
+
+            # Bad or partial resume blobs may leave state on default GREETING while the client
+            # already showed the greeting. The next user action is lead-type selection — not a
+            # mid-flow switch. Stale collected_data.leadType from a merge bug would otherwise
+            # satisfy "existing lead type" + state != LEAD_TYPE_SELECTION and fire the switch
+            # handler on the *first* button tap (re-greeting / wrong branch).
+            if flow_controller.state == ConversationState.GREETING:
+                flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
+                _user_turns_so_far = sum(
+                    1 for m in conversation_history if m.get("role") == "user"
+                )
+                if _user_turns_so_far == 0:
+                    flow_controller.update_collected_data("leadType", None)
+                    flow_controller.collected_data["title"] = None
+                    flow_controller.collected_data["leadTypeSwitchHistory"] = []
+
             integration = context.get("integration") or {}
             app_id_for_calendar = app_id  # from query params when widget is opened with ?app_id=...
 
-            # ── Calendar flow: same as WhatsApp – show days/slots from connected calendar, allow booking ──
+            # Global lead-type switch interrupt:
+            # If user selects a different lead type mid-flow, terminate current branch
+            # (including calendar/workflow) and restart from the new lead type gracefully.
+            lead_types_list = context.get("lead_types", [])
+
+            # ── Pending lead-type switch confirmation handler ─────────────────────────
+            # If we previously asked the user to confirm a lead-type switch, handle
+            # their yes/no before anything else on this turn.
+            if pending_lead_switch:
+                _confirm_text = str(user_text).strip().lower()
+                _yes_set = {"yes", "y", "yeah", "yep", "sure", "confirm", "ok", "okay", "switch"}
+                _no_set = {"no", "n", "nope", "cancel", "keep", "stay", "dont", "don't"}
+                _is_yes = _confirm_text in _yes_set or _confirm_text.startswith("yes")
+                _is_no = _confirm_text in _no_set or _confirm_text.startswith("no")
+
+                if _is_yes or _is_no:
+                    _pls = pending_lead_switch
+                    pending_lead_switch = None
+                    conversation_history.append({"role": "user", "content": user_text})
+
+                    if _is_yes:
+                        _switched = _pls["switched_lead_type"]
+                        _prev_lt = _pls["previous_lead_type"]
+
+                        calendar_flow = None
+                        calendar_days = []
+                        calendar_slots = []
+                        calendar_free_slots = []
+                        calendar_selected_day = None
+                        calendar_pending_slot = {}
+
+                        if flow_controller.workflow_manager:
+                            flow_controller.workflow_manager.reset()
+                        flow_controller.update_collected_data("leadType", _switched.get("value"))
+                        flow_controller.update_collected_data("serviceType", None)
+                        flow_controller.update_collected_data("workflowAnswers", {})
+                        flow_controller.update_collected_data("appointmentSlot", None)
+
+                        _existing_switch_hist = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
+                        _switch_hist = list(_existing_switch_hist) if isinstance(_existing_switch_hist, list) else []
+                        _switch_hist.append({
+                            "from": _prev_lt,
+                            "to": _switched.get("value"),
+                            "at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        flow_controller.update_collected_data("leadTypeSwitchHistory", _switch_hist)
+
+                        if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                            flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+                        elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                            flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+                        elif (
+                            flow_controller.capture_lead_phone
+                            and not flow_controller.skip_phone_collection
+                            and not flow_controller.collected_data.get("leadPhoneNumber")
+                        ):
+                            flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+                        else:
+                            if flow_controller.is_booking_lead_type():
+                                flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                            else:
+                                flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+
+                        _new_lbl = _lead_type_display_label_from_dict(_switched)
+                        if not _new_lbl:
+                            _new_lbl = _switched.get("text") or _switched.get("value") or "this option"
+                        _prev_lbl = _lead_type_display_label_from_value(_prev_lt, lead_types_list)
+                        try:
+                            _lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
+                                _switched.get("value"), context.get("lead_types", [])
+                            )
+                        except Exception:
+                            _lt_empathy = ""
+                        _lt_empathy = (_lt_empathy or "").strip()
+                        if _prev_lbl and _prev_lt.lower() != (_switched.get("value") or "").strip().lower():
+                            _switch_confirm_msg = (
+                                f"{_lt_empathy} I've switched you from **{_prev_lbl}** to **{_new_lbl}**."
+                                if _lt_empathy
+                                else f"Got it — switching from **{_prev_lbl}** to **{_new_lbl}**."
+                            )
+                        else:
+                            _switch_confirm_msg = (
+                                f"{_lt_empathy} I've updated your request to **{_new_lbl}**."
+                                if _lt_empathy
+                                else f"Got it — switched to **{_new_lbl}**."
+                            )
+                        _next_prompt = await response_generator.get_post_switch_prompt(
+                            flow_controller, conversation_history, context
+                        )
+                        reply = f"{_switch_confirm_msg}\n\n{_next_prompt}"
+                    else:
+                        # User declined — stay on current lead type and re-prompt current step
+                        _stay_label = _lead_type_display_label_from_value(
+                            _pls["previous_lead_type"], lead_types_list
+                        ) or _pls["previous_lead_type"]
+                        reply = f"No problem, continuing with **{_stay_label}**."
+                        _current_prompt = await response_generator._generate_state_response(
+                            flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                        )
+                        if _current_prompt:
+                            reply = f"{reply}\n\n{_current_prompt}"
+
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    continue
+                else:
+                    # User sent something unrelated — discard the pending switch and process normally
+                    pending_lead_switch = None
+
+            # Lead-type *switch* detection only when not in explicit lead-type selection
+            # (that path uses resolve_lead_type(..., LEAD_SELECTION) inside ResponseGenerator).
+            # MID_FLOW_SWITCH ignores plain digits and uses strict matching so workflow
+            # numeric answers are not mistaken for lead types.
+            switched_lead_type = None
+            if flow_controller.state != ConversationState.LEAD_TYPE_SELECTION:
+                switched_lead_type = resolve_lead_type(
+                    str(user_text), lead_types_list, LeadTypeResolutionMode.MID_FLOW_SWITCH
+                )
+
+            # Only treat as a mid-flow "switch" if we already had a lead type and we are past
+            # the greeting / initial lead menu (see _LEAD_TYPE_SWITCH_ALLOWED_STATES).
+            _existing_lt = (flow_controller.collected_data.get("leadType") or "").strip()
+            if (
+                switched_lead_type
+                and _existing_lt
+                and flow_controller.state in _LEAD_TYPE_SWITCH_ALLOWED_STATES
+                and _existing_lt.lower()
+                != (switched_lead_type.get("value") or "").strip().lower()
+            ):
+                # Ask for confirmation before switching — do not switch immediately.
+                _new_label = _lead_type_display_label_from_dict(switched_lead_type)
+                if not _new_label:
+                    _new_label = (
+                        switched_lead_type.get("text")
+                        or switched_lead_type.get("value")
+                        or "this option"
+                    )
+                _prev_label = _lead_type_display_label_from_value(_existing_lt, lead_types_list) or _existing_lt
+                pending_lead_switch = {
+                    "switched_lead_type": switched_lead_type,
+                    "previous_lead_type": _existing_lt,
+                }
+                _confirm_q = (
+                    f"Would you like to switch from **{_prev_label}** to **{_new_label}**?\n\n"
+                    f'<button value="yes">Yes, switch</button> '
+                    f'<button value="no">No, keep {_prev_label}</button>'
+                )
+                conversation_history.append({"role": "user", "content": user_text})
+                conversation_history.append({"role": "assistant", "content": _confirm_q})
+                await websocket.send_json({"type": "bot", "content": _confirm_q})
+                continue
+
+            # ── Side-question interjection ─────────────────────────────────────────────
+            # When a required step is pending and the user asks an in-industry question,
+            # answer via RAG/FAQ then re-prompt the exact pending step — without advancing
+            # state or writing any collected-data fields on this turn.
+            _INTERJECTION_STATES = {
+                ConversationState.SERVICE_SELECTION,
+                ConversationState.WORKFLOW_QUESTION,
+                ConversationState.NAME_COLLECTION,
+                ConversationState.EMAIL_COLLECTION,
+                ConversationState.PHONE_COLLECTION,
+                ConversationState.APPOINTMENT_OFFER,
+                ConversationState.CALENDAR_BOOKING,
+                ConversationState.APPOINTMENT_CONFIRMATION,
+            }
+            _Q_STARTERS = {
+                "what", "how", "why", "when", "where", "is", "does", "can", "do",
+                "are", "will", "would", "could", "should", "which", "who",
+                "tell", "explain", "describe",
+            }
+
+            def _looks_like_question(txt: str) -> bool:
+                t = (txt or "").strip()
+                if not t:
+                    return False
+                if t.endswith("?"):
+                    return True
+                first = t.lower().split()[0] if t.lower().split() else ""
+                return first in _Q_STARTERS
+
+            if (
+                flow_controller.state in _INTERJECTION_STATES
+                and not calendar_flow  # calendar flow has its own dedicated handler
+                and _looks_like_question(str(user_text))
+            ):
+                # Booking-intent interjections should route to calendar flow directly
+                # instead of generic FAQ text + redirection.
+                if _is_availability_intent(str(user_text)):
+                    if flow_controller.should_offer_booking_after_workflow():
+                        flow_controller.transition_to(ConversationState.CALENDAR_BOOKING)
+                        logger.info(
+                            "interjection_detected booking_intent=True routing_to_calendar state=%s",
+                            flow_controller.state.value,
+                        )
+                    else:
+                        logger.info(
+                            "interjection_detected booking_intent=True but booking disabled for non-booking workflow"
+                        )
+                else:
+                    _rag_answer: Optional[str] = None
+                    try:
+                        _rag_answer = await rag_service.answer_faq_question(
+                            str(user_text),
+                            profession=response_generator.profession,
+                            context_data=context,
+                        )
+                    except Exception as _rag_err:
+                        logger.warning("interjection RAG answer failed: %s", _rag_err)
+                    # Only intercept when we got a clean answer (not a JSON lead payload)
+                    if _rag_answer and not _looks_like_internal_lead_payload(_rag_answer):
+                        # Re-prompt deterministically to avoid LLM drift after an interjection.
+                        if flow_controller.state == ConversationState.WORKFLOW_QUESTION:
+                            _wm = flow_controller.workflow_manager
+                            _current_q = _wm.get_current_question() if _wm and _wm.is_active else None
+                            if _current_q:
+                                _pending_step = _wm.format_question_with_options(_current_q) or ""
+                            else:
+                                _pending_step = await response_generator._generate_state_response(
+                                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                                )
+                        elif flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                            if flow_controller.should_offer_booking_after_workflow():
+                                _pending_step = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
+                            else:
+                                _pending_step = "Thanks. How else can I help you today?"
+                        elif flow_controller.state == ConversationState.CALENDAR_BOOKING:
+                            _pending_step = "BOOK_APPOINTMENT_REQUESTED"
+                        else:
+                            _pending_step = await response_generator._generate_state_response(
+                                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                            )
+                        _interject_reply = f"{_rag_answer}\n\n---\n\n{_pending_step}"
+                        logger.info(
+                            "interjection_detected state=%s interjection_answered_from_rag=True interjection_resumed_state=%s",
+                            flow_controller.state.value, flow_controller.state.value
+                        )
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": _interject_reply})
+                        await websocket.send_json({"type": "bot", "content": _interject_reply})
+                        continue
+                    # No usable RAG answer → fall through to normal state-machine processing
+
+            # Strict personal-info-first guard:
+            # Once lead type is selected, enforce name -> email -> phone before
+            # service/workflow/booking states.
+            if flow_controller.collected_data.get("leadType") and flow_controller.state in (
+                ConversationState.SERVICE_SELECTION,
+                ConversationState.WORKFLOW_QUESTION,
+                ConversationState.APPOINTMENT_OFFER,
+                ConversationState.CALENDAR_BOOKING,
+                ConversationState.APPOINTMENT_CONFIRMATION,
+            ):
+                target_state = None
+                if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                    target_state = ConversationState.NAME_COLLECTION
+                elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                    target_state = ConversationState.EMAIL_COLLECTION
+                elif (
+                    flow_controller.capture_lead_phone
+                    and not flow_controller.skip_phone_collection
+                    and not flow_controller.collected_data.get("leadPhoneNumber")
+                ):
+                    target_state = ConversationState.PHONE_COLLECTION
+
+                if target_state is not None:
+                    flow_controller.transition_to(target_state)
+                    enforced_prompt = await response_generator._generate_state_response(
+                        flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                    )
+                    conversation_history.append({"role": "assistant", "content": enforced_prompt})
+                    await websocket.send_json({"type": "bot", "content": enforced_prompt})
+                    continue
+
+            # ── Calendar flow: show days/slots from connected calendar, allow booking ──
             if calendar_flow and app_id_for_calendar and str(user_text).strip():
-                from datetime import datetime
                 raw_lower = str(user_text).strip().lower()
                 if raw_lower in ("cancel", "back", "exit"):
                     calendar_flow = None
@@ -817,35 +2297,155 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     calendar_slots = []
                     calendar_free_slots = []
                     calendar_selected_day = None
+                    calendar_pending_slot = {}
                     reply = "Cancelled. How can I help?"
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     await websocket.send_json({"type": "bot", "content": reply})
                     continue
-                try:
-                    num = int(str(user_text).strip())
-                    if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
-                        slot = calendar_slots[num - 1]
-                        start_iso = slot.get("start", "")
-                        end_iso = slot.get("end", "")
-                        title = "Appointment"
-                        calendar_service = CalendarService(settings)
-                        book_result = await calendar_service.book_appointment(
-                            app_id_for_calendar, start_iso, end_iso, title
+                # ── Confirm step: user must explicitly confirm selected slot ──
+                if calendar_flow == "confirm" and calendar_pending_slot:
+                    confirm_text = str(user_text).strip().lower()
+                    if confirm_text not in {"confirm", "yes", "y", "book", "book now"}:
+                        reply = (
+                            "Please confirm your booking to continue.\n"
+                            "<button value=\"confirm\">Confirm booking</button> "
+                            "<button value=\"cancel\">Cancel</button>"
                         )
-                        calendar_flow = None
-                        calendar_days = []
-                        calendar_slots = []
-                        calendar_free_slots = []
-                        calendar_selected_day = None
-                        if book_result.get("success"):
-                            try:
-                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                                reply = f"Booked for {dt.strftime('%H:%M')}. You'll receive a confirmation."
-                            except Exception:
-                                reply = "Appointment booked. You'll receive a confirmation."
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        await websocket.send_json({"type": "bot", "content": reply})
+                        continue
+
+                    service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                    slot = calendar_pending_slot
+                    start_iso = slot.get("start", "")
+                    end_iso = slot.get("end", "")
+                    slot_timezone = slot.get("timezone")
+                    calendar_service = CalendarService(settings)
+                    customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                    customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                    customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                    _service_plans_ctx = context.get("service_plans", [])
+                    _post_booking_note_raw = _find_post_booking_note(_service_plans_ctx, service_title)
+                    _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
+                    book_result = await calendar_service.book_appointment(
+                        app_id_for_calendar, start_iso, end_iso, service_title,
+                        attendee_email=customer_email,
+                        time_zone=slot_timezone,
+                        customer_name=customer_name,
+                        customer_phone=customer_phone,
+                        lead_id=lead_id,
+                        post_booking_note=_post_booking_note_raw,
+                    )
+                    calendar_flow = None
+                    calendar_days = []
+                    calendar_slots = []
+                    calendar_free_slots = []
+                    calendar_selected_day = None
+                    calendar_pending_slot = {}
+                    if book_result.get("success"):
+                        _display_tz = integration.get("calendarTimezone") or slot_timezone or "UTC"
+                        flow_controller.update_collected_data("appointmentSlot", {
+                            "start": start_iso,
+                            "end": end_iso,
+                            "timezone": _display_tz,
+                            "serviceType": service_title,
+                        })
+                        _bk_start = _format_slot_time_local(start_iso, _display_tz)
+                        _bk_end = _format_slot_time_local(end_iso, _display_tz)
+                        try:
+                            from zoneinfo import ZoneInfo
+                            _bk_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(_display_tz))
+                            _bk_date = _bk_dt.strftime("%a %d/%m/%Y")
+                        except Exception:
+                            _bk_date = start_iso[:10]
+                        time_str = f"{_bk_date}, {_bk_start} – {_bk_end}"
+                        reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
+                        if _post_booking_note_chat:
+                            reply += f"\n\n📋 **Important Instructions**\n{_post_booking_note_chat}"
+                        _review_url_inline = _integration_google_review_url(integration)
+                        if _review_url_inline and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
+                        # Booking confirmation is the terminal step for this lead cycle.
+                        try:
+                            if lead_id:
+                                full_history = conversation_history + [
+                                    {"role": "user", "content": user_text},
+                                    {"role": "assistant", "content": reply},
+                                ]
+                                customer_name = flow_controller.collected_data.get("leadName") or "Customer"
+                                lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                                appointment_details = {
+                                    "eventId": book_result.get("eventId"),
+                                    "start": book_result.get("start") or start_iso,
+                                    "end": book_result.get("end") or end_iso,
+                                    "link": book_result.get("link"),
+                                    "confirmed": True,
+                                }
+                                completion_payload = {
+                                    "status": "confirmed",
+                                    "title": f"{service_title} – {customer_name}",
+                                    "serviceType": flow_controller.collected_data.get("serviceType"),
+                                    "leadType": flow_controller.collected_data.get("leadType"),
+                                    "leadName": flow_controller.collected_data.get("leadName"),
+                                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                                    "appointmentDetails": appointment_details,
+                                    "summary": f"{customer_name} booked a {service_title} appointment for {time_str}.",
+                                    "description": f"{customer_name} ({lead_type_val}) booked {service_title}. Appointment confirmed at {time_str}.",
+                                    "history": full_history,
+                                }
+                                await lead_service.update_lead(user_id, lead_id, completion_payload)
+                        except Exception as completion_exc:
+                            logger.warning("Lead completion update after booking failed: %s", completion_exc)
+                    else:
+                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    await websocket.send_json({"type": "bot", "content": reply})
+                    if book_result.get("success"):
+                        if _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            feedback_prompt = _feedback_prompt_message()
+                            feedback_collection_active = True
+                            feedback_data = {}
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            await websocket.send_json({"type": "bot", "content": feedback_prompt})
                         else:
-                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                            await websocket.send_json({"type": "session_complete"})
+                            widget_session_complete = True
+                            if resume_key:
+                                WIDGET_CHAT_RESUME.pop(resume_key, None)
+                    continue
+                try:
+                    num = _extract_index_choice(str(user_text))
+                    if num is None:
+                        raise ValueError("No numeric choice parsed")
+                    if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
+                        # Save selected slot and ask user to confirm booking
+                        slot = calendar_slots[num - 1]
+                        calendar_pending_slot = slot
+                        calendar_flow = "confirm"
+                        _confirm_tz = integration.get("calendarTimezone") or "UTC"
+                        t_start = _format_slot_time_local(slot.get("start", ""), _confirm_tz)
+                        t_end = _format_slot_time_local(slot.get("end", ""), _confirm_tz)
+                        try:
+                            from zoneinfo import ZoneInfo
+                            _dt_local = datetime.fromisoformat(slot.get("start", "").replace("Z", "+00:00")).astimezone(ZoneInfo(_confirm_tz))
+                            _date_label = _dt_local.strftime("%a %d/%m/%Y")
+                        except Exception:
+                            _date_label = slot.get("start", "")[:10]
+                        selected_service = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                        reply = (
+                            f"📋 Booking Summary\n"
+                            f"──────────────────\n"
+                            f"Service:  {selected_service}\n"
+                            f"Date:     {_date_label}\n"
+                            f"Time:     🕒 {t_start} – {t_end}\n\n"
+                            "Please confirm your booking:\n"
+                            "<button value=\"confirm\">Confirm booking</button> "
+                            "<button value=\"cancel\">Cancel</button>"
+                        )
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
                         await websocket.send_json({"type": "bot", "content": reply})
@@ -853,25 +2453,35 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if calendar_flow == "days" and 1 <= num <= len(calendar_days):
                         day_info = calendar_days[num - 1]
                         selected_date = day_info.get("date", "")
+                        _cal_tz_filter = integration.get("calendarTimezone") or "UTC"
+                        _now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                        def _slot_local_date(s: Dict[str, Any], tz: str) -> str:
+                            try:
+                                from zoneinfo import ZoneInfo
+                                dt_u = datetime.fromisoformat((s.get("start") or "").replace("Z", "+00:00"))
+                                return dt_u.astimezone(ZoneInfo(tz)).strftime("%Y-%m-%d")
+                            except Exception:
+                                return (s.get("start") or "")[:10]
                         slots_for_day = [
                             s for s in calendar_free_slots
-                            if (s.get("start") or "")[:10] == selected_date
+                            if _slot_local_date(s, _cal_tz_filter) == selected_date
+                            and datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc
                         ]
                         calendar_flow = "slots"
                         calendar_slots = slots_for_day
                         calendar_selected_day = selected_date
+                        slot_tz = integration.get("calendarTimezone") or (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        tz_label = _get_tz_label(slot_tz)
                         lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        lines.append(f"🌐 All times shown in {tz_label}")
+                        lines.append("Choose a time slot:")
                         for i, s in enumerate(slots_for_day[:15], 1):
                             start = s.get("start", "")
                             end = s.get("end", "")
                             if start and end:
-                                try:
-                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                    lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
-                                except Exception:
-                                    lines.append(f"{i}. {start}–{end}")
-                        lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                t_start = _format_slot_time_local(start, slot_tz)
+                                t_end = _format_slot_time_local(end, slot_tz)
+                                lines.append(f"<button value=\"{i}\">🕒 {i}. {t_start}–{t_end}</button>")
                         reply = "\n".join(lines)
                         conversation_history.append({"role": "user", "content": user_text})
                         conversation_history.append({"role": "assistant", "content": reply})
@@ -880,13 +2490,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 except ValueError:
                     pass
 
-            # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-            if app_id_for_calendar and _is_availability_intent(str(user_text)):
-                from datetime import datetime, timedelta
-                now = datetime.utcnow()
-                from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-                to_dt = now + timedelta(days=7)
-                to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+            # Calendar availability shortcut should only run in booking-related states.
+            # This prevents premature date/time prompts before personal info/service/workflow steps.
+            if (
+                app_id_for_calendar
+                and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+                and _is_availability_intent(str(user_text))
+            ):
+                from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
                 slot_minutes = integration.get("calendarSlotMinutes", 30)
                 if slot_minutes not in (15, 30, 60):
                     slot_minutes = 30
@@ -898,25 +2509,40 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     if result.get("error"):
                         reply = "I couldn't fetch availability right now. Please try again later."
                     else:
-                        free_slots = result.get("freeSlots") or []
+                        cal_tz_fc = _calendar_tz_from_integration(integration)
+                        _now_utc_sc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                        free_slots = [
+                            s for s in (result.get("freeSlots") or [])
+                            if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_sc
+                        ]
+                        free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_fc)
                         if not free_slots:
                             if not result.get("calendarConnected"):
                                 reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
                             else:
                                 reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
                         else:
+                            cal_tz = integration.get("calendarTimezone") or "UTC"
                             by_date: Dict[str, List[Dict[str, Any]]] = {}
                             for slot in free_slots:
                                 start = slot.get("start") or ""
-                                date_key = start[:10] if len(start) >= 10 else ""
-                                if date_key:
-                                    by_date.setdefault(date_key, []).append(slot)
+                                if not start:
+                                    continue
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_local = dt_utc.astimezone(ZoneInfo(cal_tz))
+                                    date_key = dt_local.strftime("%Y-%m-%d")
+                                except Exception:
+                                    date_key = start[:10]
+                                by_date.setdefault(date_key, []).append(slot)
                             days_order = sorted(by_date.keys())
                             calendar_days_list = []
                             for d in days_order:
                                 try:
-                                    dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                    from zoneinfo import ZoneInfo
+                                    dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
+                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                                 except Exception:
                                     calendar_days_list.append({"date": d, "label": d})
                             calendar_flow = "days"
@@ -926,10 +2552,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             calendar_selected_day = None
                             max_days = 14
                             show_days = calendar_days_list[:max_days]
-                            lines = ["Pick a day (reply with the number):"]
+                            service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                            if service_title:
+                                intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                            else:
+                                intro = "Here are the available dates for your appointment. Please choose a day:"
+                            lines = [intro]
                             for i, day in enumerate(show_days, 1):
-                                lines.append(f"{i}. {day['label']}")
-                            lines.append("Then I'll show you available times for that day.")
+                                lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
                             reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -971,7 +2601,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     customer_name = flow_controller.collected_data.get("leadName", "Customer")
                     if email:
                         ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
-                        reply = get_string("otp_resend", lang_code, email) if ok else get_string("otp_resend_fail_email", lang_code)
+                        if ok:
+                            reply = get_string("otp_resend", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_email", lang_code)
                     conversation_history.append({"role": "assistant", "content": reply})
@@ -993,7 +2628,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if ok:
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = get_string("perfect_otp_sent_email", lang_code, email) if ok else get_string("found_email_cant_send", lang_code)
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -1011,9 +2650,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             if ok:
                                 flow_controller.otp_state["email_verified"] = True
                                 flow_controller.transition_to(flow_controller.get_next_state())
-                                # Get AI response to continue
+                                # Get AI response to continue (empty string so PHONE_COLLECTION
+                                # generates a proper prompt instead of a validation error)
                                 reply = await response_generator.generate_response(
-                                    flow_controller, "Email verified", conversation_history, context
+                                    flow_controller, "", conversation_history, context
                                 )
                             else:
                                 reply = get_string("otp_wrong_code", lang_code)
@@ -1053,7 +2693,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     final_msg = get_string("final_fallback", lang_code)
                                 
                                 integration = context.get("integration") or {}
-                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     review_url_ws = integration["googleReviewUrl"].strip()
                                     await websocket.send_json({
                                         "type": "review_prompt",
@@ -1105,7 +2745,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     reply = get_string("otp_sent_email", lang_code, email)
                 else:
-                    reply = get_string("otp_send_fail_email", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1134,7 +2776,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     reply = get_string("otp_sent_phone", lang_code, phone)
                 else:
-                    reply = get_string("otp_send_fail_phone", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1155,7 +2799,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     reply = get_string("otp_sent_email", lang_code, email)
                 else:
-                    reply = get_string("otp_send_fail_email", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1176,7 +2822,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     reply = get_string("otp_sent_phone", lang_code, phone)
                 else:
-                    reply = get_string("otp_send_fail_phone", lang_code)
+                    reply = await _continue_after_otp_delivery_failed(
+                        flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                    )
                 
                 conversation_history.append({"role": "assistant", "content": reply})
                 await websocket.send_json({"type": "bot", "content": reply})
@@ -1190,7 +2838,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     phone = flow_controller.collected_data.get("leadPhoneNumber")
                     if phone:
                         ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
-                        reply = get_string("otp_resend", lang_code, phone) if ok else get_string("otp_resend_fail_phone", lang_code)
+                        if ok:
+                            reply = get_string("otp_resend", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                            )
                     else:
                         reply = get_string("no_phone", lang_code)
                     
@@ -1204,7 +2857,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     customer_name = flow_controller.collected_data.get("leadName", "Customer")
                     if email:
                         ok, _ = await email_validation_service.send_otp_email(user_id, email, customer_name)
-                        reply = get_string("otp_resend", lang_code, email) if ok else get_string("otp_resend_fail_email", lang_code)
+                        if ok:
+                            reply = get_string("otp_resend", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_email", lang_code)
                     
@@ -1228,7 +2886,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if ok:
                             flow_controller.otp_state["phone_sent"] = True
                             flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                        reply = get_string("perfect_otp_sent_phone", lang_code, phone) if ok else get_string("found_phone_cant_send", lang_code)
+                            reply = get_string("perfect_otp_sent_phone", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "phone"
+                            )
                     else:
                         reply = get_string("no_problem_phone", lang_code)
                         flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -1253,7 +2915,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if ok:
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = get_string("perfect_otp_sent_email", lang_code, email) if ok else get_string("found_email_cant_send", lang_code)
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed(
+                                flow_controller, response_generator, conversation_history, context, lang_code, "email"
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -1263,20 +2929,88 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     continue
             
             # Check if JSON was generated (all data collected)
+            if str(reply).strip() == "BOOK_APPOINTMENT_REQUESTED":
+                from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
+                slot_minutes = integration.get("calendarSlotMinutes", 30)
+                if slot_minutes not in (15, 30, 60):
+                    slot_minutes = 30
+                try:
+                    calendar_service = CalendarService(settings)
+                    result = await calendar_service.get_availability(
+                        app_id_for_calendar, from_date, to_date, slot_minutes=slot_minutes
+                    )
+                    if result.get("error"):
+                        reply = "I couldn't fetch availability right now. Please try again later."
+                    else:
+                        cal_tz_fc = _calendar_tz_from_integration(integration)
+                        _now_utc_bk = datetime.utcnow().replace(tzinfo=timezone.utc)
+                        free_slots = [
+                            s for s in (result.get("freeSlots") or [])
+                            if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_bk
+                        ]
+                        free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_fc)
+                        if not free_slots:
+                            reply = "I don't have any free slots in the next 7 days. You can ask for a different period or contact us directly."
+                        else:
+                            cal_tz = integration.get("calendarTimezone") or "UTC"
+                            by_date: Dict[str, List[Dict[str, Any]]] = {}
+                            for slot in free_slots:
+                                start = slot.get("start") or ""
+                                if not start:
+                                    continue
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_local = dt_utc.astimezone(ZoneInfo(cal_tz))
+                                    date_key = dt_local.strftime("%Y-%m-%d")
+                                except Exception:
+                                    date_key = start[:10]
+                                by_date.setdefault(date_key, []).append(slot)
+                            days_order = sorted(by_date.keys())
+                            calendar_days_list = []
+                            for d in days_order:
+                                try:
+                                    from zoneinfo import ZoneInfo
+                                    dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz))
+                                    calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
+                                except Exception:
+                                    calendar_days_list.append({"date": d, "label": d})
+                            calendar_flow = "days"
+                            calendar_days = calendar_days_list
+                            calendar_free_slots = free_slots
+                            calendar_slots = []
+                            calendar_selected_day = None
+                            service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                            if service_title:
+                                intro = f"Great! Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                            else:
+                                intro = "Great! Here are the available dates for your appointment. Please choose a day:"
+                            lines = [intro]
+                            for i, day in enumerate(calendar_days_list[:14], 1):
+                                lines.append(f"<button value=\"{i}\">📅 {i}. {day['label']}</button>")
+                            reply = "\n".join(lines)
+                except Exception as cal_exc:
+                    logger.exception("WebSocket: Calendar availability error: %s", cal_exc)
+                    reply = "I couldn't fetch availability right now. Please try again later."
+
             parsed_json = _maybe_parse_json(reply)
             if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
                 # Add appId if available (for app-scoped leads)
                 if app_id:
                     parsed_json["appId"] = app_id
-                # Create lead
+                # Update existing interaction lead if available, otherwise create a new lead
                 try:
-                    ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                    if lead_id:
+                        parsed_json["status"] = "complete"
+                        ok, _ = await lead_service.update_lead(user_id, lead_id, parsed_json)
+                    else:
+                        ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
                     final_msg = get_string("final_success", lang_code) if ok else get_string("final_fallback", lang_code)
                 except Exception:
                     final_msg = get_string("final_fallback", lang_code)
                 
                 integration = context.get("integration") or {}
-                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                     review_url = integration["googleReviewUrl"].strip()
                     await websocket.send_json({
                         "type": "review_prompt",
@@ -1284,15 +3018,67 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "reviewUrl": review_url,
                     })
                 await websocket.send_json({"type": "bot", "content": final_msg})
-                await websocket.close(code=1000)
-                break
+                conversation_history.append({"role": "assistant", "content": final_msg})
+                if _capture_feedback_enabled(context) and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                    feedback_prompt = _feedback_prompt_message()
+                    feedback_collection_active = True
+                    feedback_data = {}
+                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                    await websocket.send_json({"type": "bot", "content": feedback_prompt})
+                else:
+                    # Non-booking path: all required data collected.
+                    await websocket.send_json({"type": "session_complete"})
+                    widget_session_complete = True
+                    if resume_key:
+                        WIDGET_CHAT_RESUME.pop(resume_key, None)
+                continue
+
+            # Hard safety guard: never expose internal JSON/payloads in chat bubbles.
+            if _looks_like_internal_lead_payload(reply):
+                logger.error("Blocked internal payload from being sent to user chat (user_id=%s)", user_id)
+                graceful_msg = get_string("final_fallback", lang_code)
+                conversation_history.append({"role": "assistant", "content": graceful_msg})
+                await websocket.send_json({"type": "bot", "content": graceful_msg})
+                await websocket.send_json({"type": "session_complete"})
+                widget_session_complete = True
+                if resume_key:
+                    WIDGET_CHAT_RESUME.pop(resume_key, None)
+                continue
             
-            # Regular conversation response
+            # Regular conversation response — send the bot reply before PATCHing the lead so
+            # the client is not left idle during slow HTTP to the CRM API (avoids 1006 / user bounce).
             conversation_history.append({"role": "assistant", "content": reply})
-            await websocket.send_json({"type": "bot", "content": reply})
-            # Signal the frontend to show the file upload button if the bot is requesting a file
-            if _bot_requests_file_upload(reply):
-                await websocket.send_json({"type": "enable_file_upload"})
+            try:
+                await websocket.send_json({"type": "bot", "content": reply})
+                if _bot_requests_file_upload(reply):
+                    await websocket.send_json({"type": "enable_file_upload"})
+            except WebSocketDisconnect:
+                raise
+            except RuntimeError as send_exc:
+                if "send" in str(send_exc).lower() and "close" in str(send_exc).lower():
+                    logger.info(
+                        "Client socket closed before bot reply could be sent (user_id=%s)",
+                        user_id,
+                    )
+                    raise WebSocketDisconnect from send_exc
+                raise
+            # Progressive lead sync after the user-visible message
+            if lead_id:
+                snapshot = {
+                    "leadType": flow_controller.collected_data.get("leadType"),
+                    "serviceType": flow_controller.collected_data.get("serviceType"),
+                    "leadName": flow_controller.collected_data.get("leadName"),
+                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                    "leadTypeSwitchHistory": flow_controller.collected_data.get("leadTypeSwitchHistory"),
+                    "status": "in_progress"
+                }
+                if snapshot != last_snapshot:
+                    try:
+                        await lead_service.update_lead(user_id, lead_id, snapshot)
+                        last_snapshot = dict(snapshot)
+                    except Exception as sync_exc:
+                        logger.warning("Lead progressive update failed: %s", sync_exc)
             
             # State transitions are handled in response_generator
             # Only update if we're still in the same state (no transition happened)
@@ -1310,6 +3096,36 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "content": "An unexpected error occurred. Please try again."})
         except Exception:
             pass
+    finally:
+        if (
+            resume_key
+            and app_id
+            and fetch_by_app
+            and not widget_session_complete
+            and flow_controller.state != ConversationState.COMPLETE
+        ):
+            try:
+                WIDGET_CHAT_RESUME[resume_key] = {
+                    "saved_at": time.time(),
+                    "app_id": app_id,
+                    "terminal": False,
+                    "conversation_history": conversation_history[-50:],
+                    "calendar_flow": calendar_flow,
+                    "calendar_days": calendar_days,
+                    "calendar_slots": calendar_slots,
+                    "calendar_free_slots": calendar_free_slots,
+                    "calendar_selected_day": calendar_selected_day,
+                    "calendar_pending_slot": calendar_pending_slot,
+                    "user_timezone": user_timezone,
+                    "feedback_collection_active": feedback_collection_active,
+                    "feedback_data": feedback_data,
+                    "flow": _snapshot_flow_controller_for_resume(flow_controller),
+                    "lead_id": lead_id,
+                    "pending_lead_switch": pending_lead_switch,
+                }
+                _prune_widget_resume_store()
+            except Exception:
+                pass
 
 
 @app.post("/webhook/voice-agent")
@@ -1506,6 +3322,10 @@ async def whatsapp_webhook(request: Request):
             except Exception as exc:
                 logger.exception("Failed to fetch user context for Twilio number %s: %s", twilio_phone, exc)
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I'm having trouble accessing your information. Please try again later."), media_type="text/xml")
+
+            runtime_twilio_sid = str(context.get("twilioAccountSid") or "").strip() or None
+            runtime_twilio_token = str(context.get("twilioAuthToken") or "").strip() or None
+            whatsapp_service.set_runtime_credentials(runtime_twilio_sid, runtime_twilio_token)
             
             # Extract user_id and app_id from context for lead creation
             user_data = context.get("user", {})
@@ -1525,6 +3345,20 @@ async def whatsapp_webhook(request: Request):
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I couldn't identify your account. Please contact support."), media_type="text/xml")
             
             logger.info(f"WhatsApp: Using user_id '{user_id}' and app_id '{app_id}' for Twilio number {twilio_phone}")
+
+            allowed, block_message = await _consume_channel_limit_or_block(
+                lead_service=lead_service,
+                app_id=app_id,
+                channel="whatsapp",
+                idempotency_key=f"whatsapp-{session_id}",
+            )
+            if not allowed:
+                return Response(
+                    content=whatsapp_service.create_twiml_response(
+                        block_message or "Service is temporarily unavailable. Please try again later."
+                    ),
+                    media_type="text/xml"
+                )
             
             # Initialize new session state
             current_time = time.time()
@@ -1546,6 +3380,8 @@ async def whatsapp_webhook(request: Request):
                 "context": context,
                 "user_id": user_id,
                 "app_id": app_id,  # Store app_id for lead creation
+                "twilio_account_sid": runtime_twilio_sid,
+                "twilio_auth_token": runtime_twilio_token,
                 "created_at": current_time,
                 "last_activity": current_time,
                 "is_whatsapp": True  # Flag to identify WhatsApp conversations
@@ -1561,6 +3397,7 @@ async def whatsapp_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
+            flow_controller.update_collected_data("sourceChannel", "whatsapp")
             
             # First message from user (e.g. "السلام علیکم") – detect language and greet in that language
             first_message = (message_data.get("body") or "").strip()
@@ -1585,9 +3422,18 @@ async def whatsapp_webhook(request: Request):
             # Extract buttons and send
             cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
             if buttons:
-                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
-                await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                choice_map = {f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)}
+                choice_map.update({f"button_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)})
+                whatsapp_sessions[session_id]["last_whatsapp_choice_map"] = choice_map
+                _is_initial_multi = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=_is_initial_multi)
+                if len(buttons) <= 3 and not _is_initial_multi:
+                    _wa_btns = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
+                    _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, full_message, _wa_btns, from_phone=twilio_phone)
+                    if not _ok:
+                        await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                else:
+                    await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             else:
                 await whatsapp_service.send_message(user_phone, initial_reply, from_phone=twilio_phone)
             
@@ -1602,6 +3448,15 @@ async def whatsapp_webhook(request: Request):
         user_id = session["user_id"]
         app_id = session.get("app_id")  # Get app_id for lead creation
         twilio_phone = session.get("twilio_phone", twilio_phone)  # Get app's Twilio number from session
+        runtime_twilio_sid = str(session.get("twilio_account_sid") or context.get("twilioAccountSid") or "").strip() or None
+        runtime_twilio_token = str(session.get("twilio_auth_token") or context.get("twilioAuthToken") or "").strip() or None
+        whatsapp_service.set_runtime_credentials(runtime_twilio_sid, runtime_twilio_token)
+        session["twilio_account_sid"] = runtime_twilio_sid
+        session["twilio_auth_token"] = runtime_twilio_token
+        email_validation_service.set_branding_context(
+            app_id=str(app_id or "").strip() or None,
+            company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
+        )
         
         # Get flow controller and response generator from session (or create if missing)
         flow_controller = session.get("flow_controller")
@@ -1616,37 +3471,96 @@ async def whatsapp_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("whatsapp")
+            flow_controller.update_collected_data("sourceChannel", "whatsapp")
             session["flow_controller"] = flow_controller
             session["response_generator"] = response_generator
         
         # Handle button/list responses
         user_text = message_data.get("body", "")
-        button_id = message_data.get("button_id", "")
-        list_id = message_data.get("list_id", "")
-        
-        if button_id:
-            # Handle button response
-            user_text = button_id
-        elif list_id:
-            # Handle list response
-            user_text = list_id
+        user_text = _normalize_whatsapp_interactive_selection(
+            raw_text=user_text,
+            message_data=message_data,
+            flow_controller=flow_controller,
+            session=session,
+        )
+
+        if session.get("feedback_collection_active"):
+            user_raw = str(user_text or "").strip()
+            if user_raw:
+                conversation_history.append({"role": "user", "content": user_raw})
+            feedback_data = dict(session.get("feedback_data") or {})
+            exp, rating = _extract_feedback_submission(user_raw)
+            if exp:
+                feedback_data["experience"] = exp
+            if rating:
+                feedback_data["rating"] = rating
+            if feedback_data.get("experience") and feedback_data.get("rating"):
+                lead_id_for_feedback = str(session.get("feedback_lead_id") or "").strip()
+                saved = False
+                if lead_id_for_feedback:
+                    try:
+                        payload = {
+                            "userFeedback": {
+                                "experience": feedback_data.get("experience"),
+                                "rating": feedback_data.get("rating"),
+                                "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                            }
+                        }
+                        saved, _ = await lead_service.update_lead(user_id, lead_id_for_feedback, payload)
+                    except Exception as feedback_exc:
+                        logger.warning("WhatsApp feedback save failed: %s", feedback_exc)
+                thanks = "Thank you for your feedback!"
+                if not saved and lead_id_for_feedback:
+                    thanks = "Thank you for your feedback! We could not save it right now."
+                conversation_history.append({"role": "assistant", "content": thanks})
+                await whatsapp_service.send_message(user_phone, thanks, from_phone=twilio_phone)
+                del whatsapp_sessions[session_id]
+                if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
+                    del phone_to_session[user_phone]
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            missing_parts: List[str] = []
+            if not feedback_data.get("experience"):
+                missing_parts.append("experience")
+            if not feedback_data.get("rating"):
+                missing_parts.append("rating (1-5)")
+            followup = (
+                "Thanks! Please also share your "
+                + " and ".join(missing_parts)
+                + ".\n"
+                + _feedback_prompt_message()
+            )
+            session["feedback_data"] = feedback_data
+            conversation_history.append({"role": "assistant", "content": followup})
+            await whatsapp_service.send_message(user_phone, followup, from_phone=twilio_phone)
+            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Convert numbered responses to actual values for better context
         enhanced_user_text = user_text
+        normalized_workflow_text = _normalize_workflow_choice_input(user_text, flow_controller)
+        if normalized_workflow_text:
+            enhanced_user_text = normalized_workflow_text
+            logger.info("WhatsApp: normalized workflow input '%s' -> '%s'", user_text, enhanced_user_text)
+
         if user_text.strip().isdigit():
             number = int(user_text.strip())
             
-            # Check conversation history to determine what type of selection this is
-            # Look at the conversation flow to determine context
-            
-            # Check if we have a lead type selected (look for leadType in recent messages)
-            has_lead_type = any("leadType:" in msg.get("content", "") for msg in conversation_history[-3:] if msg.get("role") == "user")
-            
-            # Check if we have a service selected (look for service mentions in recent messages) 
-            has_service = any(any(keyword in msg.get("content", "").lower() for keyword in ["cosmetic", "general", "dentistry", "treatment"]) 
-                            for msg in conversation_history[-3:] if msg.get("role") == "user")
-            
-            logger.info(f"WhatsApp: Selection context - has_lead_type: {has_lead_type}, has_service: {has_service}")
+            # Determine selection context from stateful collected data (industry-agnostic).
+            # This is more reliable than keyword checks in prior user messages.
+            has_lead_type = bool(flow_controller.collected_data.get("leadType"))
+            has_service = bool(flow_controller.collected_data.get("serviceType"))
+
+            # Backward-safe fallback for older sessions where leadType marker was embedded in history.
+            if not has_lead_type:
+                has_lead_type = any(
+                    "leadType:" in msg.get("content", "")
+                    for msg in conversation_history[-3:]
+                    if msg.get("role") == "user"
+                )
+
+            logger.info(
+                f"WhatsApp: Selection context - state={flow_controller.state.value}, "
+                f"has_lead_type={has_lead_type}, has_service={has_service}"
+            )
             
             if not has_lead_type:
                 # First selection - must be lead type
@@ -1663,7 +3577,7 @@ async def whatsapp_webhook(request: Request):
             elif has_lead_type and not has_service:
                 # Second selection - must be service plan
                 # Use the SAME filtered list shown to the user (by lead type's relevantServicePlans)
-                service_plans = context.get("service_plans", context.get("treatment_plans", []))
+                service_plans = context.get("service_plans", [])
                 lead_types = context.get("lead_types", [])
                 collected_lead_type = flow_controller.collected_data.get("leadType")
                 filtered_names = ResponseGenerator._filter_services_by_lead_type(
@@ -1703,6 +3617,139 @@ async def whatsapp_webhook(request: Request):
                     logger.info(f"WhatsApp: In WORKFLOW_QUESTION state but workflow manager not active")
             else:
                 logger.info(f"WhatsApp: Number {number} - context unclear, treating as raw input")
+
+        # Global lead-type switch interrupt (parity with webchat):
+        # if user selects a different lead type mid-flow, reset branch context and continue.
+        lead_types_list = context.get("lead_types", [])
+        switched_lead_type = None
+        if flow_controller.state != ConversationState.LEAD_TYPE_SELECTION:
+            switched_lead_type = resolve_lead_type(
+                str(enhanced_user_text), lead_types_list, LeadTypeResolutionMode.MID_FLOW_SWITCH
+            )
+        existing_lt = (flow_controller.collected_data.get("leadType") or "").strip()
+        if (
+            switched_lead_type
+            and existing_lt
+            and flow_controller.state in _LEAD_TYPE_SWITCH_ALLOWED_STATES
+            and existing_lt.lower()
+            != (switched_lead_type.get("value") or "").strip().lower()
+        ):
+            previous_lead_type = flow_controller.collected_data.get("leadType")
+            # Reset ongoing calendar branch in session.
+            session["calendar_flow"] = None
+            session["calendar_days"] = None
+            session["calendar_slots"] = None
+            session["calendar_free_slots"] = None
+            session["calendar_selected_day"] = None
+            session["calendar_pending_slot"] = None
+
+            if flow_controller.workflow_manager:
+                flow_controller.workflow_manager.reset()
+            flow_controller.update_collected_data("leadType", switched_lead_type.get("value"))
+            flow_controller.update_collected_data("serviceType", None)
+            flow_controller.update_collected_data("workflowAnswers", {})
+            flow_controller.update_collected_data("appointmentSlot", None)
+
+            existing_switch_history = flow_controller.collected_data.get("leadTypeSwitchHistory") or []
+            switch_history = list(existing_switch_history) if isinstance(existing_switch_history, list) else []
+            switch_history.append({
+                "from": previous_lead_type,
+                "to": switched_lead_type.get("value"),
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            flow_controller.update_collected_data("leadTypeSwitchHistory", switch_history)
+
+            if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                flow_controller.transition_to(ConversationState.NAME_COLLECTION)
+            elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
+            elif (
+                flow_controller.capture_lead_phone
+                and not flow_controller.skip_phone_collection
+                and not flow_controller.collected_data.get("leadPhoneNumber")
+            ):
+                flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
+            else:
+                if flow_controller.is_booking_lead_type():
+                    flow_controller.transition_to(ConversationState.SERVICE_SELECTION)
+                else:
+                    flow_controller.transition_to(ConversationState.WORKFLOW_QUESTION)
+
+            new_label = _lead_type_display_label_from_dict(switched_lead_type)
+            if not new_label:
+                new_label = (
+                    switched_lead_type.get("text")
+                    or switched_lead_type.get("value")
+                    or "this option"
+                )
+            prev_label = _lead_type_display_label_from_value(previous_lead_type, lead_types_list)
+            prev_val = str(previous_lead_type or "").strip().lower()
+            new_val = str(switched_lead_type.get("value") or "").strip().lower()
+            try:
+                lt_empathy = await response_generator._generate_empathy_prefix_for_lead_type(
+                    switched_lead_type.get("value"), context.get("lead_types", [])
+                )
+            except Exception:
+                lt_empathy = ""
+            lt_empathy = (lt_empathy or "").strip()
+            if prev_label and prev_val and prev_val != new_val:
+                switch_msg = (
+                    f"{lt_empathy} I've switched you from **{prev_label}** to **{new_label}**."
+                    if lt_empathy
+                    else f"Got it — switching from **{prev_label}** to **{new_label}**."
+                )
+            else:
+                switch_msg = (
+                    f"{lt_empathy} I've updated your request to **{new_label}**."
+                    if lt_empathy
+                    else f"Got it — switched to **{new_label}**."
+                )
+            next_prompt = await response_generator._generate_state_response(
+                flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+            )
+            next_prompt = await _expand_booking_request_reply_for_social_channel(
+                next_prompt,
+                context.get("integration") or {},
+                app_id,
+                flow_controller,
+                session,
+            )
+            reply = f"{switch_msg}\n\n{next_prompt}"
+            conversation_history.append({"role": "user", "content": enhanced_user_text})
+            conversation_history.append({"role": "assistant", "content": reply})
+            whatsapp_sessions[session_id]["history"] = conversation_history
+            await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
+        # Strict personal-info-first guard (parity with webchat).
+        if flow_controller.collected_data.get("leadType") and flow_controller.state in (
+            ConversationState.SERVICE_SELECTION,
+            ConversationState.WORKFLOW_QUESTION,
+            ConversationState.APPOINTMENT_OFFER,
+            ConversationState.CALENDAR_BOOKING,
+            ConversationState.APPOINTMENT_CONFIRMATION,
+        ):
+            target_state = None
+            if flow_controller.capture_lead_name and not flow_controller.collected_data.get("leadName"):
+                target_state = ConversationState.NAME_COLLECTION
+            elif flow_controller.capture_lead_email and not flow_controller.collected_data.get("leadEmail"):
+                target_state = ConversationState.EMAIL_COLLECTION
+            elif (
+                flow_controller.capture_lead_phone
+                and not flow_controller.skip_phone_collection
+                and not flow_controller.collected_data.get("leadPhoneNumber")
+            ):
+                target_state = ConversationState.PHONE_COLLECTION
+            if target_state is not None:
+                flow_controller.transition_to(target_state)
+                enforced_prompt = await response_generator._generate_state_response(
+                    flow_controller.state, "", conversation_history, context, flow_controller=flow_controller
+                )
+                conversation_history.append({"role": "user", "content": enhanced_user_text})
+                conversation_history.append({"role": "assistant", "content": enforced_prompt})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, enforced_prompt, from_phone=twilio_phone)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
@@ -1711,7 +3758,6 @@ async def whatsapp_webhook(request: Request):
 
         # Calendar flow: user already in day/slot selection; handle numeric reply or cancel
         if calendar_flow and app_id and user_text.strip():
-            from datetime import datetime
             raw_lower = user_text.strip().lower()
             if raw_lower in ("cancel", "back", "exit"):
                 session["calendar_flow"] = None
@@ -1719,76 +3765,319 @@ async def whatsapp_webhook(request: Request):
                 session["calendar_slots"] = None
                 session["calendar_free_slots"] = None
                 session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
                 reply = "Cancelled. How can I help?"
                 conversation_history.append({"role": "user", "content": user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 whatsapp_sessions[session_id]["history"] = conversation_history
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
-            try:
-                num = int(user_text.strip())
-                if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
-                    slot = calendar_slots[num - 1]
-                    start_iso = slot.get("start", "")
-                    end_iso = slot.get("end", "")
-                    title = "Appointment"
-                    calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
-                    session["calendar_flow"] = None
-                    session["calendar_days"] = None
-                    session["calendar_slots"] = None
-                    session["calendar_free_slots"] = None
-                    session["calendar_selected_day"] = None
-                    if book_result.get("success"):
-                        try:
-                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            time_str = dt.strftime("%H:%M")
-                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
-                        except Exception:
-                            reply = "Appointment booked. Reply with anything to continue."
-                    else:
-                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
-                    conversation_history.append({"role": "user", "content": user_text})
-                    conversation_history.append({"role": "assistant", "content": reply})
-                    whatsapp_sessions[session_id]["history"] = conversation_history
-                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
-                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
-                if calendar_flow == "days" and 1 <= num <= len(calendar_days):
-                    day_info = calendar_days[num - 1]
-                    selected_date = day_info.get("date", "")
-                    free_slots_all = session.get("calendar_free_slots") or []
-                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+            # ── Confirm step: explicit confirm/cancel ──
+            if calendar_flow == "confirm":
+                pending_slot = session.get("calendar_pending_slot") or {}
+                if not pending_slot:
+                    raise ValueError("Missing pending slot")
+                raw_confirm = user_text.strip().lower()
+                confirm_num = _extract_index_choice(user_text)
+                is_confirm_choice = raw_confirm in ("confirm", "confirm booking", "yes", "book", "book now") or confirm_num == 1
+                is_cancel_choice = raw_confirm in ("cancel", "cancel booking", "no") or confirm_num == 2
+
+                if is_cancel_choice:
                     session["calendar_flow"] = "slots"
-                    session["calendar_slots"] = slots_for_day
-                    session["calendar_selected_day"] = selected_date
-                    lines = [f"Times on {day_info.get('label', selected_date)}:"]
-                    for i, s in enumerate(slots_for_day[:15], 1):
+                    session["calendar_pending_slot"] = None
+                    lines = ["No problem. Please choose another time slot:"]
+                    for i, s in enumerate(calendar_slots[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
                         if start and end:
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"{i}. {start}–{end}")
-                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
+                    reply = "\n".join(lines)
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
+                    await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
+                if not is_confirm_choice:
+                    reply = "Please confirm your booking:\n1. Confirm booking\n2. Cancel"
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": reply})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
+                start_iso = pending_slot.get("start", "")
+                end_iso = pending_slot.get("end", "")
+                slot_timezone = pending_slot.get("timezone")
+                service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                post_booking_note_raw = await _resolve_post_booking_note(
+                    context=context,
+                    app_id=app_id,
+                    service_title=service_title,
+                    context_service=context_service,
+                )
+                post_booking_note_chat = _format_post_booking_note_for_chat(post_booking_note_raw)
+
+                calendar_service = CalendarService(settings)
+                book_result = await calendar_service.book_appointment(
+                    app_id,
+                    start_iso,
+                    end_iso,
+                    service_title,
+                    time_zone=slot_timezone,
+                    attendee_email=customer_email,
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    lead_id=str(session.get("feedback_lead_id") or "").strip() or None,
+                    post_booking_note=post_booking_note_raw,
+                )
+                session["calendar_flow"] = None
+                session["calendar_days"] = None
+                session["calendar_slots"] = None
+                session["calendar_free_slots"] = None
+                session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
+                if book_result.get("success"):
+                    _wa_tz = slot_timezone or "UTC"
+                    _wa_start = _format_slot_time_local(start_iso, _wa_tz)
+                    _wa_end = _format_slot_time_local(end_iso, _wa_tz)
+                    try:
+                        from zoneinfo import ZoneInfo
+
+                        _wa_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
+                        _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
+                    except Exception:
+                        _wa_date = start_iso[:10]
+                    time_str = f"{_wa_date}, {_wa_start} – {_wa_end}"
+                    reply = f"✅ Your *{service_title}* is booked for {time_str}. You'll receive a confirmation shortly."
+                    if not post_booking_note_chat:
+                        fallback_note = str(book_result.get("postBookingNote") or book_result.get("post_booking_note") or "").strip()
+                        post_booking_note_chat = _format_post_booking_note_for_chat(fallback_note)
+                    if post_booking_note_chat:
+                        reply += f"\n\n📋 Important Instructions\n{post_booking_note_chat}"
+                    review_url = _integration_google_review_url(integration)
+                    skip_global_prompts = _should_skip_global_review_feedback_prompts(flow_controller, context)
+                    should_send_review_prompt = bool(review_url) and not skip_global_prompts
+                    should_collect_feedback = _capture_feedback_enabled(context) and not skip_global_prompts
+                    if should_send_review_prompt:
+                        reply += "\n\n" + get_string("review_prompt", session.get("response_language_code", "en"), review_url)
+
+                    try:
+                        full_history = conversation_history + [
+                            {"role": "user", "content": user_text},
+                            {"role": "assistant", "content": reply},
+                        ]
+                        customer_name_val = flow_controller.collected_data.get("leadName") or "Customer"
+                        lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                        completion_payload = {
+                            "status": "confirmed",
+                            "title": f"{service_title} – {customer_name_val}",
+                            "serviceType": flow_controller.collected_data.get("serviceType") or service_title,
+                            "leadType": flow_controller.collected_data.get("leadType"),
+                            "leadName": flow_controller.collected_data.get("leadName"),
+                            "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                            "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                            "sourceChannel": "whatsapp",
+                            "appId": app_id,
+                            "appointmentDetails": {
+                                "eventId": book_result.get("eventId"),
+                                "start": book_result.get("start") or start_iso,
+                                "end": book_result.get("end") or end_iso,
+                                "link": book_result.get("link"),
+                                "confirmed": True,
+                            },
+                            "summary": f"{customer_name_val} booked a {service_title} appointment.",
+                            "description": f"{customer_name_val} ({lead_type_val}) booked {service_title}.",
+                            "history": full_history,
+                        }
+                        existing_lead_id = str(session.get("feedback_lead_id") or "").strip()
+                        if existing_lead_id:
+                            await lead_service.update_lead(user_id, existing_lead_id, completion_payload)
+                        else:
+                            ok_lead, created_lead_resp = await lead_service.create_public_lead(user_id, completion_payload)
+                            if ok_lead:
+                                session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                    except Exception as lead_exc:
+                        logger.warning("WhatsApp booking lead persistence failed: %s", lead_exc)
+                else:
+                    raw_booking_error = str(book_result.get("error") or "").strip()
+                    if "invalid_grant" in raw_booking_error.lower():
+                        reply = "Booking is temporarily unavailable due to calendar authorization. Please try again shortly or contact us."
+                    else:
+                        reply = raw_booking_error or "Booking failed. Please try again or contact us."
+                conversation_history.append({"role": "user", "content": user_text})
+                conversation_history.append({"role": "assistant", "content": reply})
+                whatsapp_sessions[session_id]["history"] = conversation_history
+                await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                if book_result.get("success") and should_collect_feedback:
+                    feedback_prompt = _feedback_prompt_message()
+                    session["feedback_collection_active"] = True
+                    session["feedback_data"] = {}
+                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
+                elif book_result.get("success"):
+                    whatsapp_sessions.pop(session_id, None)
+                    if phone_to_session.get(user_phone) == session_id:
+                        phone_to_session.pop(user_phone, None)
+                return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+            try:
+                num = _extract_index_choice(user_text)
+                raw_choice = str(user_text or "").strip().lower()
+                if calendar_flow == "slots" and num is not None and 1 <= num <= len(calendar_slots):
+                    slot = calendar_slots[num - 1]
+                    # Save slot and ask for explicit booking confirmation
+                    session["calendar_pending_slot"] = slot
+                    session["calendar_flow"] = "confirm"
+                    _wa_tz = integration.get("calendarTimezone") or "UTC"
+                    _wa_t_start = _format_slot_time_local(slot.get("start", ""), _wa_tz)
+                    _wa_t_end = _format_slot_time_local(slot.get("end", ""), _wa_tz)
+                    try:
+                        from zoneinfo import ZoneInfo
+                        _wa_dt = datetime.fromisoformat(slot.get("start", "").replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
+                        _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
+                    except Exception:
+                        _wa_date = slot.get("start", "")[:10]
+                    _wa_confirm_text = (
+                        f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
+                        "Please confirm your booking:\n\n"
+                        "1. Confirm booking\n2. Cancel"
+                    )
+                    _wa_confirm_buttons = [{"id": "btn_confirm", "title": "Confirm booking"}, {"id": "btn_cancel", "title": "Cancel"}]
+                    session["last_whatsapp_choice_map"] = {"btn_confirm": "confirm", "btn_cancel": "cancel"}
+                    _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, _wa_confirm_text, _wa_confirm_buttons, from_phone=twilio_phone)
+                    if not _ok:
+                        await whatsapp_service.send_message(user_phone, _wa_confirm_text, from_phone=twilio_phone)
+                    conversation_history.append({"role": "user", "content": user_text})
+                    conversation_history.append({"role": "assistant", "content": _wa_confirm_text})
+                    whatsapp_sessions[session_id]["history"] = conversation_history
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                if calendar_flow == "slots" and num is None and calendar_slots:
+                    slot_tz_match = integration.get("calendarTimezone") or (calendar_slots[0].get("timezone") if calendar_slots else None) or "UTC"
+                    for idx, s in enumerate(calendar_slots, 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if not start or not end:
+                            continue
+                        t_start = _format_slot_time_local(start, slot_tz_match)
+                        t_end = _format_slot_time_local(end, slot_tz_match)
+                        display = f"{t_start}–{t_end}".lower()
+                        if raw_choice == display or raw_choice in display:
+                            num = idx
+                            break
+                    if num is not None and 1 <= num <= len(calendar_slots):
+                        slot = calendar_slots[num - 1]
+                        session["calendar_pending_slot"] = slot
+                        session["calendar_flow"] = "confirm"
+                        _wa_tz = integration.get("calendarTimezone") or "UTC"
+                        _wa_t_start = _format_slot_time_local(slot.get("start", ""), _wa_tz)
+                        _wa_t_end = _format_slot_time_local(slot.get("end", ""), _wa_tz)
+                        try:
+                            from zoneinfo import ZoneInfo
+                            _wa_dt = datetime.fromisoformat(slot.get("start", "").replace("Z", "+00:00")).astimezone(ZoneInfo(_wa_tz))
+                            _wa_date = _wa_dt.strftime("%a %d/%m/%Y")
+                        except Exception:
+                            _wa_date = slot.get("start", "")[:10]
+                        _wa_confirm_text = (
+                            f"You selected: 🕒 {_wa_date}, {_wa_t_start} – {_wa_t_end}\n"
+                            "Please confirm your booking:\n\n"
+                            "1. Confirm booking\n2. Cancel"
+                        )
+                        _wa_confirm_buttons = [{"id": "btn_confirm", "title": "Confirm booking"}, {"id": "btn_cancel", "title": "Cancel"}]
+                        session["last_whatsapp_choice_map"] = {"btn_confirm": "confirm", "btn_cancel": "cancel"}
+                        _ok, _ = await whatsapp_service.send_interactive_buttons(user_phone, _wa_confirm_text, _wa_confirm_buttons, from_phone=twilio_phone)
+                        if not _ok:
+                            await whatsapp_service.send_message(user_phone, _wa_confirm_text, from_phone=twilio_phone)
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": _wa_confirm_text})
+                        whatsapp_sessions[session_id]["history"] = conversation_history
+                        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                if calendar_flow == "days" and num is not None and 1 <= num <= len(calendar_days):
+                    day_info = calendar_days[num - 1]
+                    selected_date = day_info.get("date", "")
+                    free_slots_all = session.get("calendar_free_slots") or []
+                    cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                    slots_for_day = [
+                        s for s in free_slots_all
+                        if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                    ]
+                    session["calendar_flow"] = "slots"
+                    session["calendar_slots"] = slots_for_day
+                    session["calendar_selected_day"] = selected_date
+                    slot_tz = integration.get("calendarTimezone") or (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                    tz_label = _get_tz_label(slot_tz)
+                    lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append(f"🌐 All times in {tz_label}")
+                    lines.append("Choose a time slot:")
+                    for i, s in enumerate(slots_for_day[:15], 1):
+                        start = s.get("start", "")
+                        end = s.get("end", "")
+                        if start and end:
+                            t_start = _format_slot_time_local(start, slot_tz)
+                            t_end = _format_slot_time_local(end, slot_tz)
+                            lines.append(f"<button value=\"{i}\">{i}. 🕒 {t_start}–{t_end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": user_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     whatsapp_sessions[session_id]["history"] = conversation_history
                     await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+                if calendar_flow == "days" and num is None and calendar_days:
+                    for idx, d in enumerate(calendar_days, 1):
+                        label = str(d.get("label", "")).strip().lower()
+                        if raw_choice == label or raw_choice in label:
+                            num = idx
+                            break
+                    if num is not None and 1 <= num <= len(calendar_days):
+                        day_info = calendar_days[num - 1]
+                        selected_date = day_info.get("date", "")
+                        free_slots_all = session.get("calendar_free_slots") or []
+                        cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                        slots_for_day = [
+                            s for s in free_slots_all
+                            if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                        ]
+                        session["calendar_flow"] = "slots"
+                        session["calendar_slots"] = slots_for_day
+                        session["calendar_selected_day"] = selected_date
+                        slot_tz = integration.get("calendarTimezone") or (slots_for_day[0].get("timezone") if slots_for_day else None) or "UTC"
+                        tz_label = _get_tz_label(slot_tz)
+                        lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                        lines.append(f"🌐 All times in {tz_label}")
+                        lines.append("Choose a time slot:")
+                        for i, s in enumerate(slots_for_day[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                t_start = _format_slot_time_local(start, slot_tz)
+                                t_end = _format_slot_time_local(end, slot_tz)
+                                lines.append(f"<button value=\"{i}\">{i}. 🕒 {t_start}–{t_end}</button>")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": user_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        whatsapp_sessions[session_id]["history"] = conversation_history
+                        await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
+                        return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             except ValueError:
                 pass
 
         # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-        if app_id and _is_availability_intent(enhanced_user_text):
-            from datetime import datetime, timedelta
-            now = datetime.utcnow()
-            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-            to_dt = now + timedelta(days=7)
-            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+        if (
+            app_id
+            and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+            and _is_availability_intent(enhanced_user_text)
+        ):
+            from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
             if slot_minutes not in (15, 30, 60):
                 slot_minutes = 30
@@ -1798,7 +4087,13 @@ async def whatsapp_webhook(request: Request):
                 if result.get("error"):
                     reply = "I couldn't fetch availability right now. Please try again later."
                 else:
-                    free_slots = result.get("freeSlots") or []
+                    cal_tz_wa = _calendar_tz_from_integration(integration)
+                    _now_utc_wa = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    free_slots = [
+                        s for s in (result.get("freeSlots") or [])
+                        if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_wa
+                    ]
+                    free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_wa)
                     if not free_slots:
                         if not result.get("calendarConnected"):
                             reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -1808,15 +4103,24 @@ async def whatsapp_webhook(request: Request):
                         by_date: Dict[str, List[Dict[str, Any]]] = {}
                         for slot in free_slots:
                             start = slot.get("start") or ""
-                            date_key = start[:10] if len(start) >= 10 else ""
-                            if date_key:
-                                by_date.setdefault(date_key, []).append(slot)
+                            if not start:
+                                continue
+                            try:
+                                from zoneinfo import ZoneInfo
+
+                                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                date_key = dt_utc.astimezone(ZoneInfo(cal_tz_wa)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_key = start[:10]
+                            by_date.setdefault(date_key, []).append(slot)
                         days_order = sorted(by_date.keys())
                         calendar_days_list = []
                         for d in days_order:
                             try:
-                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                from zoneinfo import ZoneInfo
+
+                                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz_wa))
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
                         session["calendar_flow"] = "days"
@@ -1826,10 +4130,14 @@ async def whatsapp_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Pick a day (reply with the number):"]
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                        if service_title:
+                            intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                        else:
+                            intro = "Here are the available dates for your appointment. Please choose a day:"
+                        lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"{i}. {day['label']}")
-                        lines.append("Then I'll show you available times for that day.")
+                            lines.append(f"<button value=\"{i}\">{i}. 📅 {day['label']}</button>")
                         reply = "\n".join(lines)
                 conversation_history.append({"role": "user", "content": enhanced_user_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -1861,7 +4169,7 @@ async def whatsapp_webhook(request: Request):
         response_generator.set_response_language(lang_name)
         
         # Check if we need to handle email validation (similar to WebSocket flow)
-        validate_email = context.get("integration", {}).get("validateEmail", True)
+        validate_email = _validate_email_enabled(context)
         logger.info(f"WhatsApp: Email validation check - validate_email: {validate_email}, otp_sent: {email_validation_state['otp_sent']}, history_length: {len(conversation_history)}")
         
         if validate_email and not email_validation_state["otp_sent"] and len(conversation_history) > 1:
@@ -1903,7 +4211,18 @@ async def whatsapp_webhook(request: Request):
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     
-                    reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                     logger.info(f"WhatsApp: Email OTP sent, returning early to prevent JSON generation")
@@ -1925,11 +4244,18 @@ async def whatsapp_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("otp_sent_email", session.get("response_language_code", "en"), stored_email)
-                            if ok
-                            else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
-                        )
+                        if ok:
+                            reply = get_string("otp_sent_email", session.get("response_language_code", "en"), stored_email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                session.get("response_language_code", "en"),
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                         conversation_history.append({"role": "assistant", "content": reply})
                         await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                         logger.info(f"WhatsApp: Stored email OTP retry handled, returning early")
@@ -1948,7 +4274,18 @@ async def whatsapp_webhook(request: Request):
                 # Resend OTP to existing email
                 customer_name = email_validation_state.get("customer_name", flow_controller.collected_data.get("leadName", "Customer"))
                 ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], customer_name)
-                reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"]) if ok else get_string("otp_resend_fail_email", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"])
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
@@ -1976,7 +4313,6 @@ async def whatsapp_webhook(request: Request):
                             if msg.get("role") == "user":
                                 content = msg.get("content", "").lower()
                                 if "name is" in content or "my name is" in content:
-                                    import re
                                     name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
                                     if name_match:
                                         customer_name = name_match.group(1).strip()
@@ -1990,7 +4326,18 @@ async def whatsapp_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("found_email_cant_send", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                 else:
                     reply = get_string("no_problem_email", session.get("response_language_code", "en"))
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -2017,8 +4364,8 @@ async def whatsapp_webhook(request: Request):
                         # Update flow controller OTP state
                         flow_controller.otp_state["email_verified"] = True
                         flow_controller.transition_to(flow_controller.get_next_state())
-                        # Get AI response to continue the flow
-                        reply = await response_generator.generate_response(flow_controller, "Email verified", conversation_history, context)
+                        # Empty string so PHONE_COLLECTION generates a proper prompt instead of a validation error
+                        reply = await response_generator.generate_response(flow_controller, "", conversation_history, context)
                     
                     # Check if it's JSON (lead completion) - BEFORE sending
                     parsed_json = _maybe_parse_json(reply)
@@ -2033,8 +4380,10 @@ async def whatsapp_webhook(request: Request):
                             parsed_json["appId"] = app_id
                         
                         # Create lead and send friendly message
+                        created_lead_resp = None
+                        ok_lead = False
                         try:
-                            ok_lead, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                            ok_lead, created_lead_resp = await lead_service.create_public_lead(user_id, parsed_json)
                             if ok_lead:
                                 final_msg = get_string("final_success", session.get("response_language_code", "en"))
                             else:
@@ -2043,15 +4392,22 @@ async def whatsapp_webhook(request: Request):
                             final_msg = get_string("final_fallback", session.get("response_language_code", "en"))
                         
                         integration = context.get("integration") or {}
-                        if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                        if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                             review_url = integration["googleReviewUrl"].strip()
                             review_msg = get_string("review_prompt", session.get("response_language_code", "en"), review_url)
                             conversation_history.append({"role": "assistant", "content": review_msg})
                             await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                         conversation_history.append({"role": "assistant", "content": final_msg})
                         await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
-                        
-                        # Clean up session after lead creation
+                        if _capture_feedback_enabled(context) and ok_lead and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                            feedback_prompt = _feedback_prompt_message()
+                            session["feedback_collection_active"] = True
+                            session["feedback_data"] = {}
+                            session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
+                            return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
                         del whatsapp_sessions[session_id]
                         if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
                             del phone_to_session[user_phone]
@@ -2071,6 +4427,13 @@ async def whatsapp_webhook(request: Request):
         
         # Generate response using production-grade state machine
         reply = await response_generator.generate_response(flow_controller, enhanced_user_text, conversation_history, context)
+        reply = await _expand_booking_request_reply_for_social_channel(
+            reply,
+            integration,
+            app_id,
+            flow_controller,
+            session,
+        )
         
         # Handle special responses from response generator (SEND_EMAIL, SEND_PHONE)
         # Check for answer + SEND_EMAIL/PHONE format (when user asks question while providing email/phone)
@@ -2097,7 +4460,18 @@ async def whatsapp_webhook(request: Request):
                 email_validation_state["email"] = email
                 email_validation_state["customer_name"] = customer_name
             
-            reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "email",
+                    email_validation_state=email_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2126,7 +4500,18 @@ async def whatsapp_webhook(request: Request):
                 phone_validation_state["otp_sent"] = True
                 phone_validation_state["phone"] = phone
             
-            reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("otp_send_fail_phone", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "phone",
+                    phone_validation_state=phone_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2146,7 +4531,18 @@ async def whatsapp_webhook(request: Request):
                 email_validation_state["email"] = email
                 email_validation_state["customer_name"] = customer_name
             
-            reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "email",
+                    email_validation_state=email_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2169,7 +4565,18 @@ async def whatsapp_webhook(request: Request):
                 phone_validation_state["otp_sent"] = True
                 phone_validation_state["phone"] = phone
             
-            reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("otp_send_fail_phone", session.get("response_language_code", "en"))
+            if ok:
+                reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone)
+            else:
+                reply = await _continue_after_otp_delivery_failed_with_session(
+                    flow_controller,
+                    response_generator,
+                    conversation_history,
+                    context,
+                    session.get("response_language_code", "en"),
+                    "phone",
+                    phone_validation_state=phone_validation_state,
+                )
             conversation_history.append({"role": "assistant", "content": reply})
             await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
             return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2184,7 +4591,7 @@ async def whatsapp_webhook(request: Request):
             
             # Check email verification only if enabled
             email_valid = True
-            if context.get("integration", {}).get("validateEmail", True):
+            if _validate_email_enabled(context):
                 email_valid = _validate_email_verification(email_validation_state)
             
             # Phone is already verified by WhatsApp
@@ -2195,8 +4602,10 @@ async def whatsapp_webhook(request: Request):
                 if app_id:
                     parsed_json["appId"] = app_id
                 # Create lead
+                created_lead_resp = None
+                ok = False
                 try:
-                    ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                    ok, created_lead_resp = await lead_service.create_public_lead(user_id, parsed_json)
                     if ok:
                         final_msg = get_string("final_success", session.get("response_language_code", "en"))
                     else:
@@ -2205,17 +4614,23 @@ async def whatsapp_webhook(request: Request):
                     final_msg = get_string("final_fallback", session.get("response_language_code", "en"))
                 
                 integration = context.get("integration") or {}
-                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                     review_url = integration["googleReviewUrl"].strip()
                     review_msg = get_string("review_prompt", session.get("response_language_code", "en"), review_url)
                     await whatsapp_service.send_message(user_phone, review_msg, from_phone=twilio_phone)
                 await whatsapp_service.send_message(user_phone, final_msg, from_phone=twilio_phone)
-                
-                # Clean up session after lead creation
+                if _capture_feedback_enabled(context) and ok and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                    feedback_prompt = _feedback_prompt_message()
+                    session["feedback_collection_active"] = True
+                    session["feedback_data"] = {}
+                    session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                    await whatsapp_service.send_message(user_phone, feedback_prompt, from_phone=twilio_phone)
+                    return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
+
                 del whatsapp_sessions[session_id]
                 if user_phone in phone_to_session and phone_to_session[user_phone] == session_id:
                     del phone_to_session[user_phone]
-                
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
         
         # Check for retry requests from GPT response
@@ -2224,7 +4639,18 @@ async def whatsapp_webhook(request: Request):
             if retry_type == 'resend_otp' and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
                 # Resend OTP to existing phone number
                 ok, _ = await phone_validation_service.send_sms_otp(user_id, phone_validation_state["phone"])
-                reply = get_string("otp_resend", session.get("response_language_code", "en"), phone_validation_state["phone"]) if ok else get_string("otp_resend_fail_phone", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_resend", session.get("response_language_code", "en"), phone_validation_state["phone"])
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
@@ -2235,7 +4661,18 @@ async def whatsapp_webhook(request: Request):
                 # Resend OTP to existing email
                 customer_name = email_validation_state.get("customer_name", flow_controller.collected_data.get("leadName", "Customer"))
                 ok, _ = await email_validation_service.send_otp_email(user_id, email_validation_state["email"], customer_name)
-                reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"]) if ok else get_string("otp_resend_fail_email", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_resend", session.get("response_language_code", "en"), email_validation_state["email"])
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 success, message = await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 if not success:
@@ -2264,7 +4701,18 @@ async def whatsapp_webhook(request: Request):
                         phone_validation_state["otp_sent"] = True
                         flow_controller.otp_state["phone_sent"] = True
                         flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                    reply = get_string("perfect_otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("found_phone_cant_send", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("perfect_otp_sent_phone", session.get("response_language_code", "en"), phone)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "phone",
+                            phone_validation_state=phone_validation_state,
+                        )
                 else:
                     reply = get_string("no_problem_phone", session.get("response_language_code", "en"))
                     flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -2296,7 +4744,6 @@ async def whatsapp_webhook(request: Request):
                             if msg.get("role") == "user":
                                 content = msg.get("content", "").lower()
                                 if "name is" in content or "my name is" in content:
-                                    import re
                                     name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
                                     if name_match:
                                         customer_name = name_match.group(1).strip()
@@ -2310,7 +4757,18 @@ async def whatsapp_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("found_email_cant_send", session.get("response_language_code", "en"))
+                    if ok:
+                        reply = get_string("perfect_otp_sent_email", session.get("response_language_code", "en"), email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            session.get("response_language_code", "en"),
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                 else:
                     reply = get_string("no_problem_email", session.get("response_language_code", "en"))
                     flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -2322,7 +4780,7 @@ async def whatsapp_webhook(request: Request):
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             elif retry_type == 'send_email' and extracted_value:
                 # Check if email validation is enabled
-                validate_email = context.get("integration", {}).get("validateEmail", True)
+                validate_email = _validate_email_enabled(context)
                 if not validate_email:
                     # Email validation is disabled - store email and let AI respond naturally
                     email = extracted_value
@@ -2345,7 +4803,6 @@ async def whatsapp_webhook(request: Request):
                     if msg.get("role") == "user":
                         content = msg.get("content", "").lower()
                         if "name is" in content or "my name is" in content:
-                            import re
                             name_match = re.search(r'(?:name is|my name is)\s+([A-Za-z\s]+)', content, re.IGNORECASE)
                             if name_match:
                                 email_validation_state["customer_name"] = name_match.group(1).strip()
@@ -2355,13 +4812,24 @@ async def whatsapp_webhook(request: Request):
                 ok, _ = await email_validation_service.send_otp_email(user_id, email, email_validation_state["customer_name"])
                 if ok:
                     email_validation_state["otp_sent"] = True
-                reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email) if ok else get_string("otp_send_fail_email", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_sent_email", session.get("response_language_code", "en"), email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
             elif retry_type == 'send_phone' and extracted_value:
                 # Check if phone validation is enabled (for WhatsApp, phone is already verified, so skip)
-                validate_phone = context.get("integration", {}).get("validatePhoneNumber", True)
+                validate_phone = _validate_phone_enabled(context)
                 if not validate_phone:
                     # Phone validation is disabled - store phone and let AI respond naturally
                     # Format phone with GPT for consistent storage
@@ -2386,7 +4854,18 @@ async def whatsapp_webhook(request: Request):
                 ok, _ = await phone_validation_service.send_sms_otp(user_id, phone)
                 if ok:
                     phone_validation_state["otp_sent"] = True
-                reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone) if ok else get_string("otp_send_fail_phone", session.get("response_language_code", "en"))
+                if ok:
+                    reply = get_string("otp_sent_phone", session.get("response_language_code", "en"), phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        session.get("response_language_code", "en"),
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 await whatsapp_service.send_message(user_phone, reply, from_phone=twilio_phone)
                 return Response(content=whatsapp_service.create_twiml_response(""), media_type="text/xml")
@@ -2402,11 +4881,27 @@ async def whatsapp_webhook(request: Request):
             cleaned_reply = cleaned_reply.strip()
         
         # Send appropriate WhatsApp message
-        if buttons:
-            # For WhatsApp, convert buttons to numbered list instead of interactive buttons
-            # (interactive buttons don't work well in Twilio sandbox)
-            button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-            full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
+        is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
+        if buttons and len(buttons) <= 3 and not is_multi_select_prompt:
+            # Always include numbered list in body so options are visible even when interactive
+            # buttons don't render (e.g. Twilio sandbox). Interactive chips appear on top when supported.
+            full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=False)
+            wa_buttons = [{"id": f"btn_{i}", "title": btn["title"][:20]} for i, btn in enumerate(buttons, 1)]
+            session["last_whatsapp_choice_map"] = {
+                f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)
+            }
+            success, message = await whatsapp_service.send_interactive_buttons(user_phone, full_message, wa_buttons, from_phone=twilio_phone)
+            if not success:
+                logger.info("Interactive buttons failed (%s), falling back to numbered list", message)
+                success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
+                if not success:
+                    logger.error("Failed to send WhatsApp message: %s", message)
+        elif buttons:
+            # 4+ options or checkbox prompts — use numbered list
+            session["last_whatsapp_choice_map"] = {
+                f"btn_{i}": btn.get("payload", btn.get("title", "")) for i, btn in enumerate(buttons, 1)
+            }
+            full_message = _format_whatsapp_option_prompt(cleaned_reply, buttons, multi_select=is_multi_select_prompt)
             success, message = await whatsapp_service.send_message(user_phone, full_message, from_phone=twilio_phone)
             if not success:
                 logger.error("Failed to send WhatsApp message: %s", message)
@@ -2545,6 +5040,15 @@ async def messenger_webhook(request: Request):
                 )
                 return {"status": "error", "message": "No Messenger page access token configured"}
 
+            allowed, _ = await _consume_channel_limit_or_block(
+                lead_service=lead_service,
+                app_id=app_id,
+                channel="messenger",
+                idempotency_key=f"messenger-{session_id}",
+            )
+            if not allowed:
+                return {"status": "ok"}
+
             current_time = time.time()
             messenger_sessions[session_id] = {
                 "user_id": sender_id,          # PSID
@@ -2565,6 +5069,7 @@ async def messenger_webhook(request: Request):
                 "flow_controller": None,
                 "response_generator": None,
                 "page_access_token": page_access_token,
+                "calendar_pending_slot": None,
             }
 
             flow_controller = FlowController(context)
@@ -2575,6 +5080,7 @@ async def messenger_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("messenger")
+            flow_controller.update_collected_data("sourceChannel", "facebook")
             rag_service.build_vector_store(context)
 
             messenger_sessions[session_id]["flow_controller"] = flow_controller
@@ -2592,14 +5098,13 @@ async def messenger_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
             if buttons:
-                btn_text = "\n\n" + "\n".join(
-                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
-                )
-                await messenger_service.send_message(
-                    sender_id,
-                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
-                    page_access_token,
-                )
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await messenger_service.send_message(sender_id, full_message, page_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
             else:
                 await messenger_service.send_message(sender_id, initial_reply, page_access_token)
 
@@ -2615,7 +5120,23 @@ async def messenger_webhook(request: Request):
                 return {"status": "ok"}
             session_id = session_id_new
 
-        session["last_activity"] = time.time()
+        now = time.time()
+        last_activity = session.get("last_activity", 0)
+        app_id = session.get("app_id")
+        applied_version = session.get("conversation_style_applied_version")
+        pending = conversation_style_change_requests.get(app_id) if app_id else None
+        if pending and applied_version != pending.get("version"):
+            requested_at = float(pending.get("requested_at") or 0)
+            idle_seconds = int(pending.get("idle_seconds") or 120)
+            idle_start = max(last_activity, requested_at)
+            if now - idle_start >= idle_seconds:
+                session_context = session.get("context") or {}
+                integration = session_context.get("integration") or {}
+                if isinstance(integration, dict):
+                    integration["conversationStyle"] = bool(pending.get("conversation_style"))
+                    session["conversation_style_applied_version"] = pending.get("version")
+
+        session["last_activity"] = now
         conversation_history = session["history"]
         context = session["context"]
         flow_controller = session.get("flow_controller")
@@ -2625,10 +5146,69 @@ async def messenger_webhook(request: Request):
         page_access_token = session.get("page_access_token")
         email_validation_state = session["email_state"]
         phone_validation_state = session["phone_state"]
+        email_validation_service.set_branding_context(
+            app_id=str(app_id or "").strip() or None,
+            company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
+        )
 
         if not flow_controller or not response_generator:
             logger.error("Messenger: flow_controller or response_generator missing in session")
             return {"status": "error"}
+        flow_controller.update_collected_data("sourceChannel", "facebook")
+
+        if session.get("feedback_collection_active"):
+            user_raw = str(message_text or "").strip()
+            if user_raw:
+                conversation_history.append({"role": "user", "content": user_raw})
+            feedback_data = dict(session.get("feedback_data") or {})
+            exp, rating = _extract_feedback_submission(user_raw)
+            if exp:
+                feedback_data["experience"] = exp
+            if rating:
+                feedback_data["rating"] = rating
+            if feedback_data.get("experience") and feedback_data.get("rating"):
+                lead_id_for_feedback = str(session.get("feedback_lead_id") or "").strip()
+                saved = False
+                if lead_id_for_feedback:
+                    try:
+                        payload = {
+                            "userFeedback": {
+                                "experience": feedback_data.get("experience"),
+                                "rating": feedback_data.get("rating"),
+                                "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                            }
+                        }
+                        saved, _ = await lead_service.update_lead(owner_id, lead_id_for_feedback, payload)
+                    except Exception as feedback_exc:
+                        logger.warning("Messenger feedback save failed: %s", feedback_exc)
+                thanks = "Thank you for your feedback!"
+                if not saved and lead_id_for_feedback:
+                    thanks = "Thank you for your feedback! We could not save it right now."
+                conversation_history.append({"role": "assistant", "content": thanks})
+                session["history"] = conversation_history
+                await messenger_service.send_message(sender_id, thanks, page_access_token)
+                key = f"messenger_{recipient_id}_{sender_id}"
+                messenger_key_to_session.pop(key, None)
+                messenger_sessions.pop(session_id, None)
+                return {"status": "ok"}
+            missing_parts: List[str] = []
+            if not feedback_data.get("experience"):
+                missing_parts.append("experience")
+            if not feedback_data.get("rating"):
+                missing_parts.append("rating (1-5)")
+            followup = (
+                "Thanks! Please also share your "
+                + " and ".join(missing_parts)
+                + ".\n"
+                + _feedback_prompt_message()
+            )
+            session["feedback_data"] = feedback_data
+            conversation_history.append({"role": "assistant", "content": followup})
+            session["history"] = conversation_history
+            await messenger_service.send_message(sender_id, followup, page_access_token)
+            return {"status": "ok"}
+
+        enhanced_message_text = _normalize_workflow_choice_input(message_text, flow_controller) or message_text
 
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
@@ -2637,7 +5217,6 @@ async def messenger_webhook(request: Request):
 
         # Calendar flow: same as WhatsApp – day/slot selection or cancel
         if calendar_flow and app_id and message_text.strip():
-            from datetime import datetime
             raw_lower = message_text.strip().lower()
             if raw_lower in ("cancel", "back", "exit"):
                 session["calendar_flow"] = None
@@ -2645,6 +5224,7 @@ async def messenger_webhook(request: Request):
                 session["calendar_slots"] = None
                 session["calendar_free_slots"] = None
                 session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
                 reply = "Cancelled. How can I help?"
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -2652,42 +5232,193 @@ async def messenger_webhook(request: Request):
                 await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
             try:
-                num = int(message_text.strip())
+                if calendar_flow == "confirm":
+                    pending_slot = session.get("calendar_pending_slot") or {}
+                    if not pending_slot:
+                        raise ValueError("Missing pending slot")
+                    confirm_num = _extract_index_choice(message_text)
+                    is_confirm_choice = raw_lower in ("confirm", "confirm booking", "yes", "book", "book now") or confirm_num == 1
+                    is_cancel_choice = raw_lower in ("cancel", "cancel booking", "no") or confirm_num == 2
+                    if is_confirm_choice:
+                        start_iso = pending_slot.get("start", "")
+                        end_iso = pending_slot.get("end", "")
+                        slot_timezone = pending_slot.get("timezone")
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                        customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                        customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                        customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                        _post_booking_note_raw = await _resolve_post_booking_note(
+                            context=context,
+                            app_id=app_id,
+                            service_title=service_title,
+                            context_service=context_service,
+                        )
+                        _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
+                        calendar_service = CalendarService(settings)
+                        book_result = await calendar_service.book_appointment(
+                            app_id,
+                            start_iso,
+                            end_iso,
+                            service_title,
+                            time_zone=slot_timezone,
+                            attendee_email=customer_email,
+                            customer_name=customer_name,
+                            customer_phone=customer_phone,
+                            lead_id=str(session.get("feedback_lead_id") or "").strip() or None,
+                            post_booking_note=_post_booking_note_raw,
+                        )
+                        session["calendar_flow"] = None
+                        session["calendar_days"] = None
+                        session["calendar_slots"] = None
+                        session["calendar_free_slots"] = None
+                        session["calendar_selected_day"] = None
+                        session["calendar_pending_slot"] = None
+                        if book_result.get("success"):
+                            try:
+                                from zoneinfo import ZoneInfo
+                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                                time_str = dt.strftime("%a %d/%m/%Y, %H:%M")
+                                reply = f"Booked! Your {service_title} appointment is confirmed for {time_str}."
+                            except Exception:
+                                reply = f"Booked! Your {service_title} appointment is confirmed."
+                            if not _post_booking_note_chat:
+                                _fallback_note = str(book_result.get("postBookingNote") or book_result.get("post_booking_note") or "").strip()
+                                _post_booking_note_chat = _format_post_booking_note_for_chat(_fallback_note)
+                            if _post_booking_note_chat:
+                                reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
+                            _review_url_inline = _integration_google_review_url(integration)
+                            _skip_global_prompts = _should_skip_global_review_feedback_prompts(flow_controller, context)
+                            _should_send_review_prompt = bool(_review_url_inline) and not _skip_global_prompts
+                            _should_collect_feedback = _capture_feedback_enabled(context) and not _skip_global_prompts
+                            if _should_send_review_prompt:
+                                reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
+                            # Ensure social-channel bookings are persisted as leads.
+                            try:
+                                full_history = conversation_history + [
+                                    {"role": "user", "content": message_text},
+                                    {"role": "assistant", "content": reply},
+                                ]
+                                customer_name = flow_controller.collected_data.get("leadName") or "Customer"
+                                lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                                completion_payload = {
+                                    "status": "confirmed",
+                                    "title": f"{service_title} – {customer_name}",
+                                    "serviceType": flow_controller.collected_data.get("serviceType") or service_title,
+                                    "leadType": flow_controller.collected_data.get("leadType"),
+                                    "leadName": flow_controller.collected_data.get("leadName"),
+                                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                                    "sourceChannel": "facebook",
+                                    "appId": app_id,
+                                    "appointmentDetails": {
+                                        "eventId": book_result.get("eventId"),
+                                        "start": book_result.get("start") or start_iso,
+                                        "end": book_result.get("end") or end_iso,
+                                        "link": book_result.get("link"),
+                                        "confirmed": True,
+                                    },
+                                    "summary": f"{customer_name} booked a {service_title} appointment.",
+                                    "description": f"{customer_name} ({lead_type_val}) booked {service_title}.",
+                                    "history": full_history,
+                                }
+                                existing_lead_id = str(session.get("feedback_lead_id") or "").strip()
+                                if existing_lead_id:
+                                    await lead_service.update_lead(owner_id, existing_lead_id, completion_payload)
+                                else:
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, completion_payload)
+                                    if ok_lead:
+                                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                            except Exception as lead_exc:
+                                logger.warning("Messenger booking lead persistence failed: %s", lead_exc)
+                        else:
+                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
+                        if book_result.get("success") and _should_collect_feedback:
+                            feedback_prompt = _feedback_prompt_message()
+                            session["feedback_collection_active"] = True
+                            session["feedback_data"] = {}
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            session["history"] = conversation_history
+                            await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                        elif book_result.get("success"):
+                            key = f"messenger_{recipient_id}_{sender_id}"
+                            messenger_key_to_session.pop(key, None)
+                            messenger_sessions.pop(session_id, None)
+                        return {"status": "ok"}
+                    if is_cancel_choice:
+                        session["calendar_flow"] = "slots"
+                        session["calendar_pending_slot"] = None
+                        lines = ["No problem. Please choose another time slot:"]
+                        for i, s in enumerate(calendar_slots[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                try:
+                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                    lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                except Exception:
+                                    lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                        if buttons:
+                            qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                            await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                        else:
+                            await messenger_service.send_message(sender_id, reply, page_access_token)
+                        return {"status": "ok"}
+                    raise ValueError("Invalid confirm choice")
+                num = _extract_index_choice(message_text)
+                if num is None:
+                    raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
-                    start_iso = slot.get("start", "")
-                    end_iso = slot.get("end", "")
-                    title = "Appointment"
-                    calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
-                    session["calendar_flow"] = None
-                    session["calendar_days"] = None
-                    session["calendar_slots"] = None
-                    session["calendar_free_slots"] = None
-                    session["calendar_selected_day"] = None
-                    if book_result.get("success"):
-                        try:
-                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            time_str = dt.strftime("%H:%M")
-                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
-                        except Exception:
-                            reply = "Appointment booked. Reply with anything to continue."
-                    else:
-                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    session["calendar_pending_slot"] = slot
+                    session["calendar_flow"] = "confirm"
+                    slot_timezone = slot.get("timezone")
+                    try:
+                        from zoneinfo import ZoneInfo
+                        dt_s = datetime.fromisoformat((slot.get("start") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        dt_e = datetime.fromisoformat((slot.get("end") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        slot_label = f"{dt_s.strftime('%a %d/%m/%Y, %H:%M')}–{dt_e.strftime('%H:%M')}"
+                    except Exception:
+                        slot_label = f"{slot.get('start', '')}–{slot.get('end', '')}"
+                    reply = (
+                        f"You selected: {slot_label}\n"
+                        "Please confirm your booking:\n"
+                        "<button value=\"confirm\">Confirm booking</button>\n"
+                        "<button value=\"cancel\">Cancel</button>"
+                    )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                    else:
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
                     return {"status": "ok"}
                 if calendar_flow == "days" and 1 <= num <= len(calendar_days):
                     day_info = calendar_days[num - 1]
                     selected_date = day_info.get("date", "")
                     free_slots_all = session.get("calendar_free_slots") or []
-                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                    slots_for_day = [
+                        s for s in free_slots_all
+                        if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                    ]
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
@@ -2695,26 +5426,30 @@ async def messenger_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"{i}. {start}–{end}")
-                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await messenger_service.send_message(sender_id, reply, page_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                    else:
+                        await messenger_service.send_message(sender_id, reply, page_access_token)
                     return {"status": "ok"}
             except ValueError:
                 pass
 
         # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-        if app_id and _is_availability_intent(message_text):
-            from datetime import datetime, timedelta
-            now = datetime.utcnow()
-            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-            to_dt = now + timedelta(days=7)
-            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+        if (
+            app_id
+            and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+            and _is_availability_intent(enhanced_message_text)
+        ):
+            from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
             if slot_minutes not in (15, 30, 60):
                 slot_minutes = 30
@@ -2724,7 +5459,13 @@ async def messenger_webhook(request: Request):
                 if result.get("error"):
                     reply = "I couldn't fetch availability right now. Please try again later."
                 else:
-                    free_slots = result.get("freeSlots") or []
+                    cal_tz_ms = _calendar_tz_from_integration(integration)
+                    _now_utc_ms = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    free_slots = [
+                        s for s in (result.get("freeSlots") or [])
+                        if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_ms
+                    ]
+                    free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_ms)
                     if not free_slots:
                         if not result.get("calendarConnected"):
                             reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -2734,15 +5475,24 @@ async def messenger_webhook(request: Request):
                         by_date: Dict[str, List[Dict[str, Any]]] = {}
                         for slot in free_slots:
                             start = slot.get("start") or ""
-                            date_key = start[:10] if len(start) >= 10 else ""
-                            if date_key:
-                                by_date.setdefault(date_key, []).append(slot)
+                            if not start:
+                                continue
+                            try:
+                                from zoneinfo import ZoneInfo
+
+                                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                date_key = dt_utc.astimezone(ZoneInfo(cal_tz_ms)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_key = start[:10]
+                            by_date.setdefault(date_key, []).append(slot)
                         days_order = sorted(by_date.keys())
                         calendar_days_list = []
                         for d in days_order:
                             try:
-                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                from zoneinfo import ZoneInfo
+
+                                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz_ms))
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
                         session["calendar_flow"] = "days"
@@ -2752,27 +5502,36 @@ async def messenger_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Pick a day (reply with the number):"]
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                        if service_title:
+                            intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                        else:
+                            intro = "Here are the available dates for your appointment. Please choose a day:"
+                        lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"{i}. {day['label']}")
-                        lines.append("Then I'll show you available times for that day.")
+                            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
                         reply = "\n".join(lines)
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
-                await messenger_service.send_message(sender_id, reply, page_access_token)
+                cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                if buttons:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
+                else:
+                    await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
             except Exception as cal_exc:
                 logger.exception("Messenger: Calendar availability error: %s", cal_exc)
                 reply = "I couldn't fetch availability right now. Please try again later."
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
                 return {"status": "ok"}
 
         # Add user message to history
-        conversation_history.append({"role": "user", "content": message_text})
+        conversation_history.append({"role": "user", "content": enhanced_message_text})
 
         # Detect language and configure response generator
         lang_code = detect_language(message_text)
@@ -2781,7 +5540,7 @@ async def messenger_webhook(request: Request):
 
         try:
             # ── PRE-CHECK: detect email when last bot message asked for it ────────
-            validate_email = context.get("integration", {}).get("validateEmail", True)
+            validate_email = _validate_email_enabled(context)
             logger.info(
                 "Messenger: email validation check – validate_email=%s otp_sent=%s history_len=%d",
                 validate_email, email_validation_state["otp_sent"], len(conversation_history),
@@ -2816,11 +5575,18 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("otp_send_fail_email", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                         conversation_history.append({"role": "assistant", "content": reply})
                         session["history"] = conversation_history
                         await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -2846,11 +5612,18 @@ async def messenger_webhook(request: Request):
                                 email_validation_state["otp_sent"] = True
                                 flow_controller.otp_state["email_sent"] = True
                                 flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                            reply = (
-                                get_string("otp_sent_email", lang_code, stored_email)
-                                if ok
-                                else get_string("otp_send_fail_email", lang_code)
-                            )
+                            if ok:
+                                reply = get_string("otp_sent_email", lang_code, stored_email)
+                            else:
+                                reply = await _continue_after_otp_delivery_failed_with_session(
+                                    flow_controller,
+                                    response_generator,
+                                    conversation_history,
+                                    context,
+                                    lang_code,
+                                    "email",
+                                    email_validation_state=email_validation_state,
+                                )
                             conversation_history.append({"role": "assistant", "content": reply})
                             session["history"] = conversation_history
                             await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -2871,11 +5644,18 @@ async def messenger_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -2896,11 +5676,18 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -2919,8 +5706,9 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_verified"] = True
                             flow_controller.otp_state["email_verified"] = True
                             flow_controller.transition_to(flow_controller.get_next_state())
+                            # Empty string so PHONE_COLLECTION generates a proper prompt instead of a validation error
                             reply = await response_generator.generate_response(
-                                flow_controller, "Email verified", conversation_history, context
+                                flow_controller, "", conversation_history, context
                             )
                         else:
                             reply = temp_reply
@@ -2932,8 +5720,10 @@ async def messenger_webhook(request: Request):
                             if email_valid:
                                 if app_id:
                                     parsed_json["appId"] = app_id
+                                created_lead_resp = None
+                                ok_lead = False
                                 try:
-                                    ok_lead, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                                     final_msg = (
                                         get_string("final_success", lang_code)
                                         if ok_lead
@@ -2942,13 +5732,22 @@ async def messenger_webhook(request: Request):
                                 except Exception:
                                     final_msg = get_string("final_fallback", lang_code)
                                 integration = context.get("integration") or {}
-                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     await messenger_service.send_message(
                                         sender_id,
                                         get_string("review_prompt", lang_code, integration["googleReviewUrl"].strip()),
                                         page_access_token,
                                     )
                                 await messenger_service.send_message(sender_id, final_msg, page_access_token)
+                                if _capture_feedback_enabled(context) and ok_lead and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                                    feedback_prompt = _feedback_prompt_message()
+                                    session["feedback_collection_active"] = True
+                                    session["feedback_data"] = {}
+                                    session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                                    session["history"] = conversation_history
+                                    await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                                    return {"status": "ok"}
                                 key = f"messenger_{recipient_id}_{sender_id}"
                                 messenger_key_to_session.pop(key, None)
                                 messenger_sessions.pop(session_id, None)
@@ -2968,7 +5767,7 @@ async def messenger_webhook(request: Request):
 
             # ── Generate response via state machine ───────────────────────────────
             reply = await response_generator.generate_response(
-                flow_controller, message_text, conversation_history, context
+                flow_controller, enhanced_message_text, conversation_history, context
             )
 
             # ── SEND_EMAIL / SEND_PHONE signal interceptors ───────────────────────
@@ -2986,11 +5785,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3007,11 +5813,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3032,11 +5845,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3053,11 +5873,18 @@ async def messenger_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3071,8 +5898,10 @@ async def messenger_webhook(request: Request):
                 if email_valid:
                     if app_id:
                         parsed_json["appId"] = app_id
+                    created_lead_resp = None
+                    ok = False
                     try:
-                        ok, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                        ok, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                         final_msg = (
                             get_string("final_success", lang_code)
                             if ok
@@ -3082,7 +5911,7 @@ async def messenger_webhook(request: Request):
                         final_msg = get_string("final_fallback", lang_code)
 
                     integration = context.get("integration") or {}
-                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                         review_url = integration["googleReviewUrl"].strip()
                         await messenger_service.send_message(
                             sender_id,
@@ -3090,6 +5919,15 @@ async def messenger_webhook(request: Request):
                             page_access_token,
                         )
                     await messenger_service.send_message(sender_id, final_msg, page_access_token)
+                    if _capture_feedback_enabled(context) and ok and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        feedback_prompt = _feedback_prompt_message()
+                        session["feedback_collection_active"] = True
+                        session["feedback_data"] = {}
+                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                        conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                        session["history"] = conversation_history
+                        await messenger_service.send_message(sender_id, feedback_prompt, page_access_token)
+                        return {"status": "ok"}
                     key = f"messenger_{recipient_id}_{sender_id}"
                     messenger_key_to_session.pop(key, None)
                     messenger_sessions.pop(session_id, None)
@@ -3105,11 +5943,18 @@ async def messenger_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3117,11 +5962,18 @@ async def messenger_webhook(request: Request):
 
                 elif retry_type == "resend_otp" and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
                     ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone_validation_state["phone"])
-                    reply = (
-                        get_string("otp_resend", lang_code, phone_validation_state["phone"])
-                        if ok
-                        else get_string("otp_resend_fail_phone", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, phone_validation_state["phone"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "phone",
+                            phone_validation_state=phone_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
@@ -3142,11 +5994,18 @@ async def messenger_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -3168,11 +6027,18 @@ async def messenger_webhook(request: Request):
                             phone_validation_state["otp_sent"] = True
                             flow_controller.otp_state["phone_sent"] = True
                             flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_phone", lang_code, phone)
-                            if ok
-                            else get_string("found_phone_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_phone", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "phone",
+                                phone_validation_state=phone_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_phone", lang_code)
                         flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -3218,15 +6084,31 @@ async def messenger_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = (
-                        get_string("otp_sent_email", lang_code, email)
-                        if ok
-                        else get_string("otp_send_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_sent_email", lang_code, email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await messenger_service.send_message(sender_id, reply, page_access_token)
                     return {"status": "ok"}
+
+            # Expand booking token to real calendar choices for Messenger.
+            reply = await _expand_booking_request_reply_for_social_channel(
+                reply=reply,
+                integration=integration,
+                app_id=app_id,
+                flow_controller=flow_controller,
+                session=session,
+            )
 
             # ── Regular reply ─────────────────────────────────────────────────────
             conversation_history.append({"role": "assistant", "content": reply})
@@ -3234,14 +6116,13 @@ async def messenger_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                btn_text = "\n\n" + "\n".join(
-                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
-                )
-                await messenger_service.send_message(
-                    sender_id,
-                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
-                    page_access_token,
-                )
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await messenger_service.send_message(sender_id, full_message, page_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await messenger_service.send_quick_replies(sender_id, cleaned_reply, qrs, page_access_token)
             else:
                 await messenger_service.send_message(sender_id, reply, page_access_token)
 
@@ -3363,6 +6244,15 @@ async def instagram_webhook(request: Request):
             if not instagram_access_token:
                 logger.error(f"Instagram: no access token in context for business_account_id={recipient_id}")
                 return {"status": "error", "message": "No Instagram access token configured"}
+
+            allowed, _ = await _consume_channel_limit_or_block(
+                lead_service=lead_service,
+                app_id=app_id,
+                channel="instagram",
+                idempotency_key=f"instagram-{session_id}",
+            )
+            if not allowed:
+                return {"status": "ok"}
             
             current_time = time.time()
             instagram_sessions[session_id] = {
@@ -3379,6 +6269,7 @@ async def instagram_webhook(request: Request):
                 "flow_controller": None,
                 "response_generator": None,
                 "instagram_access_token": instagram_access_token,
+                "calendar_pending_slot": None,
             }
             
             # Initialize flow controller and response generator
@@ -3390,6 +6281,7 @@ async def instagram_webhook(request: Request):
             response_generator = ResponseGenerator(settings, rag_service)
             response_generator.set_profession(str(context.get("profession") or "Business"))
             response_generator.set_channel("instagram")
+            flow_controller.update_collected_data("sourceChannel", "instagram")
             rag_service.build_vector_store(context)
             
             instagram_sessions[session_id]["flow_controller"] = flow_controller
@@ -3407,9 +6299,13 @@ async def instagram_webhook(request: Request):
             # Send reply via Meta Graph API
             cleaned_reply, buttons = _extract_buttons_from_response(initial_reply)
             if buttons:
-                button_text = "\n\n" + "\n".join([f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)])
-                full_message = cleaned_reply + button_text + "\n\nPlease reply with the number of your choice."
-                await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(initial_reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
             else:
                 await instagram_service.send_message(sender_id, initial_reply, instagram_access_token)
             
@@ -3425,7 +6321,23 @@ async def instagram_webhook(request: Request):
                 return {"status": "ok"}
             session_id = session_id_new
 
-        session["last_activity"] = time.time()
+        now = time.time()
+        last_activity = session.get("last_activity", 0)
+        app_id = session.get("app_id")
+        applied_version = session.get("conversation_style_applied_version")
+        pending = conversation_style_change_requests.get(app_id) if app_id else None
+        if pending and applied_version != pending.get("version"):
+            requested_at = float(pending.get("requested_at") or 0)
+            idle_seconds = int(pending.get("idle_seconds") or 120)
+            idle_start = max(last_activity, requested_at)
+            if now - idle_start >= idle_seconds:
+                session_context = session.get("context") or {}
+                integration = session_context.get("integration") or {}
+                if isinstance(integration, dict):
+                    integration["conversationStyle"] = bool(pending.get("conversation_style"))
+                    session["conversation_style_applied_version"] = pending.get("version")
+
+        session["last_activity"] = now
         conversation_history = session["history"]
         context = session["context"]
         email_validation_state = session["email_state"]
@@ -3435,10 +6347,69 @@ async def instagram_webhook(request: Request):
         owner_id = session["user_id_owner"]
         app_id = session.get("app_id")
         instagram_access_token = session.get("instagram_access_token")
+        email_validation_service.set_branding_context(
+            app_id=str(app_id or "").strip() or None,
+            company_name=str((context.get("integration") or {}).get("companyName") or "").strip() or None,
+        )
 
         if not flow_controller or not response_generator:
             logger.error("Instagram: flow_controller or response_generator not initialized")
             return {"status": "error"}
+        flow_controller.update_collected_data("sourceChannel", "instagram")
+
+        if session.get("feedback_collection_active"):
+            user_raw = str(message_text or "").strip()
+            if user_raw:
+                conversation_history.append({"role": "user", "content": user_raw})
+            feedback_data = dict(session.get("feedback_data") or {})
+            exp, rating = _extract_feedback_submission(user_raw)
+            if exp:
+                feedback_data["experience"] = exp
+            if rating:
+                feedback_data["rating"] = rating
+            if feedback_data.get("experience") and feedback_data.get("rating"):
+                lead_id_for_feedback = str(session.get("feedback_lead_id") or "").strip()
+                saved = False
+                if lead_id_for_feedback:
+                    try:
+                        payload = {
+                            "userFeedback": {
+                                "experience": feedback_data.get("experience"),
+                                "rating": feedback_data.get("rating"),
+                                "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                            }
+                        }
+                        saved, _ = await lead_service.update_lead(owner_id, lead_id_for_feedback, payload)
+                    except Exception as feedback_exc:
+                        logger.warning("Instagram feedback save failed: %s", feedback_exc)
+                thanks = "Thank you for your feedback!"
+                if not saved and lead_id_for_feedback:
+                    thanks = "Thank you for your feedback! We could not save it right now."
+                conversation_history.append({"role": "assistant", "content": thanks})
+                session["history"] = conversation_history
+                await instagram_service.send_message(sender_id, thanks, instagram_access_token)
+                key = f"instagram_{recipient_id}_{sender_id}"
+                instagram_key_to_session.pop(key, None)
+                instagram_sessions.pop(session_id, None)
+                return {"status": "ok"}
+            missing_parts: List[str] = []
+            if not feedback_data.get("experience"):
+                missing_parts.append("experience")
+            if not feedback_data.get("rating"):
+                missing_parts.append("rating (1-5)")
+            followup = (
+                "Thanks! Please also share your "
+                + " and ".join(missing_parts)
+                + ".\n"
+                + _feedback_prompt_message()
+            )
+            session["feedback_data"] = feedback_data
+            conversation_history.append({"role": "assistant", "content": followup})
+            session["history"] = conversation_history
+            await instagram_service.send_message(sender_id, followup, instagram_access_token)
+            return {"status": "ok"}
+
+        enhanced_message_text = _normalize_workflow_choice_input(message_text, flow_controller) or message_text
 
         integration = context.get("integration") or {}
         calendar_flow = session.get("calendar_flow")
@@ -3447,7 +6418,6 @@ async def instagram_webhook(request: Request):
 
         # Calendar flow: same as WhatsApp/Messenger – day/slot selection or cancel
         if calendar_flow and app_id and message_text.strip():
-            from datetime import datetime
             raw_lower = message_text.strip().lower()
             if raw_lower in ("cancel", "back", "exit"):
                 session["calendar_flow"] = None
@@ -3455,6 +6425,7 @@ async def instagram_webhook(request: Request):
                 session["calendar_slots"] = None
                 session["calendar_free_slots"] = None
                 session["calendar_selected_day"] = None
+                session["calendar_pending_slot"] = None
                 reply = "Cancelled. How can I help?"
                 conversation_history.append({"role": "user", "content": message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
@@ -3462,42 +6433,193 @@ async def instagram_webhook(request: Request):
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
             try:
-                num = int(message_text.strip())
+                if calendar_flow == "confirm":
+                    pending_slot = session.get("calendar_pending_slot") or {}
+                    if not pending_slot:
+                        raise ValueError("Missing pending slot")
+                    confirm_num = _extract_index_choice(message_text)
+                    is_confirm_choice = raw_lower in ("confirm", "confirm booking", "yes", "book", "book now") or confirm_num == 1
+                    is_cancel_choice = raw_lower in ("cancel", "cancel booking", "no") or confirm_num == 2
+                    if is_confirm_choice:
+                        start_iso = pending_slot.get("start", "")
+                        end_iso = pending_slot.get("end", "")
+                        slot_timezone = pending_slot.get("timezone")
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip() or "Appointment"
+                        customer_name = str(flow_controller.collected_data.get("leadName") or "").strip() or None
+                        customer_email = str(flow_controller.collected_data.get("leadEmail") or "").strip() or None
+                        customer_phone = str(flow_controller.collected_data.get("leadPhoneNumber") or "").strip() or None
+                        _post_booking_note_raw = await _resolve_post_booking_note(
+                            context=context,
+                            app_id=app_id,
+                            service_title=service_title,
+                            context_service=context_service,
+                        )
+                        _post_booking_note_chat = _format_post_booking_note_for_chat(_post_booking_note_raw)
+                        calendar_service = CalendarService(settings)
+                        book_result = await calendar_service.book_appointment(
+                            app_id,
+                            start_iso,
+                            end_iso,
+                            service_title,
+                            time_zone=slot_timezone,
+                            attendee_email=customer_email,
+                            customer_name=customer_name,
+                            customer_phone=customer_phone,
+                            lead_id=str(session.get("feedback_lead_id") or "").strip() or None,
+                            post_booking_note=_post_booking_note_raw,
+                        )
+                        session["calendar_flow"] = None
+                        session["calendar_days"] = None
+                        session["calendar_slots"] = None
+                        session["calendar_free_slots"] = None
+                        session["calendar_selected_day"] = None
+                        session["calendar_pending_slot"] = None
+                        if book_result.get("success"):
+                            try:
+                                from zoneinfo import ZoneInfo
+                                dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                                time_str = dt.strftime("%a %d/%m/%Y, %H:%M")
+                                reply = f"Booked! Your {service_title} appointment is confirmed for {time_str}."
+                            except Exception:
+                                reply = f"Booked! Your {service_title} appointment is confirmed."
+                            if not _post_booking_note_chat:
+                                _fallback_note = str(book_result.get("postBookingNote") or book_result.get("post_booking_note") or "").strip()
+                                _post_booking_note_chat = _format_post_booking_note_for_chat(_fallback_note)
+                            if _post_booking_note_chat:
+                                reply += f"\n\n📋 Important Instructions\n{_post_booking_note_chat}"
+                            _review_url_inline = _integration_google_review_url(integration)
+                            _skip_global_prompts = _should_skip_global_review_feedback_prompts(flow_controller, context)
+                            _should_send_review_prompt = bool(_review_url_inline) and not _skip_global_prompts
+                            _should_collect_feedback = _capture_feedback_enabled(context) and not _skip_global_prompts
+                            if _should_send_review_prompt:
+                                reply += "\n\n" + get_string("review_prompt", lang_code, _review_url_inline)
+                            # Ensure social-channel bookings are persisted as leads.
+                            try:
+                                full_history = conversation_history + [
+                                    {"role": "user", "content": message_text},
+                                    {"role": "assistant", "content": reply},
+                                ]
+                                customer_name = flow_controller.collected_data.get("leadName") or "Customer"
+                                lead_type_val = flow_controller.collected_data.get("leadType") or "inquiry"
+                                completion_payload = {
+                                    "status": "confirmed",
+                                    "title": f"{service_title} – {customer_name}",
+                                    "serviceType": flow_controller.collected_data.get("serviceType") or service_title,
+                                    "leadType": flow_controller.collected_data.get("leadType"),
+                                    "leadName": flow_controller.collected_data.get("leadName"),
+                                    "leadEmail": flow_controller.collected_data.get("leadEmail"),
+                                    "leadPhoneNumber": flow_controller.collected_data.get("leadPhoneNumber"),
+                                    "sourceChannel": "instagram",
+                                    "appId": app_id,
+                                    "appointmentDetails": {
+                                        "eventId": book_result.get("eventId"),
+                                        "start": book_result.get("start") or start_iso,
+                                        "end": book_result.get("end") or end_iso,
+                                        "link": book_result.get("link"),
+                                        "confirmed": True,
+                                    },
+                                    "summary": f"{customer_name} booked a {service_title} appointment.",
+                                    "description": f"{customer_name} ({lead_type_val}) booked {service_title}.",
+                                    "history": full_history,
+                                }
+                                existing_lead_id = str(session.get("feedback_lead_id") or "").strip()
+                                if existing_lead_id:
+                                    await lead_service.update_lead(owner_id, existing_lead_id, completion_payload)
+                                else:
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, completion_payload)
+                                    if ok_lead:
+                                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                            except Exception as lead_exc:
+                                logger.warning("Instagram booking lead persistence failed: %s", lead_exc)
+                        else:
+                            reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                        if book_result.get("success") and _should_collect_feedback:
+                            feedback_prompt = _feedback_prompt_message()
+                            session["feedback_collection_active"] = True
+                            session["feedback_data"] = {}
+                            conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                            session["history"] = conversation_history
+                            await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                        elif book_result.get("success"):
+                            key = f"instagram_{recipient_id}_{sender_id}"
+                            instagram_key_to_session.pop(key, None)
+                            instagram_sessions.pop(session_id, None)
+                        return {"status": "ok"}
+                    if is_cancel_choice:
+                        session["calendar_flow"] = "slots"
+                        session["calendar_pending_slot"] = None
+                        lines = ["No problem. Please choose another time slot:"]
+                        for i, s in enumerate(calendar_slots[:15], 1):
+                            start = s.get("start", "")
+                            end = s.get("end", "")
+                            if start and end:
+                                try:
+                                    dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                    dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                                    lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
+                                except Exception:
+                                    lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
+                        reply = "\n".join(lines)
+                        conversation_history.append({"role": "user", "content": message_text})
+                        conversation_history.append({"role": "assistant", "content": reply})
+                        session["history"] = conversation_history
+                        cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                        if buttons:
+                            qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                            await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                        else:
+                            await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                        return {"status": "ok"}
+                    raise ValueError("Invalid confirm choice")
+                num = _extract_index_choice(message_text)
+                if num is None:
+                    raise ValueError("No numeric choice parsed")
                 if calendar_flow == "slots" and 1 <= num <= len(calendar_slots):
                     slot = calendar_slots[num - 1]
-                    start_iso = slot.get("start", "")
-                    end_iso = slot.get("end", "")
-                    title = "Appointment"
-                    calendar_service = CalendarService(settings)
-                    book_result = await calendar_service.book_appointment(app_id, start_iso, end_iso, title)
-                    session["calendar_flow"] = None
-                    session["calendar_days"] = None
-                    session["calendar_slots"] = None
-                    session["calendar_free_slots"] = None
-                    session["calendar_selected_day"] = None
-                    if book_result.get("success"):
-                        try:
-                            dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-                            time_str = dt.strftime("%H:%M")
-                            reply = f"Booked for {time_str}. You'll receive a confirmation. Reply with anything to continue."
-                        except Exception:
-                            reply = "Appointment booked. Reply with anything to continue."
-                    else:
-                        reply = book_result.get("error") or "Booking failed. Please try again or contact us."
+                    session["calendar_pending_slot"] = slot
+                    session["calendar_flow"] = "confirm"
+                    slot_timezone = slot.get("timezone")
+                    try:
+                        from zoneinfo import ZoneInfo
+                        dt_s = datetime.fromisoformat((slot.get("start") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        dt_e = datetime.fromisoformat((slot.get("end") or "").replace("Z", "+00:00")).astimezone(ZoneInfo(slot_timezone or "UTC"))
+                        slot_label = f"{dt_s.strftime('%a %d/%m/%Y, %H:%M')}–{dt_e.strftime('%H:%M')}"
+                    except Exception:
+                        slot_label = f"{slot.get('start', '')}–{slot.get('end', '')}"
+                    reply = (
+                        f"You selected: {slot_label}\n"
+                        "Please confirm your booking:\n"
+                        "<button value=\"confirm\">Confirm booking</button>\n"
+                        "<button value=\"cancel\">Cancel</button>"
+                    )
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                    else:
+                        await instagram_service.send_message(sender_id, reply, instagram_access_token)
                     return {"status": "ok"}
                 if calendar_flow == "days" and 1 <= num <= len(calendar_days):
                     day_info = calendar_days[num - 1]
                     selected_date = day_info.get("date", "")
                     free_slots_all = session.get("calendar_free_slots") or []
-                    slots_for_day = [s for s in free_slots_all if (s.get("start") or "")[:10] == selected_date]
+                    cal_tz_ms_sel = _calendar_tz_from_integration(integration)
+                    slots_for_day = [
+                        s for s in free_slots_all
+                        if _slot_matches_local_date(s, selected_date, cal_tz_ms_sel)
+                    ]
                     session["calendar_flow"] = "slots"
                     session["calendar_slots"] = slots_for_day
                     session["calendar_selected_day"] = selected_date
                     lines = [f"Times on {day_info.get('label', selected_date)}:"]
+                    lines.append("Choose a time slot:")
                     for i, s in enumerate(slots_for_day[:15], 1):
                         start = s.get("start", "")
                         end = s.get("end", "")
@@ -3505,26 +6627,30 @@ async def instagram_webhook(request: Request):
                             try:
                                 dt_s = datetime.fromisoformat(start.replace("Z", "+00:00"))
                                 dt_e = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                                lines.append(f"{i}. {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}")
+                                lines.append(f"<button value=\"{i}\">🕒 {dt_s.strftime('%H:%M')}–{dt_e.strftime('%H:%M')}</button>")
                             except Exception:
-                                lines.append(f"{i}. {start}–{end}")
-                    lines.append("Reply with the number to book that slot (or 'cancel' to cancel).")
+                                lines.append(f"<button value=\"{i}\">🕒 {start}–{end}</button>")
                     reply = "\n".join(lines)
                     conversation_history.append({"role": "user", "content": message_text})
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
-                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                    cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                    if buttons:
+                        qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                        await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                    else:
+                        await instagram_service.send_message(sender_id, reply, instagram_access_token)
                     return {"status": "ok"}
             except ValueError:
                 pass
 
         # Calendar availability: user asks "when are you free?" / "book appointment" -> fetch and show days
-        if app_id and _is_availability_intent(message_text):
-            from datetime import datetime, timedelta
-            now = datetime.utcnow()
-            from_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-            to_dt = now + timedelta(days=7)
-            to_date = to_dt.isoformat().replace(" ", "T") + "Z" if to_dt.tzinfo is None else to_dt.isoformat()
+        if (
+            app_id
+            and flow_controller.state in (ConversationState.APPOINTMENT_OFFER, ConversationState.CALENDAR_BOOKING)
+            and _is_availability_intent(enhanced_message_text)
+        ):
+            from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
             slot_minutes = integration.get("calendarSlotMinutes", 30)
             if slot_minutes not in (15, 30, 60):
                 slot_minutes = 30
@@ -3534,7 +6660,13 @@ async def instagram_webhook(request: Request):
                 if result.get("error"):
                     reply = "I couldn't fetch availability right now. Please try again later."
                 else:
-                    free_slots = result.get("freeSlots") or []
+                    cal_tz_ig = _calendar_tz_from_integration(integration)
+                    _now_utc_ig = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    free_slots = [
+                        s for s in (result.get("freeSlots") or [])
+                        if datetime.fromisoformat((s.get("start") or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).replace(tzinfo=timezone.utc) > _now_utc_ig
+                    ]
+                    free_slots = _filter_slots_from_tomorrow_local(free_slots, cal_tz_ig)
                     if not free_slots:
                         if not result.get("calendarConnected"):
                             reply = "Calendar isn't connected for this app, so I can't show availability. Please contact the business."
@@ -3544,15 +6676,24 @@ async def instagram_webhook(request: Request):
                         by_date: Dict[str, List[Dict[str, Any]]] = {}
                         for slot in free_slots:
                             start = slot.get("start") or ""
-                            date_key = start[:10] if len(start) >= 10 else ""
-                            if date_key:
-                                by_date.setdefault(date_key, []).append(slot)
+                            if not start:
+                                continue
+                            try:
+                                from zoneinfo import ZoneInfo
+
+                                dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                                date_key = dt_utc.astimezone(ZoneInfo(cal_tz_ig)).strftime("%Y-%m-%d")
+                            except Exception:
+                                date_key = start[:10]
+                            by_date.setdefault(date_key, []).append(slot)
                         days_order = sorted(by_date.keys())
                         calendar_days_list = []
                         for d in days_order:
                             try:
-                                dt = datetime.fromisoformat(d + "T00:00:00+00:00")
-                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d %b")})
+                                from zoneinfo import ZoneInfo
+
+                                dt = datetime.fromisoformat(d + "T12:00:00").replace(tzinfo=ZoneInfo(cal_tz_ig))
+                                calendar_days_list.append({"date": d, "label": dt.strftime("%a %d/%m/%Y")})
                             except Exception:
                                 calendar_days_list.append({"date": d, "label": d})
                         session["calendar_flow"] = "days"
@@ -3562,27 +6703,36 @@ async def instagram_webhook(request: Request):
                         session["calendar_selected_day"] = None
                         max_days = 14
                         show_days = calendar_days_list[:max_days]
-                        lines = ["Pick a day (reply with the number):"]
+                        service_title = str(flow_controller.collected_data.get("serviceType") or "").strip()
+                        if service_title:
+                            intro = f"Here are the available dates for your **{service_title}** appointment. Please choose a day:"
+                        else:
+                            intro = "Here are the available dates for your appointment. Please choose a day:"
+                        lines = [intro]
                         for i, day in enumerate(show_days, 1):
-                            lines.append(f"{i}. {day['label']}")
-                        lines.append("Then I'll show you available times for that day.")
+                            lines.append(f"<button value=\"{i}\">📅 {day['label']}</button>")
                         reply = "\n".join(lines)
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
-                await instagram_service.send_message(sender_id, reply, instagram_access_token)
+                cleaned_reply, buttons = _extract_buttons_from_response(reply)
+                if buttons:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
+                else:
+                    await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
             except Exception as cal_exc:
                 logger.exception("Instagram: Calendar availability error: %s", cal_exc)
                 reply = "I couldn't fetch availability right now. Please try again later."
-                conversation_history.append({"role": "user", "content": message_text})
+                conversation_history.append({"role": "user", "content": enhanced_message_text})
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
                 return {"status": "ok"}
         
         # Add user message to history
-        conversation_history.append({"role": "user", "content": message_text})
+        conversation_history.append({"role": "user", "content": enhanced_message_text})
 
         # Detect language and configure response generator
         lang_code = detect_language(message_text)
@@ -3591,7 +6741,7 @@ async def instagram_webhook(request: Request):
 
         try:
             # ── PRE-CHECK: detect email when last bot message asked for it ────────
-            validate_email = context.get("integration", {}).get("validateEmail", True)
+            validate_email = _validate_email_enabled(context)
             logger.info(
                 "Instagram: email validation check – validate_email=%s otp_sent=%s history_len=%d",
                 validate_email, email_validation_state["otp_sent"], len(conversation_history),
@@ -3626,11 +6776,18 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("otp_send_fail_email", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                         conversation_history.append({"role": "assistant", "content": reply})
                         session["history"] = conversation_history
                         await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3650,11 +6807,18 @@ async def instagram_webhook(request: Request):
                                 email_validation_state["otp_sent"] = True
                                 flow_controller.otp_state["email_sent"] = True
                                 flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                            reply = (
-                                get_string("otp_sent_email", lang_code, stored_email)
-                                if ok
-                                else get_string("otp_send_fail_email", lang_code)
-                            )
+                            if ok:
+                                reply = get_string("otp_sent_email", lang_code, stored_email)
+                            else:
+                                reply = await _continue_after_otp_delivery_failed_with_session(
+                                    flow_controller,
+                                    response_generator,
+                                    conversation_history,
+                                    context,
+                                    lang_code,
+                                    "email",
+                                    email_validation_state=email_validation_state,
+                                )
                             conversation_history.append({"role": "assistant", "content": reply})
                             session["history"] = conversation_history
                             await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3675,11 +6839,18 @@ async def instagram_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3700,11 +6871,18 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -3723,8 +6901,9 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_verified"] = True
                             flow_controller.otp_state["email_verified"] = True
                             flow_controller.transition_to(flow_controller.get_next_state())
+                            # Empty string so PHONE_COLLECTION generates a proper prompt instead of a validation error
                             reply = await response_generator.generate_response(
-                                flow_controller, "Email verified", conversation_history, context
+                                flow_controller, "", conversation_history, context
                             )
                         else:
                             reply = temp_reply
@@ -3735,8 +6914,10 @@ async def instagram_webhook(request: Request):
                             if email_valid:
                                 if app_id:
                                     parsed_json["appId"] = app_id
+                                created_lead_resp = None
+                                ok_lead = False
                                 try:
-                                    ok_lead, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                                    ok_lead, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                                     final_msg = (
                                         get_string("final_success", lang_code)
                                         if ok_lead
@@ -3745,13 +6926,22 @@ async def instagram_webhook(request: Request):
                                 except Exception:
                                     final_msg = get_string("final_fallback", lang_code)
                                 integration = context.get("integration") or {}
-                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                                if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                                     await instagram_service.send_message(
                                         sender_id,
                                         get_string("review_prompt", lang_code, integration["googleReviewUrl"].strip()),
                                         instagram_access_token,
                                     )
                                 await instagram_service.send_message(sender_id, final_msg, instagram_access_token)
+                                if _capture_feedback_enabled(context) and ok_lead and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                                    feedback_prompt = _feedback_prompt_message()
+                                    session["feedback_collection_active"] = True
+                                    session["feedback_data"] = {}
+                                    session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                                    conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                                    session["history"] = conversation_history
+                                    await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                                    return {"status": "ok"}
                                 key = f"instagram_{recipient_id}_{sender_id}"
                                 instagram_key_to_session.pop(key, None)
                                 instagram_sessions.pop(session_id, None)
@@ -3770,7 +6960,7 @@ async def instagram_webhook(request: Request):
 
             # ── Generate response via state machine ───────────────────────────────
             reply = await response_generator.generate_response(
-                flow_controller, message_text, conversation_history, context
+                flow_controller, enhanced_message_text, conversation_history, context
             )
 
             # ── SEND_EMAIL / SEND_PHONE signal interceptors ───────────────────────
@@ -3788,11 +6978,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3808,11 +7005,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
                     email_validation_state.update({"otp_sent": True, "email": email, "customer_name": customer_name})
-                reply = (
-                    get_string("otp_sent_email", lang_code, email)
-                    if ok
-                    else get_string("otp_send_fail_email", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_email", lang_code, email)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "email",
+                        email_validation_state=email_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3833,11 +7037,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3854,11 +7065,18 @@ async def instagram_webhook(request: Request):
                 if ok:
                     flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
                     phone_validation_state.update({"otp_sent": True, "phone": phone})
-                reply = (
-                    get_string("otp_sent_phone", lang_code, phone)
-                    if ok
-                    else get_string("otp_send_fail_phone", lang_code)
-                )
+                if ok:
+                    reply = get_string("otp_sent_phone", lang_code, phone)
+                else:
+                    reply = await _continue_after_otp_delivery_failed_with_session(
+                        flow_controller,
+                        response_generator,
+                        conversation_history,
+                        context,
+                        lang_code,
+                        "phone",
+                        phone_validation_state=phone_validation_state,
+                    )
                 conversation_history.append({"role": "assistant", "content": reply})
                 session["history"] = conversation_history
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3871,8 +7089,10 @@ async def instagram_webhook(request: Request):
                 if email_valid:
                     if app_id:
                         parsed_json["appId"] = app_id
+                    created_lead_resp = None
+                    ok = False
                     try:
-                        ok, _ = await lead_service.create_public_lead(owner_id, parsed_json)
+                        ok, created_lead_resp = await lead_service.create_public_lead(owner_id, parsed_json)
                         final_msg = (
                             get_string("final_success", lang_code)
                             if ok
@@ -3882,7 +7102,7 @@ async def instagram_webhook(request: Request):
                         final_msg = get_string("final_fallback", lang_code)
 
                     integration = context.get("integration") or {}
-                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl"):
+                    if integration.get("googleReviewEnabled") and integration.get("googleReviewUrl") and not _should_skip_global_review_feedback_prompts(flow_controller, context):
                         review_url = integration["googleReviewUrl"].strip()
                         await instagram_service.send_message(
                             sender_id,
@@ -3890,6 +7110,15 @@ async def instagram_webhook(request: Request):
                             instagram_access_token,
                         )
                     await instagram_service.send_message(sender_id, final_msg, instagram_access_token)
+                    if _capture_feedback_enabled(context) and ok and not _should_skip_global_review_feedback_prompts(flow_controller, context):
+                        feedback_prompt = _feedback_prompt_message()
+                        session["feedback_collection_active"] = True
+                        session["feedback_data"] = {}
+                        session["feedback_lead_id"] = _extract_lead_id_from_create_response(created_lead_resp)
+                        conversation_history.append({"role": "assistant", "content": feedback_prompt})
+                        session["history"] = conversation_history
+                        await instagram_service.send_message(sender_id, feedback_prompt, instagram_access_token)
+                        return {"status": "ok"}
                     key = f"instagram_{recipient_id}_{sender_id}"
                     instagram_key_to_session.pop(key, None)
                     instagram_sessions.pop(session_id, None)
@@ -3905,11 +7134,18 @@ async def instagram_webhook(request: Request):
                     ok, _ = await email_validation_service.send_otp_email(
                         owner_id, email_validation_state["email"], customer_name
                     )
-                    reply = (
-                        get_string("otp_resend", lang_code, email_validation_state["email"])
-                        if ok
-                        else get_string("otp_resend_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, email_validation_state["email"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3917,11 +7153,18 @@ async def instagram_webhook(request: Request):
 
                 elif retry_type == "resend_otp" and phone_validation_state["otp_sent"] and not phone_validation_state["otp_verified"]:
                     ok, _ = await phone_validation_service.send_sms_otp(owner_id, phone_validation_state["phone"])
-                    reply = (
-                        get_string("otp_resend", lang_code, phone_validation_state["phone"])
-                        if ok
-                        else get_string("otp_resend_fail_phone", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_resend", lang_code, phone_validation_state["phone"])
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "phone",
+                            phone_validation_state=phone_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
@@ -3942,11 +7185,18 @@ async def instagram_webhook(request: Request):
                             email_validation_state["otp_sent"] = True
                             flow_controller.otp_state["email_sent"] = True
                             flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_email", lang_code, email)
-                            if ok
-                            else get_string("found_email_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_email", lang_code, email)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "email",
+                                email_validation_state=email_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_email", lang_code)
                         flow_controller.transition_to(ConversationState.EMAIL_COLLECTION)
@@ -3968,11 +7218,18 @@ async def instagram_webhook(request: Request):
                             phone_validation_state["otp_sent"] = True
                             flow_controller.otp_state["phone_sent"] = True
                             flow_controller.transition_to(ConversationState.PHONE_OTP_VERIFICATION)
-                        reply = (
-                            get_string("perfect_otp_sent_phone", lang_code, phone)
-                            if ok
-                            else get_string("found_phone_cant_send", lang_code)
-                        )
+                        if ok:
+                            reply = get_string("perfect_otp_sent_phone", lang_code, phone)
+                        else:
+                            reply = await _continue_after_otp_delivery_failed_with_session(
+                                flow_controller,
+                                response_generator,
+                                conversation_history,
+                                context,
+                                lang_code,
+                                "phone",
+                                phone_validation_state=phone_validation_state,
+                            )
                     else:
                         reply = get_string("no_problem_phone", lang_code)
                         flow_controller.transition_to(ConversationState.PHONE_COLLECTION)
@@ -4016,15 +7273,31 @@ async def instagram_webhook(request: Request):
                         email_validation_state["otp_sent"] = True
                         flow_controller.otp_state["email_sent"] = True
                         flow_controller.transition_to(ConversationState.EMAIL_OTP_VERIFICATION)
-                    reply = (
-                        get_string("otp_sent_email", lang_code, email)
-                        if ok
-                        else get_string("otp_send_fail_email", lang_code)
-                    )
+                    if ok:
+                        reply = get_string("otp_sent_email", lang_code, email)
+                    else:
+                        reply = await _continue_after_otp_delivery_failed_with_session(
+                            flow_controller,
+                            response_generator,
+                            conversation_history,
+                            context,
+                            lang_code,
+                            "email",
+                            email_validation_state=email_validation_state,
+                        )
                     conversation_history.append({"role": "assistant", "content": reply})
                     session["history"] = conversation_history
                     await instagram_service.send_message(sender_id, reply, instagram_access_token)
                     return {"status": "ok"}
+
+            # Expand booking token to real calendar choices for Instagram.
+            reply = await _expand_booking_request_reply_for_social_channel(
+                reply=reply,
+                integration=integration,
+                app_id=app_id,
+                flow_controller=flow_controller,
+                session=session,
+            )
 
             # ── Regular reply ─────────────────────────────────────────────────────
             conversation_history.append({"role": "assistant", "content": reply})
@@ -4032,14 +7305,13 @@ async def instagram_webhook(request: Request):
 
             cleaned_reply, buttons = _extract_buttons_from_response(reply)
             if buttons:
-                btn_text = "\n\n" + "\n".join(
-                    [f"{i}. {btn['title']}" for i, btn in enumerate(buttons, 1)]
-                )
-                await instagram_service.send_message(
-                    sender_id,
-                    cleaned_reply + btn_text + "\n\nPlease reply with the number of your choice.",
-                    instagram_access_token,
-                )
+                is_multi_select_prompt = bool(re.search(r"<\s*checkbox\b", str(reply), flags=re.IGNORECASE))
+                if is_multi_select_prompt:
+                    full_message = _format_social_option_prompt(cleaned_reply, buttons, multi_select=True)
+                    await instagram_service.send_message(sender_id, full_message, instagram_access_token)
+                else:
+                    qrs = [{"title": btn["title"], "payload": btn.get("payload", btn["title"])} for btn in buttons]
+                    await instagram_service.send_quick_replies(sender_id, cleaned_reply, qrs, instagram_access_token)
             else:
                 await instagram_service.send_message(sender_id, reply, instagram_access_token)
 

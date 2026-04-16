@@ -84,10 +84,15 @@ class CalendarService:
         title: str = "Appointment",
         attendee_email: Optional[str] = None,
         description: Optional[str] = None,
+        time_zone: Optional[str] = None,
+        customer_name: Optional[str] = None,
+        customer_phone: Optional[str] = None,
+        lead_id: Optional[str] = None,
+        post_booking_note: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         POST /api/v1/calendar/apps/:appId/appointments
-        Body: { start, end, title, attendeeEmail?, description? }
+        Body: { start, end, title, attendeeEmail?, description?, timeZone?, customerName?, customerPhone? }
         """
         path = f"/api/v1/calendar/apps/{app_id}/appointments"
         url = f"{self.base_url}{path}"
@@ -121,12 +126,29 @@ class CalendarService:
             body["attendeeEmail"] = attendee_email
         if description:
             body["description"] = description
+        if time_zone:
+            body["timeZone"] = time_zone
+        if customer_name:
+            body["customerName"] = customer_name
+        if customer_phone:
+            body["customerPhone"] = customer_phone
+        if lead_id:
+            body["leadId"] = lead_id
+        if post_booking_note:
+            body["postBookingNote"] = post_booking_note
 
         logger.info("Calendar book_appointment app_id=%s start=%s", app_id, start_iso)
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             resp = await client.post(url, headers=headers, json=body)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as http_err:
+                logger.error(
+                    "Calendar book_appointment HTTP error app_id=%s status=%s body=%s",
+                    app_id, http_err.response.status_code, http_err.response.text[:200]
+                )
+                return {"success": False, "error": f"Booking request failed (HTTP {http_err.response.status_code})"}
             data = resp.json()
 
         status = data.get("status")

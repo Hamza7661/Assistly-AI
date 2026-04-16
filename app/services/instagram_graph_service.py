@@ -110,6 +110,86 @@ class InstagramGraphService:
                 logger.error(f"Failed to send Instagram message: {str(e)}")
                 raise
 
+    async def send_quick_replies(
+        self,
+        recipient_id: str,
+        message_text: str,
+        quick_replies: list,
+        access_token: str,
+    ) -> InstagramSendMessageResponse:
+        """
+        Send a message with quick reply chips to an Instagram user.
+        Instagram supports up to 13 quick replies (same Meta Graph API shape as Messenger).
+
+        Args:
+            recipient_id:   Instagram-scoped sender ID (IGSID) of the recipient.
+            message_text:   Message body displayed above the chips.
+            quick_replies:  List of {"title": "...", "payload": "..."} dicts.
+            access_token:   Page access token for the Instagram Business Account.
+
+        Returns:
+            Response from Graph API containing message_id.
+        """
+        if not access_token:
+            raise ValueError("Instagram access token is required")
+
+        # Keep numbered fallback text for clients where chips are hidden.
+        fallback_lines = [f"{i}. {qr.get('title', '')}".strip() for i, qr in enumerate(quick_replies[:13], 1)]
+        fallback_lines = [ln for ln in fallback_lines if ln and not ln.endswith(".")]
+        if fallback_lines:
+            fallback_text = "\n".join(fallback_lines)
+            if fallback_text:
+                message_text = (
+                    f"{message_text}\n\n{fallback_text}\n\n"
+                    "If buttons are not visible, reply with the number of your choice."
+                )
+        if len(message_text) > 2000:
+            message_text = message_text[:1997] + "..."
+
+        url = f"{self.base_url}/me/messages"
+        payload = {
+            "recipient": {"id": recipient_id},
+            "message": {
+                "text": message_text,
+                "quick_replies": [
+                    {
+                        "content_type": "text",
+                        "title": qr["title"][:20],
+                        "payload": qr.get("payload", qr["title"])[:1000],
+                    }
+                    for qr in quick_replies[:13]
+                ],
+            },
+        }
+        params = {"access_token": access_token}
+
+        logger.info(
+            "Sending Instagram quick replies to %s with %d options",
+            recipient_id,
+            len(quick_replies[:13]),
+        )
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(url, json=payload, params=params)
+                response.raise_for_status()
+                result = response.json()
+                logger.info(
+                    "Instagram quick replies sent successfully. Message ID: %s",
+                    result.get("message_id", "unknown"),
+                )
+                return result
+            except httpx.HTTPStatusError as e:
+                logger.error(
+                    "Instagram Graph API error (quick replies): %s - %s",
+                    e.response.status_code,
+                    e.response.text,
+                )
+                raise
+            except Exception as e:
+                logger.error("Failed to send Instagram quick replies: %s", str(e))
+                raise
+
     # ------------------------------------------------------------------
     # Security (Meta uses X-Hub-Signature-256)
     # ------------------------------------------------------------------

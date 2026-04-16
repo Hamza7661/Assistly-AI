@@ -18,6 +18,7 @@ class Settings(BaseModel):
     
     # Session configuration
     session_timeout_seconds: int = Field(default=300, alias="SESSION_TIMEOUT_SECONDS")  # 5 minutes default
+    lead_dedupe_window_hours: int = Field(default=4, alias="LEAD_DEDUPE_WINDOW_HOURS")
     # Note: Session invalidation endpoint uses tp_sign_secret for authentication (same as other third-party API calls)
     
     # Twilio WhatsApp configuration
@@ -33,6 +34,7 @@ class Settings(BaseModel):
 
     # Deepgram voice agent
     deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
+    deepgram_voice_model: str = Field(default="aura-2-electra-en", alias="DEEPGRAM_VOICE_MODEL")
     
     # RAG (Retrieval-Augmented Generation) configuration
     rag_k: int = Field(default=3, alias="RAG_K")  # Number of documents to retrieve

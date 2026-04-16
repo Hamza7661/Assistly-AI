@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Optional
 import logging
 import json
+import tempfile
+import re
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -206,23 +208,17 @@ class RAGService:
             
             logger.info(f"Split {len(documents)} documents into {len(splits)} chunks")
             
-            # Use persist_directory from settings if not provided
+            # Chroma ephemeral default breaks on some pydantic/chromadb combos
+            # ("chroma_db_impl" / Rust client). Always use a directory (explicit or temp).
             persist_dir = persist_directory or self.rag_persist_directory
-            
-            # Create vector store (in-memory by default, or persistent if directory provided)
-            if persist_dir:
-                self.vector_store = Chroma.from_documents(
-                    documents=splits,
-                    embedding=self.embeddings,
-                    persist_directory=persist_dir
-                )
-                logger.info(f"Created persistent vector store at {persist_dir}")
-            else:
-                self.vector_store = Chroma.from_documents(
-                    documents=splits,
-                    embedding=self.embeddings
-                )
-                logger.info("Created in-memory vector store")
+            if not persist_dir:
+                persist_dir = tempfile.mkdtemp(prefix="assistly_chroma_")
+            self.vector_store = Chroma.from_documents(
+                documents=splits,
+                embedding=self.embeddings,
+                persist_directory=persist_dir,
+            )
+            logger.info("Created vector store at %s", persist_dir)
             
             # Create retriever with configured k value
             self.retriever = self.vector_store.as_retriever(
@@ -238,12 +234,23 @@ class RAGService:
             
         except Exception as e:
             logger.error(f"Failed to build vector store: {e}")
+            self.vector_store = None
+            self.retriever = None
             return False
     
     def _create_qa_chain(self) -> None:
         """Create a comprehensive QA chain for ALL conversation responses"""
         # Note: Flow will be adjusted dynamically based on is_whatsapp parameter
-        prompt_template = """You are a {profession} assistant. Use ONLY the context below.
+        prompt_template = """You are a knowledgeable, friendly {profession} assistant.
+
+ANSWERING QUESTIONS FROM USERS:
+- If the context below directly answers a user's question, use it.
+- If the context does NOT contain the answer but the question is relevant to the {profession} industry or related services, answer helpfully from your general knowledge — like a knowledgeable staff member would.
+- If the question is completely unrelated to {profession} or our services, respond with genuine warmth and empathy — acknowledge the question, then gently redirect. Use varied, human-sounding phrases, for example:
+  * "Oh, I wish I could help with that! I'm really only set up to assist with {profession} services — but I'd love to help you with a treatment or booking if you're interested?"
+  * "Ha, that one's a little out of my world! I'm mostly here for {profession} stuff. Anything I can help you with on that front?"
+  * "Good question, though that's a bit beyond what I'm here for! I specialise in {profession} — is there anything about our services I can help with?"
+  Always make the user feel genuinely welcome. Never sound dismissive. Never say "I don't have that information".
 
 RULES:
 1. Match user input to lead types, services, FAQs from context - use exact values
@@ -526,7 +533,17 @@ Response:"""
                 option_format = "BUTTONS: Use <button> Option Text </button> format for all options"
             
             # Let LangChain handle everything - flow progression, matching, and JSON generation
-            prompt = f"""You are a {profession} assistant. Follow this conversation flow: {flow}
+            prompt = f"""You are a knowledgeable, friendly {profession} assistant. Follow this conversation flow: {flow}
+
+HANDLING USER QUESTIONS (applies at any point in the conversation):
+- If the user asks a question that is answered in the Context section below, answer it directly.
+- If the user asks a question about the {profession} industry, treatments, procedures, or related topics that is NOT in the context, answer it helpfully from your general knowledge — like a well-informed staff member would. Then continue the conversation flow.
+- If the user asks something completely unrelated to {profession} services or the industry, respond with genuine warmth — acknowledge the question, then redirect naturally. Use varied, empathetic phrasing, for example:
+  * "Oh, I wish I could help with that! I'm really only set up for {profession} services — but happy to help with a treatment or booking if that's of interest?"
+  * "Ha, that one's a little out of my world! I'm mostly a {profession} assistant. Anything I can help with on that front?"
+  * "Great question — though that's a bit beyond my area! I'm here for {profession} — is there anything about our services I can assist with?"
+  Always make the user feel welcome and valued. Never sound dismissive or robotic. Then continue the conversation flow.
+- NEVER say "I don't have that information". Always sound warm, human, and helpful.
 
 AVAILABLE OPTIONS:
 Lead Types:
@@ -579,6 +596,7 @@ RULES:
    - When ALL required information is collected AND no OTP change requests detected AND OTP verification is complete (if required), output ONLY valid JSON: {json_fields}
 7. Do NOT repeat questions already answered - continue from where conversation left off
 8. Move to next step automatically when information is collected
+9. OFF-TOPIC & KNOWLEDGE QUESTIONS: If the user asks about something related to the {profession} industry that isn't in the context, answer from general knowledge then continue the flow. If truly unrelated to {profession}, respond with genuine warmth — acknowledge their question, then gently redirect (see examples above) — then continue the flow. NEVER say "I don't have that information". Always make the user feel welcome and valued.
 
 {history_text}
 
@@ -901,6 +919,86 @@ Generate the initial greeting with lead type buttons. Use EXACT format: <button>
             logger.error(f"Error getting initial greeting: {e}")
             return None
     
+    async def answer_faq_question(
+        self,
+        query: str,
+        profession: Optional[str] = None,
+        context_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Answer a side question using FAQ/RAG context without advancing conversation flow.
+
+        Designed for the interjection handler: the caller retains full control of the flow
+        state machine. This method ONLY answers the question — it never returns JSON or
+        flow-advancing instructions.
+        """
+        if not self.llm:
+            return None
+        try:
+            active_profession = (
+                str((context_data or {}).get("profession") or profession or "").strip()
+                or "Business"
+            )
+            context_payload = context_data or {}
+
+            # 1) FAQ-first shortcut for side questions:
+            # Prefer exact/near-exact FAQ answers before mixed RAG retrieval.
+            def _tokens(text: str) -> set:
+                return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+
+            def _faq_match_score(user_q: str, faq_q: str) -> float:
+                uq = _tokens(user_q)
+                fq = _tokens(faq_q)
+                if not uq or not fq:
+                    return 0.0
+                # Jaccard overlap + substring bonus for near-exact phrasing.
+                overlap = len(uq.intersection(fq)) / max(1, len(uq.union(fq)))
+                if faq_q and faq_q.lower() in (user_q or "").lower():
+                    overlap += 0.35
+                return overlap
+
+            faqs = context_payload.get("faqs", [])
+            best_answer = None
+            best_score = 0.0
+            if isinstance(faqs, list):
+                for faq in faqs:
+                    if not isinstance(faq, dict):
+                        continue
+                    faq_q = str(faq.get("question") or "").strip()
+                    faq_a = str(faq.get("answer") or faq.get("response") or "").strip()
+                    if not faq_q or not faq_a:
+                        continue
+                    score = _faq_match_score(query, faq_q)
+                    if score > best_score:
+                        best_score = score
+                        best_answer = faq_a
+
+            # Conservative threshold to avoid unrelated FAQ leakage.
+            if best_answer and best_score >= 0.18:
+                return best_answer
+
+            context_str = await self.get_relevant_context(query) if self.retriever else ""
+            prompt = (
+                f"You are a knowledgeable {active_profession} assistant. "
+                f"Answer the following question concisely in 1-3 sentences.\n\n"
+                f"RULES:\n"
+                f"- Use the context below if it answers the question directly.\n"
+                f"- If the question is about the {active_profession} industry but not in the context, "
+                f"answer from your general knowledge like a well-informed staff member would.\n"
+                f"- If the question is completely unrelated to {active_profession}, respond warmly: "
+                f"\"That's a bit outside my area! I'm mostly here for {active_profession} services.\"\n"
+                f"- DO NOT ask questions back. DO NOT mention booking or lead type selection. "
+                f"DO NOT produce JSON.\n\n"
+                f"Context:\n{context_str or '(no specific context found)'}\n\n"
+                f"Question: {query}\n\n"
+                f"Answer:"
+            )
+            response = await self.llm.ainvoke(prompt)
+            answer = response.content if hasattr(response, "content") else str(response)
+            return answer.strip() if answer else None
+        except Exception as e:
+            logger.error(f"Error in answer_faq_question: {e}")
+            return None
+
     def clear_vector_store(self) -> None:
         """Clear the current vector store"""
         self.vector_store = None
