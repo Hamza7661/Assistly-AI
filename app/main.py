@@ -4975,7 +4975,7 @@ async def messenger_webhook(request: Request):
         if app_secret:
             sig_header = request.headers.get("x-hub-signature-256", "")
             if not MessengerGraphService.verify_signature(raw_body, sig_header, app_secret):
-                logger.warning("Messenger webhook: signature verification failed")
+                logger.debug("Messenger webhook: signature verification failed (client_ip=%s)", request.client.host if request.client else "unknown")
                 return Response(content="Forbidden", status_code=403)
 
         body = json.loads(raw_body)
@@ -6182,8 +6182,13 @@ async def instagram_webhook(request: Request):
         app_secret = getattr(settings, "meta_app_secret", None)
         if app_secret:
             sig_header = request.headers.get("x-hub-signature-256", "")
+            if not sig_header:
+                # No signature header — likely a Meta probe/health-check request (facebookexternalua).
+                # Return 200 so Meta stops retrying; skip processing since there is no real event.
+                logger.debug("Instagram webhook: no X-Hub-Signature-256 header, acknowledging probe request")
+                return {"status": "ok"}
             if not InstagramGraphService.verify_signature(raw_body, sig_header, app_secret):
-                logger.warning("Instagram webhook: signature verification failed")
+                logger.warning("Instagram webhook: signature verification failed (invalid signature)")
                 return Response(content="Forbidden", status_code=403)
 
         body = json.loads(raw_body)
