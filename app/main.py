@@ -4,6 +4,7 @@ import re
 import time
 import secrets
 import asyncio
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
@@ -38,6 +39,29 @@ from twilio.twiml.voice_response import VoiceResponse
 
 logger = logging.getLogger("assistly")
 logging.basicConfig(level=logging.INFO)
+
+
+async def _consume_channel_limit_or_block(
+    lead_service: LeadService,
+    app_id: Optional[str],
+    channel: str,
+    idempotency_key: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Consume one conversation unit for a new session.
+    Returns (allowed, block_message). block_message is safe for end users and avoids renewal details.
+    """
+    if not app_id:
+        return True, None
+    ok, payload = await lead_service.consume_channel_conversation(
+        app_id=str(app_id),
+        channel=channel,
+        idempotency_key=idempotency_key,
+    )
+    if ok:
+        return True, None
+    logger.warning("Conversation blocked by subscription gate app_id=%s channel=%s payload=%s", app_id, channel, payload)
+    return False, "Service is temporarily unavailable. Please try again later."
 
 
 # ─── TypedDicts for Messenger and Instagram sessions ────────────────────────
@@ -1765,6 +1789,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 flow_controller.update_collected_data("leadId", lead_id)
 
     if not restored:
+        allowed, block_message = await _consume_channel_limit_or_block(
+            lead_service=lead_service,
+            app_id=resolved_app_id or app_id,
+            channel="web",
+            idempotency_key=f"web-{resume_key or uuid.uuid4().hex}",
+        )
+        if not allowed:
+            await websocket.send_json({
+                "type": "error",
+                "content": block_message or "Service is temporarily unavailable. Please try again later.",
+            })
+            await websocket.close(code=1008)
+            return
+
         flow_controller.transition_to(ConversationState.LEAD_TYPE_SELECTION)
         try:
             location_country = country_hint or (context.get("country") or "US")
@@ -3307,6 +3345,20 @@ async def whatsapp_webhook(request: Request):
                 return Response(content=whatsapp_service.create_twiml_response("Sorry, I couldn't identify your account. Please contact support."), media_type="text/xml")
             
             logger.info(f"WhatsApp: Using user_id '{user_id}' and app_id '{app_id}' for Twilio number {twilio_phone}")
+
+            allowed, block_message = await _consume_channel_limit_or_block(
+                lead_service=lead_service,
+                app_id=app_id,
+                channel="whatsapp",
+                idempotency_key=f"whatsapp-{session_id}",
+            )
+            if not allowed:
+                return Response(
+                    content=whatsapp_service.create_twiml_response(
+                        block_message or "Service is temporarily unavailable. Please try again later."
+                    ),
+                    media_type="text/xml"
+                )
             
             # Initialize new session state
             current_time = time.time()
@@ -4988,6 +5040,15 @@ async def messenger_webhook(request: Request):
                 )
                 return {"status": "error", "message": "No Messenger page access token configured"}
 
+            allowed, _ = await _consume_channel_limit_or_block(
+                lead_service=lead_service,
+                app_id=app_id,
+                channel="messenger",
+                idempotency_key=f"messenger-{session_id}",
+            )
+            if not allowed:
+                return {"status": "ok"}
+
             current_time = time.time()
             messenger_sessions[session_id] = {
                 "user_id": sender_id,          # PSID
@@ -6178,6 +6239,15 @@ async def instagram_webhook(request: Request):
             if not instagram_access_token:
                 logger.error(f"Instagram: no access token in context for business_account_id={recipient_id}")
                 return {"status": "error", "message": "No Instagram access token configured"}
+
+            allowed, _ = await _consume_channel_limit_or_block(
+                lead_service=lead_service,
+                app_id=app_id,
+                channel="instagram",
+                idempotency_key=f"instagram-{session_id}",
+            )
+            if not allowed:
+                return {"status": "ok"}
             
             current_time = time.time()
             instagram_sessions[session_id] = {
