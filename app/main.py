@@ -6209,7 +6209,7 @@ async def instagram_webhook(request: Request):
         if app_secret:
             sig_header = request.headers.get("x-hub-signature-256", "")
             if not InstagramGraphService.verify_signature(raw_body, sig_header, app_secret):
-                logger.warning("Instagram webhook: signature verification failed")
+                logger.warning("Instagram webhook: signature verification failed (invalid signature)")
                 return Response(content="Forbidden", status_code=403)
 
         body = json.loads(raw_body)
