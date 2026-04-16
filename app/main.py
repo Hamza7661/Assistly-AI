@@ -46,10 +46,10 @@ async def _consume_channel_limit_or_block(
     app_id: Optional[str],
     channel: str,
     idempotency_key: str,
-) -> Tuple[bool, Optional[str]]:
+) -> Tuple[bool, Optional[Dict[str, str]]]:
     """
     Consume one conversation unit for a new session.
-    Returns (allowed, block_message). block_message is safe for end users and avoids renewal details.
+    Returns (allowed, block_payload). block_payload is safe for end users and avoids renewal details.
     """
     if not app_id:
         return True, None
@@ -61,7 +61,13 @@ async def _consume_channel_limit_or_block(
     if ok:
         return True, None
     logger.warning("Conversation blocked by subscription gate app_id=%s channel=%s payload=%s", app_id, channel, payload)
-    return False, "Service is temporarily unavailable. Please try again later."
+    block_code = "channel_unavailable"
+    if isinstance(payload, dict):
+        block_code = str(payload.get("data", {}).get("code") or payload.get("code") or block_code)
+    return False, {
+        "code": block_code,
+        "message": "This chat channel is currently unavailable for this organization. Please contact them through another channel.",
+    }
 
 
 # ─── TypedDicts for Messenger and Instagram sessions ────────────────────────
@@ -1375,6 +1381,23 @@ def _detect_retry_request(reply: str) -> Tuple[Optional[str], Optional[str]]:
     logger.info("No retry phrases detected")
     return (None, None)
 
+
+def _sanitize_internal_control_reply(reply: Any, lang_code: str) -> Any:
+    """
+    Prevent internal control tokens from leaking into user-facing chat.
+    """
+    if not isinstance(reply, str):
+        return reply
+
+    stripped = reply.strip()
+    if stripped.startswith("CHANGE_EMAIL_REQUESTED"):
+        return get_string("no_problem_email", lang_code)
+    if stripped.startswith("CHANGE_PHONE_REQUESTED"):
+        return get_string("no_problem_phone", lang_code)
+    if stripped.startswith("RETRY_OTP_REQUESTED"):
+        return get_string("otp_code_retry", lang_code)
+    return reply
+
 def _extract_email_from_text(text: str) -> str:
     import re
     # Look for email patterns
@@ -1789,7 +1812,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 flow_controller.update_collected_data("leadId", lead_id)
 
     if not restored:
-        allowed, block_message = await _consume_channel_limit_or_block(
+        allowed, block_payload = await _consume_channel_limit_or_block(
             lead_service=lead_service,
             app_id=resolved_app_id or app_id,
             channel="web",
@@ -1797,8 +1820,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         )
         if not allowed:
             await websocket.send_json({
-                "type": "error",
-                "content": block_message or "Service is temporarily unavailable. Please try again later.",
+                "type": "channel_blocked",
+                "content": (block_payload or {}).get("message") or "This chat channel is currently unavailable for this organization. Please contact them through another channel.",
+                "code": (block_payload or {}).get("code") or "channel_unavailable",
             })
             await websocket.close(code=1008)
             return
@@ -2928,6 +2952,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "bot", "content": reply})
                     continue
             
+            reply = _sanitize_internal_control_reply(reply, lang_code)
+
             # Check if JSON was generated (all data collected)
             if str(reply).strip() == "BOOK_APPOINTMENT_REQUESTED":
                 from_date, to_date = _availability_window_from_tomorrow_utc(integration, horizon_days=14)
@@ -3346,7 +3372,7 @@ async def whatsapp_webhook(request: Request):
             
             logger.info(f"WhatsApp: Using user_id '{user_id}' and app_id '{app_id}' for Twilio number {twilio_phone}")
 
-            allowed, block_message = await _consume_channel_limit_or_block(
+            allowed, block_payload = await _consume_channel_limit_or_block(
                 lead_service=lead_service,
                 app_id=app_id,
                 channel="whatsapp",
@@ -3355,7 +3381,7 @@ async def whatsapp_webhook(request: Request):
             if not allowed:
                 return Response(
                     content=whatsapp_service.create_twiml_response(
-                        block_message or "Service is temporarily unavailable. Please try again later."
+                        (block_payload or {}).get("message") or "This chat channel is currently unavailable for this organization. Please contact them through another channel."
                     ),
                     media_type="text/xml"
                 )
