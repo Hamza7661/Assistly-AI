@@ -273,7 +273,7 @@ class InstagramGraphService:
             entry = entries[0]
             messaging_events = entry.get("messaging", [])
             if not messaging_events:
-                logger.information("Instagram: no messaging events (may be read/delivery)")
+                logger.info("Instagram: no messaging events (may be read/delivery)")
                 return None
 
             event = messaging_events[0]
@@ -283,7 +283,7 @@ class InstagramGraphService:
 
             # Skip read receipts (messaging_seen)
             if "read" in event:
-                logger.information("Instagram: skipping read receipt")
+                logger.info("Instagram: skipping read receipt")
                 return None
 
             # Handle postback (Icebreaker, Generic Template buttons)
@@ -310,10 +310,10 @@ class InstagramGraphService:
             # Handle message (text, quick_reply, etc.)
             message = event.get("message", {})
             if message.get("is_echo"):
-                logger.information("Instagram: skipping echo message")
+                logger.info("Instagram: skipping echo message")
                 return None
             if message.get("is_deleted") or message.get("is_unsupported"):
-                logger.information("Instagram: skipping deleted/unsupported message")
+                logger.info("Instagram: skipping deleted/unsupported message")
                 return None
 
             message_id = message.get("mid")
@@ -327,10 +327,10 @@ class InstagramGraphService:
                 message_text = qr.get("payload", "").strip()
 
             if not sender_id:
-                logger.information("Instagram: missing sender IGSID in event")
+                logger.info("Instagram: missing sender IGSID in event")
                 return None
             if not message_text:
-                logger.information("Instagram: empty message text (attachment/sticker not supported)")
+                logger.info("Instagram: empty message text (attachment/sticker not supported)")
                 return None
 
             logger.info(
