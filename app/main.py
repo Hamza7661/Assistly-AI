@@ -1744,6 +1744,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # For OTP, leads, etc.: use user id from context (app owner when app_id was used)
     user_id = str(context.get("user", {}).get("id") or identifier)
     resolved_app_id = str((context.get("app") or {}).get("id") or app_id or "").strip()
+    # HMAC public lead routes must use the same :userId path segment as the browser widget
+    # (app Mongo id when embedded by app; legacy embeds use the business user id).
+    public_lead_route_id = str(resolved_app_id) if fetch_by_app and resolved_app_id else user_id
     resolved_company_name = str((context.get("integration") or {}).get("companyName") or "").strip()
     email_validation_service.set_branding_context(
         app_id=resolved_app_id or None,
@@ -1831,8 +1834,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         try:
             location_country = country_hint or (context.get("country") or "US")
             ok_lead, lead_resp = await lead_service.create_interaction_lead(
-                app_id=app_id,
-                user_id=user_id,
+                app_id=(resolved_app_id or app_id),
+                user_id=public_lead_route_id,
                 location={"country": location_country, "countryCode": location_country},
                 initial_interaction="widget_opened",
                 source_channel="web",
@@ -1989,7 +1992,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     "submittedAt": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
                                 }
                             }
-                            saved, _ = await lead_service.update_lead(user_id, lead_id, feedback_payload)
+                            saved, _ = await lead_service.update_lead(public_lead_route_id, lead_id, feedback_payload)
                         except Exception as feedback_exc:
                             logger.warning("Failed to persist user feedback: %s", feedback_exc)
                     thank_you = "Thank you for your feedback!"
@@ -2420,7 +2423,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     "description": f"{customer_name} ({lead_type_val}) booked {service_title}. Appointment confirmed at {time_str}.",
                                     "history": full_history,
                                 }
-                                await lead_service.update_lead(user_id, lead_id, completion_payload)
+                                await lead_service.update_lead(public_lead_route_id, lead_id, completion_payload)
                         except Exception as completion_exc:
                             logger.warning("Lead completion update after booking failed: %s", completion_exc)
                     else:
@@ -2708,10 +2711,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                     # Fallback if JSON parsing fails
                                     json_data = flow_controller.get_json_data(conversation_history)
                                 # Add appId if available (for app-scoped leads)
-                                if app_id:
-                                    json_data["appId"] = app_id
+                                if resolved_app_id or app_id:
+                                    json_data["appId"] = resolved_app_id or app_id
                                 try:
-                                    ok, _ = await lead_service.create_public_lead(user_id, json_data)
+                                    ok, _ = await lead_service.create_public_lead(public_lead_route_id, json_data)
                                     final_msg = get_string("final_success", lang_code) if ok else get_string("final_fallback", lang_code)
                                 except Exception:
                                     final_msg = get_string("final_fallback", lang_code)
@@ -3022,15 +3025,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             parsed_json = _maybe_parse_json(reply)
             if parsed_json and isinstance(parsed_json, dict) and flow_controller.can_generate_json():
                 # Add appId if available (for app-scoped leads)
-                if app_id:
-                    parsed_json["appId"] = app_id
+                if resolved_app_id or app_id:
+                    parsed_json["appId"] = resolved_app_id or app_id
                 # Update existing interaction lead if available, otherwise create a new lead
                 try:
                     if lead_id:
                         parsed_json["status"] = "complete"
-                        ok, _ = await lead_service.update_lead(user_id, lead_id, parsed_json)
+                        ok, _ = await lead_service.update_lead(public_lead_route_id, lead_id, parsed_json)
                     else:
-                        ok, _ = await lead_service.create_public_lead(user_id, parsed_json)
+                        ok, _ = await lead_service.create_public_lead(public_lead_route_id, parsed_json)
                     final_msg = get_string("final_success", lang_code) if ok else get_string("final_fallback", lang_code)
                 except Exception:
                     final_msg = get_string("final_fallback", lang_code)
@@ -3101,7 +3104,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 }
                 if snapshot != last_snapshot:
                     try:
-                        await lead_service.update_lead(user_id, lead_id, snapshot)
+                        await lead_service.update_lead(public_lead_route_id, lead_id, snapshot)
                         last_snapshot = dict(snapshot)
                     except Exception as sync_exc:
                         logger.warning("Lead progressive update failed: %s", sync_exc)
