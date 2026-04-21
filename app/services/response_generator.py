@@ -1162,6 +1162,10 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(next_state)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                # Non-booking workflows should complete immediately after the last answer.
+                # This avoids waiting for an extra "any additional info" turn.
+                if flow_controller.state == ConversationState.COMPLETE and not flow_controller.is_booking_lead_type():
+                    return await self._generate_json(flow_controller, conversation_history)
                 return await self._generate_state_response(flow_controller.state, "", conversation_history, context, flow_controller=flow_controller)
             
             current_options = current_question.get("options", []) or []
@@ -1297,7 +1301,9 @@ Classify the intent:"""
                             workflow_manager.reset()
                             flow_controller.transition_to(next_state)
                             logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
-                            if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
+                            if flow_controller.state == ConversationState.COMPLETE and not flow_controller.is_booking_lead_type():
+                                next_prompt = await self._generate_json(flow_controller, conversation_history)
+                            elif flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                                 next_prompt = 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
                             elif flow_controller.state == ConversationState.CALENDAR_BOOKING:
                                 next_prompt = "BOOK_APPOINTMENT_REQUESTED"
@@ -1333,6 +1339,8 @@ Classify the intent:"""
                     workflow_manager.reset()
                     flow_controller.transition_to(next_state)
                     logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                    if flow_controller.state == ConversationState.COMPLETE and not flow_controller.is_booking_lead_type():
+                        return await self._generate_json(flow_controller, conversation_history)
                     if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                         return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
                     if flow_controller.state == ConversationState.CALENDAR_BOOKING:
@@ -1346,6 +1354,8 @@ Classify the intent:"""
                 workflow_manager.reset()
                 flow_controller.transition_to(next_state)
                 logger.info(f"Workflow complete. Transitioned to state: {flow_controller.state.value}")
+                if flow_controller.state == ConversationState.COMPLETE and not flow_controller.is_booking_lead_type():
+                    return await self._generate_json(flow_controller, conversation_history)
                 if flow_controller.state == ConversationState.APPOINTMENT_OFFER:
                     return 'Would you like to book an appointment now? <button value="yes">Yes, book now</button> <button value="no">No thanks</button>'
                 if flow_controller.state == ConversationState.CALENDAR_BOOKING:
