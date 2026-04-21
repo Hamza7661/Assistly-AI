@@ -2,6 +2,7 @@
 from typing import Dict, Any, Optional, List, Tuple
 import logging
 import re
+from app.services.validators import Validator
 
 logger = logging.getLogger("assistly.workflow_manager")
 
@@ -27,6 +28,8 @@ class WorkflowManager:
         self._linked_question_ids: set = set()
         # Base URL for attachment download links (set from config/context)
         self.api_base_url: str = context.get("api_base_url", "")
+        # One-shot validation feedback shown before repeating the same question
+        self._last_validation_error: Optional[str] = None
 
     def _conversation_style_enabled(self) -> bool:
         """Read conversational style flag from the latest context."""
@@ -232,7 +235,10 @@ class WorkflowManager:
         q_text = question.get("question", "")
         options = question.get("options", []) or []
         
-        parts = [q_text]
+        parts = []
+        if self._last_validation_error:
+            parts.append(self._last_validation_error)
+        parts.append(q_text)
         
         # Attach file download link if available
         attachment_url = self.get_question_attachment_url(question)
@@ -268,6 +274,15 @@ class WorkflowManager:
         current_question = self.get_current_question()
         if not current_question:
             return False
+
+        is_valid, validation_message = self._validate_current_answer(current_question, answer)
+        if not is_valid:
+            self._last_validation_error = validation_message
+            logger.info("Workflow answer failed validation: %s", validation_message)
+            # Keep workflow on the same question and ask again.
+            return True
+
+        self._last_validation_error = None
         
         question_id = current_question.get("_id")
         question_text = current_question.get("question", "")
@@ -317,6 +332,91 @@ class WorkflowManager:
         )
         
         return self.get_current_question() is not None
+
+    def _validate_current_answer(self, question: Dict[str, Any], answer: str) -> Tuple[bool, Optional[str]]:
+        """Validate answer by inferred question intent (email/phone/postcode)."""
+        q_text = str(question.get("question") or "").lower()
+        if not q_text:
+            return True, None
+
+        # Only validate free-text-like answers. Option-based answers are already constrained.
+        if question.get("options"):
+            return True, None
+
+        if self._looks_like_email_question(q_text):
+            email = self._extract_email_candidate(answer)
+            if not email or not Validator.is_valid_email(email):
+                return False, "Please enter a valid email address (for example: name@example.com)."
+
+        if self._looks_like_phone_question(q_text):
+            phone = self._extract_phone_candidate(answer)
+            if not phone or not Validator.is_valid_phone(phone):
+                return False, "Please enter a valid phone number including country code if possible."
+
+        if self._looks_like_postcode_question(q_text):
+            postcode = self._extract_postcode_candidate(answer)
+            if not postcode or not self._is_valid_postcode(postcode):
+                return False, "Please enter a valid postcode/ZIP code."
+
+        return True, None
+
+    @staticmethod
+    def _looks_like_email_question(question_text: str) -> bool:
+        return "email" in question_text or "e-mail" in question_text
+
+    @staticmethod
+    def _looks_like_phone_question(question_text: str) -> bool:
+        phone_keywords = ("phone", "mobile", "telephone", "contact number", "contact no", "tel", "whatsapp number")
+        return any(k in question_text for k in phone_keywords)
+
+    @staticmethod
+    def _looks_like_postcode_question(question_text: str) -> bool:
+        postcode_keywords = ("postcode", "postal code", "zip code", "zipcode", "zip")
+        return any(k in question_text for k in postcode_keywords)
+
+    @staticmethod
+    def _extract_email_candidate(answer: str) -> Optional[str]:
+        if not answer:
+            return None
+        match = re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", answer.strip())
+        return match.group(0).strip() if match else None
+
+    @staticmethod
+    def _extract_phone_candidate(answer: str) -> Optional[str]:
+        if not answer:
+            return None
+        text = answer.strip()
+        # Keep digits and common phone punctuation; remove labels.
+        match = re.search(r"(?:\+?\d[\d\s().-]{6,}\d)", text)
+        return match.group(0).strip() if match else None
+
+    @staticmethod
+    def _extract_postcode_candidate(answer: str) -> Optional[str]:
+        if not answer:
+            return None
+        text = answer.strip()
+        # Prefer compact alphanumeric postcode-like token; otherwise keep full trimmed input.
+        token_match = re.search(r"\b[A-Za-z0-9][A-Za-z0-9\s-]{1,10}[A-Za-z0-9]\b", text)
+        return token_match.group(0).strip() if token_match else text
+
+    @staticmethod
+    def _is_valid_postcode(value: str) -> bool:
+        if not value:
+            return False
+        cleaned = " ".join(value.strip().split())
+        # UK postcode
+        uk_pattern = r"^(GIR 0AA|[A-PR-UWYZ][A-HK-Y]?\d\d?[A-Z]?\s?\d[ABD-HJLNP-UW-Z]{2})$"
+        if re.match(uk_pattern, cleaned, re.IGNORECASE):
+            return True
+        # US ZIP / ZIP+4
+        if re.match(r"^\d{5}(?:-\d{4})?$", cleaned):
+            return True
+        # Generic postal code fallback (3-10 chars, alphanumeric + space/hyphen)
+        generic = re.match(r"^[A-Za-z0-9][A-Za-z0-9\s-]{1,9}$", cleaned)
+        if not generic:
+            return False
+        has_digit = any(ch.isdigit() for ch in cleaned)
+        return has_digit
     
     def _advance_index(self):
         """Move to next question sequentially"""
@@ -498,6 +598,7 @@ class WorkflowManager:
         self.workflow_answers = {}
         self.is_active = False
         self._linked_question_ids = set()
+        self._last_validation_error = None
 
     def export_state(self) -> Optional[Dict[str, Any]]:
         """JSON-friendly snapshot for web widget session resume."""
@@ -512,6 +613,7 @@ class WorkflowManager:
             "_question_queue": q_copy,
             "workflow_answers": dict(self.workflow_answers),
             "_linked_question_ids": list(self._linked_question_ids),
+            "_last_validation_error": self._last_validation_error,
             "is_active": self.is_active,
         }
 
@@ -528,6 +630,7 @@ class WorkflowManager:
         self.workflow_answers = dict(data.get("workflow_answers") or {})
         lids = data.get("_linked_question_ids")
         self._linked_question_ids = set(lids) if isinstance(lids, list) else set()
+        self._last_validation_error = data.get("_last_validation_error")
         self.is_active = bool(data.get("is_active"))
         if self.is_active and not self.current_workflow:
             self.is_active = False
